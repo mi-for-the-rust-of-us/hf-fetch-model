@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] — Remote safetensors via anamnesis
+
 ### Changed
 
 - **Remote `.safetensors` inspect now goes through anamnesis, like the cache-hit path.** `hf-fm inspect <repo> file.safetensors` (no `--cached`) drops its bespoke two-Range-request fetcher (`fetch_header_bytes` + an in-tree JSON parser) in favor of feeding the v0.11.0 [`HttpRangeReader`](src/http_range.rs) directly into `anamnesis::parse_safetensors_header_from_reader` — the same primitive the cache-hit path has used since v0.10.3, and the two paths now share a single `safetensors_header_to_info` mapping so they cannot drift. No new anamnesis work was needed: the reader-generic primitive has shipped since anamnesis 0.4.4, well before this phase. **User-facing:** the `Source:` line now reports honest transfer stats (`remote (N range requests, X fetched)`, matching NPZ's v0.11.0 wording) instead of a hardcoded `remote (2 HTTP requests)` — live-verified at `remote (4 range requests, 8.0 KiB fetched)` against a small `hf-internal-testing/tiny-random-gpt2` shard (2 of those are the substrate's fixed access probe; the rest fetch the length prefix and header, one or two depending on header size relative to the reader's 4 KiB read-ahead window). Remote safetensors inspect also gains quantization detection (`Format:` / `Size:` lines) for free, previously cached-only. Library API: `inspect::inspect_safetensors` now returns a `(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>)` triple (was a pair), matching `inspect_npz`'s shape.
