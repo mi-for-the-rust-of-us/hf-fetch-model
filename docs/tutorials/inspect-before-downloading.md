@@ -37,7 +37,7 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    regardless of the moment.
 -->
 
-A new tutorial in the v0.10.0 docs effort. If you find a step confusing or an output that looks different from yours, please open an issue on [GitHub](https://github.com/PCfVW/hf-fetch-model/issues) — the tutorial improves as real questions land.
+A new tutorial in the v0.10.0 docs effort. If you find a step confusing or an output that looks different from yours, please open an issue on [GitHub](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues) — the tutorial improves as real questions land.
 
 ## Contents
 

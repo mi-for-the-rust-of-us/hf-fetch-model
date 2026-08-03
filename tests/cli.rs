@@ -1978,6 +1978,13 @@ fn inspect_cached_npz_renders() {
         stdout.contains("Tensor") && stdout.contains("Dtype"),
         "NPZ inspect should print the standard tensor table, got:\n{stdout}"
     );
+    // v0.11.1: NPZ has no discrete header (like GGUF), so it must use the
+    // `Size:` label, not the safetensors-flavoured `Header: 0 B (JSON)`.
+    assert!(
+        stdout.contains("Size:") && !stdout.contains("(JSON)"),
+        "NPZ has no discrete header — expected a `Size:` line and no \
+         safetensors-flavoured `(JSON)` suffix, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -1996,6 +2003,13 @@ fn inspect_cached_pth_renders() {
     assert!(
         stdout.contains("Tensor") && stdout.contains("Dtype"),
         "PTH inspect should print the standard tensor table, got:\n{stdout}"
+    );
+    // v0.11.1: PTH has no discrete header (like GGUF), so it must use the
+    // `Size:` label, not the safetensors-flavoured `Header: 0 B (JSON)`.
+    assert!(
+        stdout.contains("Size:") && !stdout.contains("(JSON)"),
+        "PTH has no discrete header — expected a `Size:` line and no \
+         safetensors-flavoured `(JSON)` suffix, got:\n{stdout}"
     );
 }
 

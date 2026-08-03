@@ -3,7 +3,7 @@
 **Date:** 2026-05-12
 **hf-fm version:** 0.10.1
 **hypomnesis version:** 0.2.0
-**Context:** Adopting `hypomnesis` as the GPU-measurement substrate for the new `hf-fm inspect <repo> [FILE] --check-gpu [N]` flag. This is the first external consumer of `hypomnesis` (called out as the proof-of-concept use case in the [hypomnesis brief](https://github.com/PCfVW/hypomnesis/blob/main/docs/hypomnesis-brief.md)), and the report is written for the upstream maintainer (us) so the next hypomnesis release can act on real-world wear-and-tear.
+**Context:** Adopting `hypomnesis` as the GPU-measurement substrate for the new `hf-fm inspect <repo> [FILE] --check-gpu [N]` flag. This is the first external consumer of `hypomnesis` (called out as the proof-of-concept use case in the [hypomnesis brief](https://github.com/mi-for-the-rust-of-us/hypomnesis/blob/main/docs/hypomnesis-brief.md)), and the report is written for the upstream maintainer (us) so the next hypomnesis release can act on real-world wear-and-tear.
 
 ---
 

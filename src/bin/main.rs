@@ -2337,24 +2337,26 @@ fn looks_like_default_template(body: &str) -> bool {
 /// Renders the `inspect` summary's first size line (the one immediately
 /// after `Source:`).
 ///
-/// For safetensors (`is_gguf == false`), preserves the v0.10.2 wording:
-/// `Header: <header_size> (JSON), <total> total` (or just
+/// For safetensors (`is_headerless == false`), preserves the v0.10.2
+/// wording: `Header: <header_size> (JSON), <total> total` (or just
 /// `Header: <header_size> (JSON)` when the total isn't known). The `(JSON)`
 /// suffix is accurate because safetensors *does* start with a length-prefixed
 /// JSON header.
 ///
-/// For GGUF (`is_gguf == true`), drops the safetensors-flavoured `(JSON)`
-/// suffix and the `0 B` prefix — GGUF has no length-prefixed JSON header, so
-/// the v0.10.2 wording printed a meaningless `0 B (JSON)` for every GGUF
-/// invocation. The replacement surfaces the total file size under a `Size:`
-/// label (note: `File:` is already used by the preceding filename line, so
-/// we cannot reuse it here).
+/// For `GGUF` / `NPZ` / `PTH` (`is_headerless == true` — none of the three
+/// has a discrete header analogous to safetensors's length-prefixed JSON,
+/// so all three report `header_size == 0`), drops the safetensors-flavoured
+/// `(JSON)` suffix and the `0 B` prefix — the v0.10.2 wording printed a
+/// meaningless `0 B (JSON)` for these formats (fixed for `GGUF` in v0.10.3;
+/// extended to `NPZ` / `PTH` in v0.11.1). The replacement surfaces the total
+/// file size under a `Size:` label (note: `File:` is already used by the
+/// preceding filename line, so we cannot reuse it here).
 ///
 /// The two-space indent is the caller's responsibility — this helper returns
 /// the label-and-value line without leading whitespace.
 #[must_use]
-fn format_header_line(header_size: u64, file_size: Option<u64>, is_gguf: bool) -> String {
-    if is_gguf {
+fn format_header_line(header_size: u64, file_size: Option<u64>, is_headerless: bool) -> String {
+    if is_headerless {
         match file_size {
             Some(fs) => format!("Size:     {}", format_size(fs)),
             // BORROW: explicit .to_owned() for &str → owned String
@@ -2432,8 +2434,8 @@ fn format_metadata_lines(meta: &HashMap<String, String>) -> Vec<String> {
 /// Renders the optional `Format:` + `Size:` block in the `inspect` summary
 /// for quantized safetensors files. Returns `Vec::new()` (and the caller
 /// skips the `println!`s) when `quant_info` is `None` — i.e. for
-/// unquantized safetensors, all `GGUF` / `NPZ` / `PTH` paths, and the
-/// remote safetensors path (until v0.11.1 lifts it to anamnesis).
+/// unquantized safetensors (cached or remote) and all `GGUF` / `NPZ` / `PTH`
+/// paths.
 ///
 /// The two-line `Format: …` + `Size: <stored> stored -> <deq> (BF16)` form
 /// matches `anamnesis::InspectInfo`'s `Display` idiom while preserving the
@@ -5949,8 +5951,8 @@ fn run_inspect_single(
             path: PathBuf::from("<runtime>"),
             source: e,
         })?;
+        // BORROW: explicit .as_deref() for Option<String> → Option<&str>
         if is_npz {
-            // BORROW: explicit .as_deref() for Option<String> → Option<&str>
             rt.block_on(inspect::inspect_npz(
                 repo_id,
                 filename,
@@ -5958,14 +5960,13 @@ fn run_inspect_single(
                 revision,
             ))?
         } else {
-            // BORROW: explicit .as_deref() for Option<String> → Option<&str>
-            let (info, source) = rt.block_on(inspect::inspect_safetensors(
+            // Reachable only for is_safetensors (see the comment above).
+            rt.block_on(inspect::inspect_safetensors(
                 repo_id,
                 filename,
                 token.as_deref(),
                 revision,
-            ))?;
-            (info, source, None)
+            ))?
         }
     };
 
@@ -6053,10 +6054,13 @@ fn run_inspect_single(
         return Ok(());
     }
 
-    // Human-readable output. Remote NPZ (v0.11.0 `HttpRangeReader` path)
-    // reports honest transfer stats — the on-screen proof that the inspect
-    // read metadata, not weights; remote safetensors stays on its bespoke
-    // fixed two-request path until v0.11.1.
+    // Human-readable output. Every remote format on the `HttpRangeReader`
+    // substrate (NPZ since v0.11.0, safetensors since v0.11.1) reports
+    // honest transfer stats — the on-screen proof that the inspect read
+    // metadata, not weights. `(Remote, None)` is unreachable today (every
+    // remote path now returns `Some(stats)`) but stays in the match because
+    // the type doesn't statically rule it out; the fallback avoids
+    // asserting a specific, possibly-wrong request count.
     let source_label = match (source, range_stats) {
         (inspect::InspectSource::Cached, _) => "cached".to_owned(),
         (inspect::InspectSource::Remote, Some(stats)) => format!(
@@ -6064,7 +6068,9 @@ fn run_inspect_single(
             stats.requests,
             format_size(stats.bytes_fetched)
         ),
-        (inspect::InspectSource::Remote, None) => "remote (2 HTTP requests)".to_owned(),
+        // Unreachable via any current call path (see comment above); a
+        // generic label beats guessing at a request count.
+        (inspect::InspectSource::Remote, None) => "remote".to_owned(),
         _ => "unknown".to_owned(),
     };
     println!("  Repo:     {repo_id}");
@@ -6073,7 +6079,11 @@ fn run_inspect_single(
 
     println!(
         "  {}",
-        format_header_line(info.header_size, info.file_size, is_gguf)
+        format_header_line(
+            info.header_size,
+            info.file_size,
+            is_gguf || is_npz || is_pth
+        )
     );
 
     // v0.10.3 Phase C: surface quantization scheme + dequantised-size

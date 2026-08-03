@@ -49,9 +49,9 @@
 //! `model.safetensors.index.json`) work transparently —
 //! [`inspect::inspect_repo_safetensors`] reads every shard's header in parallel
 //! and returns a flat per-file result list. See
-//! [`examples/candle_inspect.rs`](https://github.com/PCfVW/hf-fetch-model/blob/main/examples/candle_inspect.rs)
+//! [`examples/candle_inspect.rs`](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/examples/candle_inspect.rs)
 //! for a runnable example, or the
-//! [Inspect tutorial](https://github.com/PCfVW/hf-fetch-model/blob/main/docs/tutorials/inspect-before-downloading.md)
+//! [Inspect tutorial](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/docs/tutorials/inspect-before-downloading.md)
 //! for a narrative walkthrough.
 //!
 //! ```rust,no_run

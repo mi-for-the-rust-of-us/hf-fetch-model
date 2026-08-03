@@ -16,7 +16,7 @@ and upgrade promptly when a patch ships.
 
 **Please do not open a public GitHub issue for security problems.**
 
-Report privately through GitHub's **[Security Advisories](https://github.com/PCfVW/hf-fetch-model/security/advisories/new)**
+Report privately through GitHub's **[Security Advisories](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/security/advisories/new)**
 ("Report a vulnerability" on the repository's *Security* tab). This opens a
 private channel visible only to the maintainers.
 

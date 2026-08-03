@@ -31,7 +31,7 @@ STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
    docs/tutorials/ or docs/case-studies/ and linking from here.
 -->
 
-A living list of the questions we and our early users have actually run into. If your question is not here, please open an issue on [GitHub](https://github.com/PCfVW/hf-fetch-model/issues) — we add entries as real questions arrive.
+A living list of the questions we and our early users have actually run into. If your question is not here, please open an issue on [GitHub](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues) — we add entries as real questions arrive.
 
 ## Contents
 
@@ -64,7 +64,7 @@ A living list of the questions we and our early users have actually run into. If
 - [Errors and unexpected output](#errors-and-unexpected-output)
   - [Which file formats can `inspect` read?](#which-file-formats-can-inspect-read)
   - [I got a `checksum mismatch` error — what do I do?](#i-got-a-checksum-mismatch-error--what-do-i-do)
-  - [Why does `inspect` say `Source: remote (2 HTTP requests)`?](#why-does-inspect-say-source-remote-2-http-requests)
+  - [Why does `inspect` say `Source: remote (N range requests, X fetched)`?](#why-does-inspect-say-source-remote-n-range-requests-x-fetched)
   - [Why didn't my pipeline catch a download failure?](#why-didnt-my-pipeline-catch-a-download-failure)
 
 ---
@@ -334,13 +334,13 @@ Four tensor formats: `.safetensors` and NumPy `.npz` (remote via HTTP Range, or 
 
 ### I got a `checksum mismatch` error — what do I do?
 
-A `checksum mismatch` means the file's computed SHA256 does not match the hash HuggingFace's API reported. Most of the time this is caused by a truncated download — delete the local file (or run `hf-fm cache delete <repo>` for the whole repo) and retry; the multi-connection download path will re-fetch it cleanly. If the mismatch repeats on a fresh download, that is genuinely unusual — open an issue on [GitHub](https://github.com/PCfVW/hf-fetch-model/issues) with the repo ID, filename, and the error message.
+A `checksum mismatch` means the file's computed SHA256 does not match the hash HuggingFace's API reported. Most of the time this is caused by a truncated download — delete the local file (or run `hf-fm cache delete <repo>` for the whole repo) and retry; the multi-connection download path will re-fetch it cleanly. If the mismatch repeats on a fresh download, that is genuinely unusual — open an issue on [GitHub](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues) with the repo ID, filename, and the error message.
 
-### Why does `inspect` say `Source: remote (2 HTTP requests)`?
+### Why does `inspect` say `Source: remote (N range requests, X fetched)`?
 
-Reading a safetensors header remotely takes two ranged HTTP requests: the first fetches the 8-byte little-endian `u64` at the start of the file that encodes the header's length, and the second fetches exactly that many bytes of JSON. That is the entire network cost of an `inspect` run — the multi-gigabyte weight data is never touched. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all.
+Remote `.safetensors` and `.npz` inspect (v0.11.1 and v0.11.0 respectively) both ride the same `HttpRangeReader` substrate, and the line reports the *measured* cost of that run rather than a fixed count — the on-screen proof that `inspect` read metadata, not weights. The reader enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted file cannot silently turn an inspect into a full download. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all.
 
-For a remote `.npz` (v0.11.0+) the same line reports the measured cost instead of a fixed count — e.g. `Source: remote (6 range requests, 136.0 KiB fetched)` against a 72 MiB GemmaScope archive: the requests fetch the `ZIP` central directory and the per-array `NPY` headers, never the tensor data. The reader also enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted archive cannot silently turn an inspect into a full download.
+For `.safetensors`, the header is a little-endian `u64` length prefix followed by the `JSON` header itself, both at the very start of the file — the reader's 4 KiB read-ahead window usually covers both in a single fetch, with a second fetch only when the header is larger than that window (common on many-tensor models). Every remote path on this substrate also bakes in a fixed one-time access probe (2 requests), so a small shard reads e.g. `Source: remote (4 range requests, 8.0 KiB fetched)` (live-measured against `hf-internal-testing/tiny-random-gpt2`). For `.npz`, the requests fetch the `ZIP` central directory and the per-array `NPY` headers — e.g. `Source: remote (6 range requests, 136.0 KiB fetched)` against a 72 MiB GemmaScope archive. Neither format ever downloads tensor data.
 
 ### Why didn't my pipeline catch a download failure?
 

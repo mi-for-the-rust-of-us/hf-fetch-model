@@ -1151,4 +1151,83 @@ mod tests {
             stats.bytes_fetched
         );
     }
+
+    // ---------- Safetensors end-to-end over the reader (v0.11.1) ----------
+
+    /// Builds a synthetic safetensors buffer: an 8-byte little-endian length
+    /// prefix, a JSON header with `count` tensor entries (deliberately large
+    /// enough to exceed the reader's 4 KiB read-ahead window, mirroring a
+    /// real many-tensor model), and a dummy data section the inspect must
+    /// never fetch.
+    fn synthetic_safetensors(count: usize, data_section_len: usize) -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut entries = String::new();
+        let mut offset: u64 = 0;
+        for i in 0..count {
+            if i > 0 {
+                entries.push(',');
+            }
+            let start = offset;
+            let end = offset + 16;
+            offset = end;
+            let _ = write!(
+                entries,
+                "\"tensor_{i}\":{{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[{start},{end}]}}"
+            );
+        }
+        let header_bytes = format!("{{{entries}}}").into_bytes();
+
+        let mut buf = Vec::with_capacity(8 + header_bytes.len() + data_section_len);
+        buf.extend_from_slice(&u64::try_from(header_bytes.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend(std::iter::repeat_n(0u8, data_section_len));
+        buf
+    }
+
+    #[test]
+    fn safetensors_inspect_over_range_reader_reads_metadata_not_data() {
+        // 100 tensor entries push the JSON header past the 4 KiB read-ahead
+        // window, so this also exercises the second-fetch path a real
+        // many-tensor model triggers. 256 KiB of dummy tensor data the
+        // inspect must never touch.
+        let buf = synthetic_safetensors(100, 256 * 1024);
+        let total = u64::try_from(buf.len()).unwrap();
+        let mut reader = RangeReader::new(InMemoryFetcher::new(buf));
+
+        let header = anamnesis::parse_safetensors_header_from_reader(&mut reader)
+            .expect("synthetic safetensors header must parse cleanly");
+        assert_eq!(header.tensors.len(), 100);
+
+        // The efficiency property this module exists for: metadata-only
+        // transfer, exactly two requests (the header exceeds the first
+        // window fetch, forcing a second), no data section fetched.
+        let stats = reader.stats();
+        assert_eq!(
+            stats.requests, 2,
+            "6552-byte header should need exactly two range requests \
+             (first window fetch covers 0..4096, second covers the rest); \
+             got {}",
+            stats.requests
+        );
+        assert!(
+            stats.bytes_fetched < total / 4,
+            "fetched {} of {total} bytes — inspect must not read tensor data",
+            stats.bytes_fetched
+        );
+    }
+
+    #[test]
+    fn safetensors_small_header_fits_in_one_read_ahead_window() {
+        // A handful of tensors keeps the header well under 4 KiB, so the
+        // length prefix and the JSON header are both served by the same
+        // initial window fetch — one request total.
+        let buf = synthetic_safetensors(3, 1024);
+        let mut reader = RangeReader::new(InMemoryFetcher::new(buf));
+
+        let header = anamnesis::parse_safetensors_header_from_reader(&mut reader)
+            .expect("synthetic safetensors header must parse cleanly");
+        assert_eq!(header.tensors.len(), 3);
+        assert_eq!(reader.stats().requests, 1);
+    }
 }

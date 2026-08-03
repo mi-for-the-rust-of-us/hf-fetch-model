@@ -3,10 +3,12 @@
 //! Tensor-file header inspection (local and remote).
 //!
 //! Reads tensor metadata (names, shapes, dtypes, byte offsets) without
-//! downloading full weight data. `.safetensors` files resolve cache-first
-//! with HTTP Range request fallback; `.npz` files likewise (v0.11.0 —
-//! [`inspect_npz`] drives `anamnesis::inspect_npz_from_reader` over an
-//! [`HttpRangeReader`]); `.gguf` / `.pth` files are inspected from the
+//! downloading full weight data. `.safetensors` and `.npz` files both
+//! resolve cache-first with an [`HttpRangeReader`] fallback — `.npz` since
+//! v0.11.0 ([`inspect_npz`] drives `anamnesis::inspect_npz_from_reader`
+//! over the reader), `.safetensors` since v0.11.1 ([`inspect_safetensors`]
+//! drives `anamnesis::parse_safetensors_header_from_reader` over the same
+//! reader); `.gguf` / `.pth` files are inspected from the
 //! local cache via the `anamnesis` parser crate ([`inspect_gguf_cached`] /
 //! [`inspect_pth_cached`] — remote inspect for those two is planned for
 //! v0.11.2 / v0.11.3).
@@ -122,13 +124,14 @@ pub fn torch_dtype_bytes(torch_dtype: Option<&str>) -> u8 {
     }
 }
 
-/// Quantization scheme + size estimates for a cached `.safetensors` file.
+/// Quantization scheme + size estimates for a `.safetensors` file, cached or remote.
 ///
-/// Populated by [`inspect_safetensors_local`] (the cache-hit path) via
-/// `anamnesis::InspectInfo::from(&header)`. Absent (`None`) when:
-/// - the safetensors file has no detected quantization (`QuantScheme::Unquantized`),
-/// - the inspect ran over HTTP Range (the remote path's bespoke parser
-///   doesn't go through anamnesis until v0.11.1), or
+/// Populated via `anamnesis::InspectInfo::from(&header)` by both the
+/// cache-hit path ([`inspect_safetensors_local`]) and the remote path
+/// ([`inspect_safetensors`], v0.11.1+) — the two share the same
+/// `safetensors_header_to_info` mapping, so quant detection works
+/// identically cached or remote. Absent (`None`) when:
+/// - the safetensors file has no detected quantization (`QuantScheme::Unquantized`), or
 /// - the file format isn't safetensors (`GGUF` / `NPZ` / `PTH` carry no
 ///   quant-method metadata).
 ///
@@ -181,12 +184,13 @@ pub struct SafetensorsHeaderInfo {
     /// the first request (`bytes 0-7/TOTAL` → `TOTAL`). This is free — no
     /// extra request needed.
     pub file_size: Option<u64>,
-    /// Quantization scheme + size estimates (cached safetensors only).
+    /// Quantization scheme + size estimates (safetensors only, cached or remote).
     ///
-    /// Populated by [`inspect_safetensors_local`] when a non-`Unquantized`
-    /// `QuantScheme` is detected. `None` for unquantized safetensors,
-    /// `GGUF` / `NPZ` / `PTH` files, and the remote safetensors path
-    /// (until v0.11.1 migrates that path to anamnesis).
+    /// Populated whenever a non-`Unquantized` `QuantScheme` is detected —
+    /// both [`inspect_safetensors_local`] (cache-hit) and
+    /// [`inspect_safetensors`] (remote, v0.11.1+) go through the same
+    /// anamnesis primitive. `None` for unquantized safetensors and for
+    /// `GGUF` / `NPZ` / `PTH` files (no quant-method metadata).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quant_info: Option<QuantInfo>,
 }
@@ -350,72 +354,6 @@ pub struct ModelConfig {
 }
 
 // -----------------------------------------------------------------------
-// JSON parsing
-// -----------------------------------------------------------------------
-
-/// Raw tensor entry as it appears in the safetensors JSON header.
-#[derive(serde::Deserialize)]
-struct RawTensorEntry {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: (u64, u64),
-}
-
-/// Parsed tensor list and optional metadata from a safetensors header.
-type ParsedHeader = (Vec<TensorInfo>, Option<HashMap<String, String>>);
-
-/// Parses the safetensors JSON header bytes into tensor metadata.
-///
-/// Extracts the `__metadata__` key separately (if present).
-fn parse_header_json(json_bytes: &[u8], filename: &str) -> Result<ParsedHeader, FetchError> {
-    let raw: HashMap<String, serde_json::Value> =
-        serde_json::from_slice(json_bytes).map_err(|e| FetchError::SafetensorsHeader {
-            filename: filename.to_owned(),
-            reason: format!("failed to parse header JSON: {e}"),
-        })?;
-
-    let mut metadata: Option<HashMap<String, String>> = None;
-    let mut tensors = Vec::new();
-
-    for (key, value) in raw {
-        if key == "__metadata__" {
-            if let serde_json::Value::Object(obj) = value {
-                let mut meta_map = HashMap::new();
-                for (mk, mv) in obj {
-                    // BORROW: explicit .to_owned()/.to_string() for Value → String conversion
-                    let v_str = if let Some(s) = mv.as_str() {
-                        s.to_owned()
-                    } else {
-                        mv.to_string()
-                    };
-                    meta_map.insert(mk, v_str);
-                }
-                metadata = Some(meta_map);
-            }
-            continue;
-        }
-
-        let entry: RawTensorEntry =
-            serde_json::from_value(value).map_err(|e| FetchError::SafetensorsHeader {
-                filename: filename.to_owned(),
-                reason: format!("failed to parse tensor \"{key}\": {e}"),
-            })?;
-
-        tensors.push(TensorInfo {
-            name: key,
-            dtype: entry.dtype,
-            shape: entry.shape,
-            data_offsets: entry.data_offsets,
-        });
-    }
-
-    // Sort by data offset start to preserve file order.
-    tensors.sort_by_key(|t| t.data_offsets.0);
-
-    Ok((tensors, metadata))
-}
-
-// -----------------------------------------------------------------------
 // Cache resolution
 // -----------------------------------------------------------------------
 
@@ -478,11 +416,11 @@ pub fn inspect_safetensors_local(path: &Path) -> Result<SafetensorsHeaderInfo, F
     // impl itself, *without* requiring the data section to be present
     // (it bypasses `safetensors::SafeTensors::read_metadata` for exactly
     // this reason). Anamnesis caps the declared header length at 100 MiB
-    // internally so the worst-case allocation is bounded.
-    //
-    // The remote path's `fetch_header_bytes` + `parse_header_json` chain
-    // stays bespoke until v0.11.1, when anamnesis's reader variant adapts
-    // to an HTTP Range source.
+    // internally so the worst-case allocation is bounded. The remote path
+    // (`inspect_safetensors`, v0.11.1) feeds the same anamnesis function
+    // an `HttpRangeReader` instead of a `std::fs::File`, and shares this
+    // function's `safetensors_header_to_info` mapping — the two paths
+    // cannot drift.
     let header = anamnesis::parse_safetensors_header_from_reader(file).map_err(|e| {
         FetchError::SafetensorsHeader {
             // BORROW: explicit .clone() for the error variant's owned String field
@@ -490,15 +428,31 @@ pub fn inspect_safetensors_local(path: &Path) -> Result<SafetensorsHeaderInfo, F
             reason: format!("failed to parse safetensors header: {e}"),
         }
     })?;
+
+    Ok(safetensors_header_to_info(header, Some(file_size)))
+}
+
+/// Maps an anamnesis `SafetensorsHeader` into the format-agnostic
+/// [`SafetensorsHeaderInfo`] shape used by hf-fm's render path.
+///
+/// Shared by the cache-hit path ([`inspect_safetensors_local`]) and the
+/// remote path ([`inspect_safetensors`]), so the two cannot drift. Derives
+/// `quant_info` via `anamnesis::InspectInfo::from(&header)` (iterates the
+/// already-parsed tensors and aggregates per-role byte sums — pure
+/// computation, no I/O); unquantized models produce no `quant_info` so the
+/// renderer suppresses the `Format:` / `Size:` lines (absence communicates
+/// full precision). Preserves hf-fm's v0.10.2 sort order: anamnesis returns
+/// tensors sorted alphabetically by name, but hf-fm's inspect table has
+/// always been file-ordered (sorted by start offset) so users can spot
+/// first/last tensors per shard at a glance.
+fn safetensors_header_to_info(
+    header: anamnesis::SafetensorsHeader,
+    file_size: Option<u64>,
+) -> SafetensorsHeaderInfo {
     // CAST: usize → u64, anamnesis caps header_size at 100 MiB so it always fits in u64
     #[allow(clippy::as_conversions)]
     let header_size = header.header_size as u64;
 
-    // Phase C: derive `quant_info` before the `header.tensors` move below.
-    // `anamnesis::InspectInfo::from(&header)` iterates the already-parsed
-    // tensors and aggregates per-role byte sums — pure computation, no I/O.
-    // Unquantized models produce no `quant_info` so the renderer suppresses
-    // the new `Format:` / `Size:` lines (absence communicates full precision).
     let quant_info = if header.scheme == anamnesis::QuantScheme::Unquantized {
         None
     } else {
@@ -531,115 +485,15 @@ pub fn inspect_safetensors_local(path: &Path) -> Result<SafetensorsHeaderInfo, F
         })
         .collect();
 
-    // Preserve hf-fm's v0.10.2 sort order. Anamnesis returns tensors sorted
-    // alphabetically by name; hf-fm's inspect table has always been
-    // file-ordered (sorted by start offset) so users can spot first/last
-    // tensors per shard at a glance.
     tensors.sort_by_key(|t| t.data_offsets.0);
 
-    Ok(SafetensorsHeaderInfo {
+    SafetensorsHeaderInfo {
         tensors,
         metadata: header.metadata,
         header_size,
-        file_size: Some(file_size),
+        file_size,
         quant_info,
-    })
-}
-
-// -----------------------------------------------------------------------
-// Remote fetching (HTTP Range requests)
-// -----------------------------------------------------------------------
-
-/// Fetches safetensors header bytes via two HTTP Range requests.
-///
-/// 1. `Range: bytes=0-7` → 8-byte header length (little-endian `u64`)
-/// 2. `Range: bytes=8-{8+length-1}` → JSON header
-///
-/// Returns `(json_bytes, total_file_size)`. The file size is extracted from
-/// the `Content-Range` header of the first request.
-async fn fetch_header_bytes(
-    client: &reqwest::Client,
-    url: &str,
-    filename: &str,
-) -> Result<(Vec<u8>, Option<u64>), FetchError> {
-    // Request 1: 8-byte length prefix.
-    let resp1 = client
-        .get(url)
-        .header(reqwest::header::RANGE, "bytes=0-7")
-        .send()
-        .await
-        .map_err(|e| {
-            FetchError::Http(format!("failed to fetch header length for {filename}: {e}"))
-        })?;
-
-    if !resp1.status().is_success() && resp1.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(FetchError::Http(format!(
-            "Range request for {filename} returned status {}",
-            resp1.status()
-        )));
     }
-
-    // Extract total file size from Content-Range: bytes 0-7/{total}
-    let file_size = resp1
-        .headers()
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split('/').next_back())
-        .and_then(|s| s.parse::<u64>().ok());
-
-    let len_bytes = resp1.bytes().await.map_err(|e| {
-        FetchError::Http(format!("failed to read header length for {filename}: {e}"))
-    })?;
-
-    if len_bytes.len() < 8 {
-        return Err(FetchError::SafetensorsHeader {
-            filename: filename.to_owned(),
-            reason: format!(
-                "expected 8 bytes for length prefix, got {}",
-                len_bytes.len()
-            ),
-        });
-    }
-
-    // INDEX: first 8 bytes guaranteed by length check above
-    #[allow(clippy::indexing_slicing)]
-    let header_size = u64::from_le_bytes([
-        len_bytes[0],
-        len_bytes[1],
-        len_bytes[2],
-        len_bytes[3],
-        len_bytes[4],
-        len_bytes[5],
-        len_bytes[6],
-        len_bytes[7],
-    ]);
-
-    // Request 2: JSON header.
-    let range_end = 8u64.saturating_add(header_size).saturating_sub(1);
-    let range_header = format!("bytes=8-{range_end}");
-    let resp2 = client
-        .get(url)
-        // BORROW: explicit .as_str() instead of Deref coercion
-        .header(reqwest::header::RANGE, range_header.as_str())
-        .send()
-        .await
-        .map_err(|e| {
-            FetchError::Http(format!("failed to fetch header JSON for {filename}: {e}"))
-        })?;
-
-    if !resp2.status().is_success() && resp2.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(FetchError::Http(format!(
-            "Range request for {filename} header JSON returned status {}",
-            resp2.status()
-        )));
-    }
-
-    let json_bytes = resp2
-        .bytes()
-        .await
-        .map_err(|e| FetchError::Http(format!("failed to read header JSON for {filename}: {e}")))?;
-
-    Ok((json_bytes.to_vec(), file_size))
 }
 
 // -----------------------------------------------------------------------
@@ -648,56 +502,80 @@ async fn fetch_header_bytes(
 
 /// Inspects a single `.safetensors` file's header (cache-first).
 ///
-/// Checks the local HF cache first. If the file is cached, reads the header
-/// from disk with zero network requests. Otherwise, falls back to two HTTP
-/// Range requests (8-byte length prefix + JSON header). Does not download
-/// tensor data in either case.
+/// Checks the local `HF` cache first. If the file is cached, reads the
+/// header from disk with zero network requests. Otherwise, opens an
+/// [`HttpRangeReader`] over the file and runs
+/// `anamnesis::parse_safetensors_header_from_reader` against it on a
+/// blocking thread (v0.11.1 — previously a bespoke two-Range-request
+/// fetcher that didn't go through anamnesis; see `safetensors_header_to_info`
+/// for the mapping now shared with the cache-hit path). The safetensors
+/// header is sequential at the very start of the file, so the reader's
+/// 4 KiB read-ahead window typically satisfies both the 8-byte length
+/// prefix and the `JSON` header in a single range fetch — a second fetch
+/// only fires when the header exceeds that window. The reported
+/// [`RangeStats`] additionally counts the reader's one-time access probe
+/// (2 requests), so the `Source:` line typically shows 3–4 total for this
+/// path. No tensor data is downloaded in either case.
+///
+/// The third tuple element reports the remote transfer statistics
+/// ([`RangeStats`]: request count + bytes fetched); `None` on the cached
+/// path. Mirrors [`inspect_npz`]'s shape so the `hf-fm` CLI renders both
+/// formats' `Source:` line identically.
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Http`] if the Range requests fail.
-/// Returns [`FetchError::SafetensorsHeader`] if the header is malformed.
+/// Returns [`FetchError::Http`] if the Range probe or a range request
+/// fails — including gated repos, which surface as `returned status
+/// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
+/// diagnosis).
+/// Returns [`FetchError::SafetensorsHeader`] if the header is malformed
+/// (cached or remote).
 pub async fn inspect_safetensors(
     repo_id: &str,
     filename: &str,
     token: Option<&str>,
     revision: Option<&str>,
-) -> Result<(SafetensorsHeaderInfo, InspectSource), FetchError> {
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     let rev = revision.unwrap_or("main");
 
     // Try local cache first.
     if let Some(cached_path) = resolve_cached_path(repo_id, rev, filename) {
         let info = inspect_safetensors_local(&cached_path)?;
-        return Ok((info, InspectSource::Cached));
+        return Ok((info, InspectSource::Cached, None));
     }
 
-    // Fall back to HTTP Range requests.
-    let client = chunked::build_client(token)?;
-    let url = chunked::build_download_url(repo_id, rev, filename);
+    // Fall back to HTTP Range requests: probe eagerly (typed errors here),
+    // then hand the reader to a blocking thread for the sync parse.
+    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    let file_size = reader.total_size();
 
-    // BORROW: explicit .as_str() instead of Deref coercion
-    let (json_bytes, file_size) = fetch_header_bytes(&client, url.as_str(), filename).await?;
+    let (parse_result, stats, transport_error) = tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        // `&mut` keeps ownership here so stats and the typed transport
+        // error survive the parse (std's blanket `Read` for `&mut R`).
+        let result = anamnesis::parse_safetensors_header_from_reader(&mut reader);
+        (result, reader.stats(), reader.take_last_error())
+    })
+    .await
+    .map_err(|e| FetchError::Http(format!("failed to join safetensors inspect task: {e}")))?;
 
-    // CAST: usize → u64, JSON buffer length is always small
-    #[allow(clippy::as_conversions)]
-    let header_size = json_bytes.len() as u64;
-
-    let (tensors, metadata) = parse_header_json(&json_bytes, filename)?;
-
-    Ok((
-        SafetensorsHeaderInfo {
-            tensors,
-            metadata,
-            header_size,
-            file_size,
-            // Remote path doesn't go through anamnesis yet; quant detection
-            // arrives in v0.11.1 when this path migrates to
-            // `anamnesis::parse_safetensors_header_from_reader` over an
-            // HTTP Range adapter.
-            quant_info: None,
-        },
-        InspectSource::Remote,
-    ))
+    match parse_result {
+        Ok(header) => Ok((
+            safetensors_header_to_info(header, Some(file_size)),
+            InspectSource::Remote,
+            Some(stats),
+        )),
+        // Prefer the typed transport error over anamnesis's io-flattened
+        // wrapper — an HTTP 401/403 must stay recognisable for the CLI's
+        // gated-repo diagnosis.
+        Err(e) => Err(
+            transport_error.unwrap_or_else(|| FetchError::SafetensorsHeader {
+                // BORROW: explicit .to_owned() for owned String in the error variant
+                filename: filename.to_owned(),
+                reason: format!("failed to parse safetensors header: {e}"),
+            }),
+        ),
+    }
 }
 
 /// Inspects a single `.safetensors` file from cache only.
@@ -1177,7 +1055,11 @@ pub async fn inspect_repo_safetensors(
                 .await
                 .map_err(|e| FetchError::Http(format!("semaphore error: {e}")))?;
             // BORROW: explicit .as_deref() for Option<String> → Option<&str>
-            let (info, source) =
+            // Range stats aren't part of this multi-file listing's shape
+            // (only the per-file `Cached`/`Remote` provenance is); the
+            // single-file `inspect_safetensors` caller in the `hf-fm` CLI
+            // is what renders them.
+            let (info, source, _stats) =
                 inspect_safetensors(&repo, &filename, tok.as_deref(), rev.as_deref()).await?;
             Ok::<_, FetchError>((filename, info, source))
         });

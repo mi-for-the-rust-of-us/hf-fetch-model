@@ -19,7 +19,7 @@ async fn main() -> Result<(), hf_fetch_model::FetchError> {
 
     println!("Inspecting {repo_id}...\n");
 
-    // Read tensor metadata — only 2 HTTP requests per file, no weight download.
+    // Read tensor metadata — a handful of range requests per file, no weight download.
     let results = inspect::inspect_repo_safetensors(&repo_id, None, None).await?;
 
     let mut total_params: u64 = 0;

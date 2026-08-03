@@ -35,7 +35,7 @@ These are distinct from the single-oversized-field shape in [#3533](https://gith
 
 **One scope note, so this is not overstated:** it is availability only, not Remote Code Execution. `reduce` (L296-312) builds an `Object::Reduce { ... }` without invoking the callable, so there is no pickle code-execution path here. The concern is purely the DoS.
 
-**A minimal fix would mirror the GGUF one:** a working-set byte budget charged on each `Object` push and memo clone, a depth cap on `Object` construction (in the spirit of `GGUF_MAX_VALUE_DEPTH`), and `checked_mul` on any derived size. We shipped and `cargo-fuzz`-ed exactly this in [anamnesis](https://github.com/PCfVW/anamnesis); details and minimal repros below.
+**A minimal fix would mirror the GGUF one:** a working-set byte budget charged on each `Object` push and memo clone, a depth cap on `Object` construction (in the spirit of `GGUF_MAX_VALUE_DEPTH`), and `checked_mul` on any derived size. We shipped and `cargo-fuzz`-ed exactly this in [anamnesis](https://github.com/mi-for-the-rust-of-us/anamnesis); details and minimal repros below.
 
 Hoping this helps!
 
@@ -48,7 +48,7 @@ anamnesis is a pure-Rust tensor-file parser whose own pickle VM had the same str
 2. **A permanent construction-depth cap** (`MAX_PICKLE_VM_DEPTH`, 256), so an over-deep value never forms, and recursive `Drop` (and every recursive walk) stays shallow. Same idea as `GGUF_MAX_VALUE_DEPTH`, at pickle construction time.
 3. The accounting is deliberately `O(1)` per opcode (depth tracked incrementally, deep-size walk only on memo-clone opcodes). A naive per-push deep walk would itself be an `O(n^2)` CPU-DoS in the guard.
 
-`cargo-fuzz`-ed: the pickle/PTH targets ran clean — `fuzz_pth` 381k runs and `fuzz_pth_limits` 193k runs, RSS-limited so an unbounded-heap regression surfaces as an OOM. See the campaign log in [`fuzz/README.md`](https://github.com/PCfVW/anamnesis/blob/main/fuzz/README.md).
+`cargo-fuzz`-ed: the pickle/PTH targets ran clean — `fuzz_pth` 381k runs and `fuzz_pth_limits` 193k runs, RSS-limited so an unbounded-heap regression surfaces as an OOM. See the campaign log in [`fuzz/README.md`](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/fuzz/README.md).
 
 </details>
 

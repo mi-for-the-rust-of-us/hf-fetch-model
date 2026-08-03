@@ -1,6 +1,6 @@
 # hf-fetch-model
 
-[![CI](https://github.com/PCfVW/hf-fetch-model/actions/workflows/ci.yml/badge.svg)](https://github.com/PCfVW/hf-fetch-model/actions/workflows/ci.yml)
+[![CI](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/actions/workflows/ci.yml/badge.svg)](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/hf-fetch-model)](https://crates.io/crates/hf-fetch-model)
 [![docs.rs](https://img.shields.io/docsrs/hf-fetch-model)](https://docs.rs/hf-fetch-model)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
@@ -160,7 +160,7 @@ $ hf-fm inspect EleutherAI/pythia-1.4b model.safetensors --cached --filter "laye
 $ hf-fm inspect google/gemma-4-E2B-it model.safetensors --tree --filter "embed"
   Repo:     google/gemma-4-E2B-it
   File:     model.safetensors
-  Source:   remote (2 HTTP requests)
+  Source:   remote (4 range requests, 182.4 KiB fetched)
 
   └── model.
       ├── embed_audio.embedding_projection.weight   BF16  [1536, 1536]   4.50 MiB
@@ -284,7 +284,7 @@ Filter, progress, auth, and more via the builder — see [Configuration](docs/co
 
 ## Used by
 
-- [candle-mi](https://github.com/PCfVW/candle-mi) — Mechanistic interpretability toolkit for language models
+- [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi) — Mechanistic interpretability toolkit for language models
 
 ## License
 
@@ -293,7 +293,7 @@ or [MIT License](LICENSE-MIT) at your option.
 
 ## Development
 
-- Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev) and [Augment Code](https://www.augmentcode.com/) (review)
+- Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev)
 - Git workflow managed with [Fork](https://fork.dev/)
 - All code follows [CONVENTIONS.md](CONVENTIONS.md), derived from [Amphigraphic-Strict](https://github.com/PCfVW/Amphigraphic-Strict)'s [Grit](https://github.com/PCfVW/Amphigraphic-Strict/tree/master/Grit) — a strict Rust subset designed to improve AI coding accuracy.
 - CI gates every push and PR: `cargo fmt --check`, `clippy --all-targets --all-features -D warnings`, and the test suite on **Linux and Windows**, plus a [`cargo audit`](https://github.com/rustsec/rustsec) security pass. Vulnerability disclosure: see [SECURITY.md](SECURITY.md).

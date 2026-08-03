@@ -311,7 +311,7 @@ $ hf-fm inspect google/gemma-4-E2B-it model.safetensors --check-gpu
 
 Validates the `hypomnesis` API surface against a real consumer before `candle-mi` migrates in `hypomnesis` Phase 3 (candle-mi v0.2). Implementation-light on the hf-fm side: read the device info, format the verdict alongside the existing inspect output. The hard work — Windows DXGI per-process VRAM, NVML `u64::MAX` sentinel handling, `nvidia-smi` fallback — lives in `hypomnesis` and is already battle-tested code ported from candle-mi.
 
-**Status:** shipped. `hypomnesis 0.2.0` (the current tip; the originally-planned 0.1.0 was bumped because 0.2 is API-additive over 0.1 and the upstream brief moved on). hf-fm v0.10.1 is the proof-of-concept consumer named in the [hypomnesis brief](https://github.com/PCfVW/hypomnesis/blob/main/docs/hypomnesis-brief.md) under *First consumer*. Concrete adoption feedback for the upstream maintainer (us) is captured in [`docs/dogfooding-feedbacks/hypomnesis-adoption.md`](../dogfooding-feedbacks/hypomnesis-adoption.md).
+**Status:** shipped. `hypomnesis 0.2.0` (the current tip; the originally-planned 0.1.0 was bumped because 0.2 is API-additive over 0.1 and the upstream brief moved on). hf-fm v0.10.1 is the proof-of-concept consumer named in the [hypomnesis brief](https://github.com/mi-for-the-rust-of-us/hypomnesis/blob/main/docs/hypomnesis-brief.md) under *First consumer*. Concrete adoption feedback for the upstream maintainer (us) is captured in [`docs/dogfooding-feedbacks/hypomnesis-adoption.md`](../dogfooding-feedbacks/hypomnesis-adoption.md).
 
 ### v0.10.2 — GGUF inspect (cached) + anamnesis dep + hypomnesis 0.2.1 adoption
 
@@ -505,7 +505,7 @@ Each commit is independently shippable: if a later one stalls, the remainder sti
 
 ---
 
-The v0.11 minor is dedicated to **remote inspection**. v0.11.0 builds an `HttpRangeReader: Read + Seek` adapter once over `reqwest` Range requests; each subsequent patch wires one more tensor format through the same adapter. anamnesis owns format knowledge; hf-fm owns HTTP plumbing. Format order is risk-ascending: NPZ (anamnesis primitive already shipped in v0.4.3) → safetensors (small library work, retires the bespoke parser) → GGUF (medium library work, the originally-promised v0.11.0 feature) → PTH (largest library work, lowest demand). v0.11.4 then generalises the substrate **beyond the tensor-format matrix** — `peek` reuses `HttpRangeReader` for arbitrary small text / config / `.gz`-compressed sidecar files (`config.yaml`, `README.md`, `index.json.gz`), with no anamnesis dispatch.
+The v0.11 minor is dedicated to **remote inspection**. v0.11.0 builds an `HttpRangeReader: Read + Seek` adapter once over `reqwest` Range requests; each subsequent patch wires one more tensor format through the same adapter. anamnesis owns format knowledge; hf-fm owns HTTP plumbing. Format order is risk-ascending: NPZ (anamnesis primitive already shipped in v0.4.3) → safetensors (anamnesis primitive already shipped in v0.4.4, pure hf-fm wiring, retires the bespoke parser) → GGUF (medium library work, the originally-promised v0.11.0 feature) → PTH (largest library work, lowest demand). v0.11.4 then generalises the substrate **beyond the tensor-format matrix** — `peek` reuses `HttpRangeReader` for arbitrary small text / config / `.gz`-compressed sidecar files (`config.yaml`, `README.md`, `index.json.gz`), with no anamnesis dispatch.
 
 ### v0.11.0 — Remote inspect framework + NPZ remote ✓
 
@@ -523,11 +523,12 @@ The v0.11 minor is dedicated to **remote inspection**. v0.11.0 builds an `HttpRa
 
 | Feature | Scope |
 |---------|-------|
-| `parse_safetensors_header_from_reader<R: Read>` (anamnesis library work) | New ~30 LOC primitive in anamnesis. **No `Seek` needed** — the safetensors header is sequential at the start of the file. Reads the 8-byte length prefix, then the JSON header, then parses it. |
-| Retire hf-fm's bespoke `fetch_header_bytes` | Replace with a small wrapper that issues two HTTP Range requests (length prefix + header bytes) and feeds them as a `Read` to the new anamnesis primitive. |
+| Retire hf-fm's bespoke `fetch_header_bytes` | Feed `HttpRangeReader` (v0.11.0, already `Read + Seek`) directly into `anamnesis::parse_safetensors_header_from_reader<R: Read>` — the two types are already compatible, no adapter needed. Deletes hf-fm's manual two-Range-request fetch (length prefix + header bytes) and its hand-rolled JSON parsing entirely; `src/inspect.rs`'s `fetch_header_bytes` goes away. |
 | `Header:` line polish for NPZ / PTH | Cosmetic nit spotted during v0.11.0 dogfooding: remote **and** cached NPZ print `Header: 0 B (JSON), <total> total` — the `0 B (JSON)` prefix is a safetensors-ism (v0.10.3's render polish dropped it for GGUF only). Extend the same fix to NPZ / PTH: these formats have no discrete header, so render just `Header: <total> total` (or relabel the line `Size:`). Render-path only, ~10 LOC in `format_header_line`. |
 
-**User-facing:** no behavioural change on safetensors — `hf-fm inspect <repo> file.safetensors` works identically; NPZ / PTH lose a misleading `0 B (JSON)` prefix. **Architecturally:** single source of truth for safetensors layout. The duplicated parser is gone.
+**No anamnesis library work required.** The plan originally called for a new ~30 LOC reader-based primitive in anamnesis; `parse_safetensors_header_from_reader<R: Read>` turns out to have already shipped in anamnesis 0.4.4 (2026-05-02), months before this phase — hf-fm's existing `anamnesis = "0.6.9"` dependency already includes it. This phase is now pure hf-fm-side wiring: smaller than originally scoped, and safe to do immediately since it depends on nothing beyond what's already in tree.
+
+**User-facing:** no behavioural change on safetensors — `hf-fm inspect <repo> file.safetensors` works identically; NPZ / PTH lose a misleading `0 B (JSON)` prefix. **Architecturally:** single source of truth for safetensors layout — remote and cached paths both go through the same anamnesis primitive. The duplicated parser is gone.
 
 ### v0.11.2 — Remote GGUF inspect
 
