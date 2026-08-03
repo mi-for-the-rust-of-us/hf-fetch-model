@@ -9195,24 +9195,26 @@ More content.
     }
 
     #[test]
-    fn format_header_line_gguf_with_total() {
+    fn format_header_line_headerless_with_total() {
+        // Shared branch for GGUF / NPZ / PTH (v0.11.1) — all three report
+        // header_size == 0 and pass is_headerless == true.
         let line = format_header_line(0, Some(3_705_032_704), true);
         assert!(
             line.starts_with("Size:"),
-            "GGUF line should use `Size:` label, got: {line}"
+            "headerless-format line should use `Size:` label, got: {line}"
         );
         assert!(
             !line.contains("(JSON)"),
-            "GGUF line must not have safetensors-flavoured `(JSON)`, got: {line}"
+            "headerless-format line must not have safetensors-flavoured `(JSON)`, got: {line}"
         );
         assert!(
             !line.contains(" 0 B "),
-            "GGUF line must not show the meaningless `0 B` prefix, got: {line}"
+            "headerless-format line must not show the meaningless `0 B` prefix, got: {line}"
         );
     }
 
     #[test]
-    fn format_header_line_gguf_without_total() {
+    fn format_header_line_headerless_without_total() {
         let line = format_header_line(0, None, true);
         assert_eq!(line, "Size:     (size unknown)");
     }
