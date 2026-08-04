@@ -25,7 +25,7 @@ cli = ["dep:clap", "dep:tracing-subscriber", "indicatif"]
 # lines fire on cached BnB / GPTQ / AWQ safetensors (without them the
 # tensors classify as `Passthrough` and `detect_scheme` returns
 # `Unquantized` — silently no-op for the families the feature targets).
-anamnesis = { version = "0.6.9", features = ["gguf", "npz", "pth", "bnb", "gptq", "awq"] }
+anamnesis = { version = "0.7.2", features = ["gguf", "npz", "pth", "bnb", "gptq", "awq"] }
 clap = { version = "4", features = ["derive"], optional = true }
 dirs = "6"
 fs2 = "0.4"
@@ -103,3 +103,9 @@ missing_panics_doc = "warn"
 # Allow noisy pedantic lints
 module_name_repetitions = "allow"
 too_many_lines = "allow"
+
+[patch.crates-io]
+# TEMPORARY — anamnesis 0.7.2 (GgufFrontMatter / parse_gguf_front_matter_from_reader,
+# v0.11.2's remote GGUF inspect) is committed locally but not yet published to
+# crates.io. Remove this override and regenerate Cargo.lock once it is.
+anamnesis = { path = "../anamnesis" }

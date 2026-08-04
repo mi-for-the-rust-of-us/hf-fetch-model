@@ -1241,4 +1241,105 @@ mod tests {
         assert_eq!(header.tensors.len(), 3);
         assert_eq!(reader.stats().requests, 1);
     }
+
+    // ---------- GGUF end-to-end over the reader ----------
+
+    /// In-memory `GGUF` v3 byte-stream builder — mirrors the layout
+    /// anamnesis's parser expects (magic, version, counts, tensor-info
+    /// table, alignment-padded data section). Minimal: no metadata KV
+    /// entries, `F32` tensors only (`GGML_TYPE_F32 = 0`).
+    struct GgufBuilder {
+        buf: Vec<u8>,
+    }
+
+    impl GgufBuilder {
+        fn new(tensor_count: u64) -> Self {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"GGUF");
+            buf.extend_from_slice(&3u32.to_le_bytes()); // version
+            buf.extend_from_slice(&tensor_count.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes()); // kv_count = 0
+            Self { buf }
+        }
+
+        fn push_f32_tensor_info(&mut self, name: &str, shape: &[u64], relative_offset: u64) {
+            self.buf
+                .extend_from_slice(&u64::try_from(name.len()).unwrap().to_le_bytes());
+            self.buf.extend_from_slice(name.as_bytes());
+            self.buf
+                .extend_from_slice(&u32::try_from(shape.len()).unwrap().to_le_bytes());
+            for d in shape {
+                self.buf.extend_from_slice(&d.to_le_bytes());
+            }
+            self.buf.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32 = 0
+            self.buf.extend_from_slice(&relative_offset.to_le_bytes());
+        }
+
+        fn pad_to_alignment(&mut self, alignment: usize) {
+            let rem = self.buf.len() % alignment;
+            if rem != 0 {
+                self.buf.extend(std::iter::repeat_n(0u8, alignment - rem));
+            }
+        }
+
+        fn push_zeros(&mut self, n: usize) {
+            self.buf.extend(std::iter::repeat_n(0u8, n));
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.buf
+        }
+    }
+
+    /// Builds a minimal `GGUF` v3 byte stream: two `F32` tensors, no
+    /// metadata, default 32-byte alignment. `b_dec` carries 600 KiB of data
+    /// the front-matter parse must never fetch — same magnitude as the NPZ
+    /// fixture above, for an apples-to-apples `bytes_fetched` comparison.
+    fn synthetic_gguf() -> Vec<u8> {
+        let mut b = GgufBuilder::new(2);
+        b.push_f32_tensor_info("w_enc", &[2, 3], 0);
+        b.push_f32_tensor_info("b_dec", &[153_600], 32);
+        b.pad_to_alignment(32); // end of tensor-info table -> data_section_start
+        b.push_zeros(24); // w_enc data (2*3*4 bytes)
+        b.push_zeros(8); // pad up to b_dec's relative offset 32
+        b.push_zeros(153_600 * 4); // b_dec data (600 KiB)
+        b.finish()
+    }
+
+    #[test]
+    fn gguf_front_matter_over_range_reader_reads_metadata_not_data() {
+        let gguf = synthetic_gguf();
+        let total = u64::try_from(gguf.len()).unwrap();
+        let mut reader = RangeReader::new(InMemoryFetcher::new(gguf));
+
+        let front = anamnesis::parse_gguf_front_matter_from_reader(&mut reader)
+            .expect("synthetic GGUF must parse cleanly");
+
+        assert_eq!(front.tensor_infos.len(), 2);
+        let names: Vec<&str> = front.tensor_infos.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"w_enc"), "names: {names:?}");
+        assert!(names.contains(&"b_dec"), "names: {names:?}");
+        let b_dec = front
+            .tensor_infos
+            .iter()
+            .find(|t| t.name == "b_dec")
+            .unwrap();
+        assert_eq!(b_dec.shape, vec![153_600]);
+
+        // The efficiency property this module exists for: metadata-only
+        // transfer, a small number of requests, no weight data fetched.
+        // Measured: exactly 1 range request, 64 KiB fetched (bounded by the
+        // reader's internal `BufReader` capacity) out of the 600 KiB payload.
+        let stats = reader.stats();
+        assert!(
+            stats.requests <= 8,
+            "expected a handful of range requests, got {}",
+            stats.requests
+        );
+        assert!(
+            stats.bytes_fetched < total / 4,
+            "fetched {} of {total} bytes — front-matter parse must not read tensor data",
+            stats.bytes_fetched
+        );
+    }
 }

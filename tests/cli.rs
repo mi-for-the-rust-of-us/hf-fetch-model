@@ -2014,20 +2014,12 @@ fn inspect_cached_pth_renders() {
 }
 
 #[test]
-fn inspect_remote_gguf_and_pth_error_names_their_release() {
-    // v0.11.0: `.npz` left the cached-only gate (remote NPZ rides the new
-    // `HttpRangeReader` adapter); `.gguf` / `.pth` remain cached-only and
-    // the rejection now names each format's actual planned release. The
-    // dispatch rejects before any network I/O, so this test runs offline.
-    let (_stdout, stderr, success) =
-        run(hf_fm().args(["inspect", "some-org/some-model", "model.gguf"]));
-    assert!(!success, "remote GGUF inspect must be rejected");
-    assert!(
-        stderr.contains("remote GGUF inspect not yet supported")
-            && stderr.contains("planned for v0.11.2"),
-        "GGUF rejection should name v0.11.2, got:\n{stderr}"
-    );
-
+fn inspect_remote_pth_errors_names_its_release() {
+    // v0.11.2: `.gguf` left the cached-only gate (remote GGUF rides the same
+    // `HttpRangeReader` adapter as NPZ/safetensors, via anamnesis's new
+    // `parse_gguf_front_matter_from_reader`); `.pth` remains cached-only and
+    // the rejection still names its actual planned release. The dispatch
+    // rejects before any network I/O, so this test runs offline.
     let (_stdout, stderr, success) =
         run(hf_fm().args(["inspect", "some-org/some-model", "weights.pth"]));
     assert!(!success, "remote PTH inspect must be rejected");

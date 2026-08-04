@@ -384,15 +384,16 @@ See also: hf-fm list-families, hf-fm discover")]
         #[arg(long)]
         json: bool,
     },
-    /// Inspect tensor file headers (`.safetensors` / `.npz` remote/cached; `.gguf` / `.pth` cached).
+    /// Inspect tensor file headers (`.safetensors` / `.npz` / `.gguf` remote/cached; `.pth` cached).
     ///
     /// Reads tensor metadata without downloading full weight data. For
-    /// `.safetensors` and `.npz`, checks the local cache first and falls
-    /// back to HTTP Range requests (`.npz` fetches only the archive
+    /// `.safetensors`, `.npz`, and `.gguf`, checks the local cache first and
+    /// falls back to HTTP Range requests (`.npz` fetches only the archive
     /// directory and array headers — typically 100–200 KiB even on
-    /// multi-hundred-MiB archives). For `.gguf` / `.pth`, only cached inspect is
-    /// supported (remote inspect is planned for v0.11.2 / v0.11.3); pass
-    /// `--cached` after downloading the file.
+    /// multi-hundred-MiB archives; `.gguf` fetches only the front-loaded
+    /// metadata and tensor-info table, never the weight data). For `.pth`,
+    /// only cached inspect is supported (remote inspect is planned for
+    /// v0.11.3); pass `--cached` after downloading the file.
     #[command(after_help = "Examples:\n  \
         hf-fm inspect <repo>                                    # inspect every .safetensors in the repo\n  \
         hf-fm inspect <repo> --filter blocks.0.                 # matched tensor names (per shard/file)\n  \
@@ -5893,10 +5894,9 @@ fn run_inspect_single(
     check_gpu: Option<u32>,
     context: Option<u32>,
 ) -> Result<(), FetchError> {
-    // Classify extension once; v0.11.0 dispatches across .safetensors and
-    // .npz (remote or cached — .npz rides the `HttpRangeReader` adapter) and
-    // .gguf / .pth (cached only — remote inspect for these two arrives in
-    // v0.11.2 / v0.11.3 on the same adapter).
+    // Classify extension once. .safetensors / .npz (since v0.11.0/v0.11.1)
+    // and .gguf (since v0.11.2) all dispatch remote-or-cached over the same
+    // `HttpRangeReader` adapter; .pth remains cached-only until v0.11.3.
     let ext_lc = Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
@@ -5915,14 +5915,9 @@ fn run_inspect_single(
         });
     }
 
-    if (is_gguf || is_pth) && !cached {
-        let (format_label, planned) = if is_pth {
-            ("PTH", "v0.11.3")
-        } else {
-            ("GGUF", "v0.11.2")
-        };
+    if is_pth && !cached {
         return Err(FetchError::InvalidArgument(format!(
-            "remote {format_label} inspect not yet supported (planned for {planned}): \
+            "remote PTH inspect not yet supported (planned for v0.11.3): \
              pass --cached after downloading {filename} with `hf-fm download`"
         )));
     }
@@ -5939,7 +5934,7 @@ fn run_inspect_single(
         };
         (info, inspect::InspectSource::Cached, None)
     } else {
-        // Reachable only when is_safetensors or is_npz (the .gguf/.pth
+        // Reachable only when is_safetensors, is_npz, or is_gguf (the .pth
         // cached-only branch returned earlier; the unclassified branch
         // returned earlier).
         // BORROW: explicit String::from for Option<&str> → Option<String>
@@ -5954,6 +5949,13 @@ fn run_inspect_single(
         // BORROW: explicit .as_deref() for Option<String> → Option<&str>
         if is_npz {
             rt.block_on(inspect::inspect_npz(
+                repo_id,
+                filename,
+                token.as_deref(),
+                revision,
+            ))?
+        } else if is_gguf {
+            rt.block_on(inspect::inspect_gguf(
                 repo_id,
                 filename,
                 token.as_deref(),

@@ -3,15 +3,17 @@
 //! Tensor-file header inspection (local and remote).
 //!
 //! Reads tensor metadata (names, shapes, dtypes, byte offsets) without
-//! downloading full weight data. `.safetensors` and `.npz` files both
-//! resolve cache-first with an [`HttpRangeReader`] fallback — `.npz` since
-//! v0.11.0 ([`inspect_npz`] drives `anamnesis::inspect_npz_from_reader`
+//! downloading full weight data. `.safetensors`, `.npz`, and `.gguf` files
+//! all resolve cache-first with an [`HttpRangeReader`] fallback — `.npz`
+//! since v0.11.0 ([`inspect_npz`] drives `anamnesis::inspect_npz_from_reader`
 //! over the reader), `.safetensors` since v0.11.1 ([`inspect_safetensors`]
 //! drives `anamnesis::parse_safetensors_header_from_reader` over the same
-//! reader); `.gguf` / `.pth` files are inspected from the
-//! local cache via the `anamnesis` parser crate ([`inspect_gguf_cached`] /
-//! [`inspect_pth_cached`] — remote inspect for those two is planned for
-//! v0.11.2 / v0.11.3).
+//! reader), `.gguf` since v0.11.2 ([`inspect_gguf`] drives
+//! `anamnesis::parse_gguf_front_matter_from_reader` over the same reader —
+//! anamnesis's earlier `inspect_gguf_from_reader`, 0.4.5, is summary-only
+//! and insufficient for `hf-fm`'s per-tensor rendering); `.pth` files are
+//! inspected from the local cache only via the `anamnesis` parser crate
+//! ([`inspect_pth_cached`] — remote inspect is planned for v0.11.3).
 //!
 //! The primary types are [`TensorInfo`] (per-tensor metadata),
 //! [`SafetensorsHeaderInfo`] (the format-agnostic parsed-header shape all
@@ -667,8 +669,39 @@ pub fn inspect_gguf_cached(
             reason: format!("failed to parse GGUF: {e}"),
         })?;
 
-    let tensors: Vec<TensorInfo> = parsed
-        .tensor_info()
+    Ok(gguf_front_matter_to_header_info(
+        parsed.tensor_info(),
+        parsed.metadata(),
+        parsed.version(),
+        parsed.alignment(),
+        file_size,
+    ))
+}
+
+/// Maps parsed `GGUF` front matter into the format-agnostic
+/// [`SafetensorsHeaderInfo`] shape used by hf-fm's render path.
+///
+/// Shared by the cached ([`inspect_gguf_cached`], via `anamnesis::parse_gguf`
+/// → `ParsedGguf::tensor_info`/`::metadata`) and remote ([`inspect_gguf`],
+/// via `anamnesis::parse_gguf_front_matter_from_reader` → `GgufFrontMatter`'s
+/// same-named fields) paths, so the two cannot drift.
+///
+/// **Metadata surfacing:** the GGUF metadata table can contain very large
+/// arrays (e.g. `tokenizer.ggml.tokens` with 50K+ entries). To keep
+/// `Metadata:` rendering useful, this function surfaces *scalar* metadata
+/// values only — strings, booleans, integers, floats — and skips arrays.
+/// The GGUF format version is surfaced under the synthetic key
+/// `gguf.version`, the effective alignment under `gguf.alignment`. The
+/// original `general.architecture`, `general.name`, and friends pass
+/// through unchanged.
+fn gguf_front_matter_to_header_info(
+    tensor_infos: &[anamnesis::GgufTensorInfo],
+    metadata: &HashMap<String, anamnesis::GgufMetadataValue>,
+    version: u32,
+    alignment: u32,
+    file_size: Option<u64>,
+) -> SafetensorsHeaderInfo {
+    let tensors: Vec<TensorInfo> = tensor_infos
         .iter()
         .map(|info| {
             let start = info.data_offset;
@@ -687,20 +720,19 @@ pub fn inspect_gguf_cached(
     // Stringify scalar metadata only; skip arrays (potentially huge — e.g.
     // tokenizer.ggml.tokens). Add synthetic keys for the format version and
     // alignment so they appear in the `Metadata:` block.
-    let mut metadata: HashMap<String, String> = parsed
-        .metadata()
+    let mut metadata_out: HashMap<String, String> = metadata
         .iter()
         // BORROW: explicit .clone() to materialise an owned String key from
         // the borrowed HashMap iteration
         .filter_map(|(k, v)| stringify_gguf_scalar(v).map(|s| (k.clone(), s)))
         .collect();
     // BORROW: explicit .to_owned() for owned String keys
-    metadata.insert("gguf.version".to_owned(), parsed.version().to_string());
-    metadata.insert("gguf.alignment".to_owned(), parsed.alignment().to_string());
+    metadata_out.insert("gguf.version".to_owned(), version.to_string());
+    metadata_out.insert("gguf.alignment".to_owned(), alignment.to_string());
 
-    Ok(SafetensorsHeaderInfo {
+    SafetensorsHeaderInfo {
         tensors,
-        metadata: Some(metadata),
+        metadata: Some(metadata_out),
         // GGUF has no discrete "header size" like safetensors's
         // u64-length-prefix + JSON. The value is left at 0 here; consumers
         // that care can derive an approximation from `file_size` minus the
@@ -711,7 +743,87 @@ pub fn inspect_gguf_cached(
         // GGUF quant info (Q4_K_M etc.) is implicit in per-tensor dtypes;
         // the v0.10.3 Phase C `Format:` / `Size:` lines are safetensors-only.
         quant_info: None,
+    }
+}
+
+/// Inspects a single `.gguf` file's metadata (cache-first, remote fallback).
+///
+/// Checks the local `HF` cache first. If the file is cached, delegates to
+/// [`inspect_gguf_cached`] with zero network requests. Otherwise, opens an
+/// [`HttpRangeReader`] over the file and runs
+/// `anamnesis::parse_gguf_front_matter_from_reader` against it on a blocking
+/// thread (v0.11.2, on anamnesis 0.7.2's reader-generic `GgufFrontMatter` —
+/// the full-detail counterpart to the summary-only `inspect_gguf_from_reader`
+/// anamnesis shipped in 0.4.5). `GGUF` is front-loaded: the parser reads the
+/// metadata KV table and tensor-info table in a single linear scan and never
+/// touches the tensor-data segment, so a multi-GiB quantised file inspects in
+/// a handful of range requests. Mirrors [`inspect_npz`] / [`inspect_safetensors`]'s
+/// shape so the `hf-fm` CLI renders all three formats' `Source:` line
+/// identically.
+///
+/// The third tuple element reports the remote transfer statistics
+/// ([`RangeStats`]: request count + bytes fetched); `None` on the cached path.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the Range probe or a range request
+/// fails — including gated repos, which surface as `returned status
+/// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
+/// diagnosis).
+/// Returns [`FetchError::SafetensorsHeader`] if the GGUF file is malformed
+/// (cached or remote).
+pub async fn inspect_gguf(
+    repo_id: &str,
+    filename: &str,
+    token: Option<&str>,
+    revision: Option<&str>,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
+    let rev = revision.unwrap_or("main");
+
+    // Try local cache first (mirrors `inspect_npz` / `inspect_safetensors`).
+    if resolve_cached_path(repo_id, rev, filename).is_some() {
+        let info = inspect_gguf_cached(repo_id, filename, revision)?;
+        return Ok((info, InspectSource::Cached, None));
+    }
+
+    // Fall back to HTTP Range requests: probe eagerly (typed errors here),
+    // then hand the reader to a blocking thread for the sync parse.
+    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    let file_size = reader.total_size();
+
+    let (parse_result, stats, transport_error) = tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        // `&mut` keeps ownership here so stats and the typed transport
+        // error survive the parse (std's blanket `Read`/`Seek` for `&mut R`).
+        let result = anamnesis::parse_gguf_front_matter_from_reader(&mut reader);
+        (result, reader.stats(), reader.take_last_error())
     })
+    .await
+    .map_err(|e| FetchError::Http(format!("failed to join GGUF inspect task: {e}")))?;
+
+    match parse_result {
+        Ok(front) => Ok((
+            gguf_front_matter_to_header_info(
+                &front.tensor_infos,
+                &front.metadata,
+                front.version,
+                front.alignment,
+                Some(file_size),
+            ),
+            InspectSource::Remote,
+            Some(stats),
+        )),
+        // Prefer the typed transport error over anamnesis's io-flattened
+        // wrapper — an HTTP 401/403 must stay recognisable for the CLI's
+        // gated-repo diagnosis.
+        Err(e) => Err(
+            transport_error.unwrap_or_else(|| FetchError::SafetensorsHeader {
+                // BORROW: explicit .to_owned() for owned String in the error variant
+                filename: filename.to_owned(),
+                reason: format!("failed to parse GGUF: {e}"),
+            }),
+        ),
+    }
 }
 
 /// Inspects a `.npz` file's metadata from the local `HuggingFace` cache.
@@ -1090,8 +1202,8 @@ pub async fn inspect_repo_safetensors(
 /// Single source of truth shared by the cached listing
 /// ([`list_cached_tensor_files`]) and the CLI's remote listing / numeric
 /// index / `--pick` candidate set. Matches the per-file dispatch in
-/// `hf-fm inspect` (`.safetensors` / `.npz` remote or cached since
-/// v0.11.0; `.gguf` / `.pth` cached-only until v0.11.2 / v0.11.3).
+/// `hf-fm inspect` (`.safetensors` / `.npz` / `.gguf` remote or cached
+/// since v0.11.0 / v0.11.1 / v0.11.2; `.pth` cached-only until v0.11.3).
 pub const SUPPORTED_TENSOR_EXTENSIONS: [&str; 4] = ["safetensors", "gguf", "npz", "pth"];
 
 /// Returns `true` when `filename`'s extension matches one of
@@ -1794,6 +1906,8 @@ pub fn fetch_model_config_cached(
 mod tests {
     #![allow(clippy::panic)]
 
+    use std::collections::HashMap;
+
     use super::is_supported_tensor_file;
 
     #[test]
@@ -1833,6 +1947,72 @@ mod tests {
         assert_eq!(info.header_size, 0);
         assert_eq!(info.file_size, Some(1234));
         assert!(info.metadata.is_none());
+        assert!(info.quant_info.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn gguf_front_matter_to_header_info_maps_tensors_and_metadata() {
+        // The mapping shared by `inspect_gguf_cached` (v0.10.2, via
+        // `anamnesis::parse_gguf` → `ParsedGguf`) and the remote
+        // `inspect_gguf` (v0.11.2, via
+        // `anamnesis::parse_gguf_front_matter_from_reader` → `GgufFrontMatter`):
+        // absolute per-tensor offsets carry over directly, scalar metadata
+        // is stringified, array metadata is skipped, and the format
+        // version/alignment land under synthetic `gguf.*` keys.
+        let tensor_infos = vec![
+            anamnesis::GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_owned(),
+                shape: vec![4, 4],
+                dtype: anamnesis::GgufType::F32,
+                data_offset: 0,
+                byte_len: Some(64),
+            },
+            anamnesis::GgufTensorInfo {
+                name: "blk.0.attn_k.weight".to_owned(),
+                shape: vec![2],
+                dtype: anamnesis::GgufType::F32,
+                data_offset: 64,
+                byte_len: None,
+            },
+        ];
+        let mut metadata: HashMap<String, anamnesis::GgufMetadataValue> = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_owned(),
+            anamnesis::GgufMetadataValue::String("llama".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_owned(),
+            anamnesis::GgufMetadataValue::Array(Box::new(anamnesis::GgufMetadataArray::String(
+                vec!["<bos>".to_owned()],
+            ))),
+        );
+
+        let info =
+            super::gguf_front_matter_to_header_info(&tensor_infos, &metadata, 3, 32, Some(9999));
+
+        assert_eq!(info.tensors.len(), 2);
+        let first = info.tensors.first().unwrap();
+        let second = info.tensors.get(1).unwrap();
+        assert_eq!(first.name, "blk.0.attn_q.weight");
+        assert_eq!(first.data_offsets, (0, 64));
+        assert_eq!(first.dtype, "F32");
+        // `byte_len: None` maps to `end == start` — no byte length known.
+        assert_eq!(second.data_offsets, (64, 64));
+
+        let meta = info.metadata.unwrap();
+        assert_eq!(
+            meta.get("general.architecture").map(String::as_str),
+            Some("llama")
+        );
+        assert_eq!(meta.get("gguf.version").map(String::as_str), Some("3"));
+        assert_eq!(meta.get("gguf.alignment").map(String::as_str), Some("32"));
+        // Array-valued metadata (potentially huge, e.g. tokenizer vocab) is
+        // skipped, not stringified.
+        assert!(!meta.contains_key("tokenizer.ggml.tokens"));
+
+        assert_eq!(info.header_size, 0);
+        assert_eq!(info.file_size, Some(9999));
         assert!(info.quant_info.is_none());
     }
 
