@@ -103,9 +103,3 @@ missing_panics_doc = "warn"
 # Allow noisy pedantic lints
 module_name_repetitions = "allow"
 too_many_lines = "allow"
-
-[patch.crates-io]
-# TEMPORARY — anamnesis 0.7.1 (GgufFrontMatter / parse_gguf_front_matter_from_reader,
-# v0.11.2's remote GGUF inspect) is committed locally but not yet published to
-# crates.io. Remove this override and regenerate Cargo.lock once it is.
-anamnesis = { path = "../anamnesis" }
