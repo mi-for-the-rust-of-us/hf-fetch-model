@@ -752,7 +752,7 @@ fn gguf_front_matter_to_header_info(
 /// [`inspect_gguf_cached`] with zero network requests. Otherwise, opens an
 /// [`HttpRangeReader`] over the file and runs
 /// `anamnesis::parse_gguf_front_matter_from_reader` against it on a blocking
-/// thread (v0.11.2, on anamnesis 0.7.2's reader-generic `GgufFrontMatter` —
+/// thread (v0.11.2, on anamnesis 0.7.1's reader-generic `GgufFrontMatter` —
 /// the full-detail counterpart to the summary-only `inspect_gguf_from_reader`
 /// anamnesis shipped in 0.4.5). `GGUF` is front-loaded: the parser reads the
 /// metadata KV table and tensor-info table in a single linear scan and never

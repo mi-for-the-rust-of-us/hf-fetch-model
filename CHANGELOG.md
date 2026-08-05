@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`anamnesis` `0.6.9` → `0.7.2`.** Needed for the new `parse_gguf_front_matter_from_reader<R: Read + Seek>` reader-generic entry point (anamnesis 0.7.2) that the remote `GGUF` inspect above depends on. anamnesis's earlier `inspect_gguf_from_reader` (0.4.5) turned out to be summary-only (no per-tensor list) — insufficient for hf-fm's `--tree` / `--dtypes` / `--filter` / tensor-table rendering, which needs full parity with the cached path and with remote NPZ/safetensors. See the [cache-management roadmap](docs/roadmaps/cache-management-roadmap.md#v0112--remote-gguf-inspect) for the full design-decision writeup.
+- **`anamnesis` `0.6.9` → `0.7.1`.** Needed for the new `parse_gguf_front_matter_from_reader<R: Read + Seek>` reader-generic entry point (anamnesis 0.7.1) that the remote `GGUF` inspect above depends on. anamnesis's earlier `inspect_gguf_from_reader` (0.4.5) turned out to be summary-only (no per-tensor list) — insufficient for hf-fm's `--tree` / `--dtypes` / `--filter` / tensor-table rendering, which needs full parity with the cached path and with remote NPZ/safetensors. See the [cache-management roadmap](docs/roadmaps/cache-management-roadmap.md#v0112--remote-gguf-inspect) for the full design-decision writeup.
 
 ## [0.11.1] — Remote safetensors via anamnesis
 
