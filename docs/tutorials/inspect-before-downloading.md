@@ -2,9 +2,9 @@
 
 *Read tensor metadata over HTTP Range — no weight data downloaded — and decide whether the model is worth the bandwidth.*
 
-*~1,720 words · about 7 min read*
+*~1,900 words · about 8 min read*
 
-<!-- Last updated: 2026-06-11, hf-fm v0.10.5 -->
+<!-- Last updated: 2026-08-06, hf-fm v0.11.2 (remote GGUF inspect in the quant pivot) -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -305,13 +305,51 @@ Mapping each variant against ~14 GiB of usable free VRAM on a 5060 Ti:
 
 Q4_K_M is the typical recommendation for llama.cpp users — quality, size and speed all in a comfortable place — and it leaves nine gigabytes for KV cache, activations, and CUDA workspace. That's enough for very long contexts.
 
+That table is arithmetic on `list-files` sizes. Since v0.11.2, `inspect` reads `.gguf` files remotely too — the same `--check-gpu` verdict from §6, now against the GGUF file itself before a single byte downloads:
+
+```sh
+hf-fm inspect bartowski/zed-industries_zeta-2-GGUF zed-industries_zeta-2-Q4_K_M.gguf --check-gpu --dtypes
+```
+
+```
+  Repo:     bartowski/zed-industries_zeta-2-GGUF
+  File:     zed-industries_zeta-2-Q4_K_M.gguf
+  Source:   remote (98 range requests, 6.00 MiB fetched)
+  Size:     4.87 GiB
+  Metadata:
+    general.architecture=llama
+    general.name=Zeta 2
+    …
+    llama.block_count=32
+    llama.context_length=32768
+    …
+
+  Dtype  Tensors       Params       Size
+  Q4_K       113        5.67B   2.97 GiB
+  F32         65       266.2K   1.02 MiB
+  Q5_K        64       671.1M 440.00 MiB
+  Q6_K        49        1.91B   1.46 GiB
+  ─────────────────────────────────────────
+  291 tensors, 8.25B params
+
+  Model weights:  4.86 GiB  (Q4_K + others, 8.25B params)
+  GPU 0:          NVIDIA GeForce RTX 5060 Ti — 15.93 GiB VRAM
+                  free: 13.79 GiB, used: 2.14 GiB
+  Fit:            ✓ 8.93 GiB headroom for weights + KV cache + runtime
+
+  Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
+  weight size for KV cache and activations.
+```
+
+Confirmed against the live device, not just the size table: `✓ 8.93 GiB headroom`, comfortably reversing the `✗ short by 1.77 GiB` verdict from §6's BF16 original. The `Metadata:` block is GGUF's other advantage over safetensors: `llama.block_count=32` self-confirms the same 32-layer architecture as zeta-2's safetensors original, read straight from the file rather than inferred. `291 tensors, 8.25B params` matches §2's safetensors tree exactly — same model, same tensor and parameter counts, fewer bytes per parameter.
+
 The closing command, the only download in this whole tutorial:
 
 ```sh
 hf-fm download-file bartowski/zed-industries_zeta-2-GGUF "*Q4_K_M*"
 ```
 
-You went from "15 GiB I can't use" to "5 GiB that fits with room to spare" without downloading the wrong thing first.
+You went from "15 GiB I can't use" to "5 GiB that fits with room to spare" — confirmed against the live device, not just arithmetic on a size table.
 
 ## What you've learned
 
@@ -320,12 +358,12 @@ You went from "15 GiB I can't use" to "5 GiB that fits with room to spare" witho
 - **`inspect --tree`** answers what shape — architecture, layer count, GQA ratio, tied vs untied heads, vocabulary size.
 - **`inspect --filter` / `--limit`** answer "what does *this part* cost?" before you commit to anything.
 - **`inspect --check-gpu`** turns weight bytes vs. free VRAM into a one-line ✓ / ✗ verdict — add **`--context N`** to fold in the KV cache and judge `weights + KV` at a real context length.
-- **`search --tag` + `list-files`** find community quantizations when the headline repo doesn't fit.
+- **`search --tag` + `list-files`** find community quantizations when the headline repo doesn't fit — and `inspect --check-gpu` (remote `.gguf` since v0.11.2) confirms the pick against the live device before you download it.
 - **`--revision <sha>`** pins every command above to a specific commit so notes stay reproducible.
 
 Total bytes downloaded to learn all of that: less than a megabyte. Every command above is also valid input to library callers — see [`examples/candle_inspect.rs`](../../examples/candle_inspect.rs) for the embeddable equivalent.
 
-The companion path — **inspect after you download** — already exists today via `--cached` on `.gguf` files (since v0.10.2) and `.npz` / `.pth` files plus quantization detection on cached safetensors (since v0.10.3).
+The companion path — **inspect after you download** — still matters for `.pth` files (`--cached` only; remote inspect is planned for v0.11.3) and for quantization detection on cached safetensors (since v0.10.3). `.gguf` no longer needs it: as the pivot above just showed, it joined `.safetensors` / `.npz` as remote-inspectable in v0.11.2, so `inspect` works the same way — before or after downloading — for three of the four tensor formats.
 
 For details on every flag in `inspect`, see the [CLI reference](../cli-reference.md). For common follow-up questions, the [FAQ](../FAQ.md) covers gating, cache layout, and the quirks of partial downloads.
 

@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-06-03, hf-fm v0.10.4 (--check-gpu --context KV budgeting) -->
+<!-- Last updated: 2026-08-06, hf-fm v0.11.2 (remote GGUF inspect) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -24,7 +24,7 @@ STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
    top whenever any answer text changes — not for typo fixes or new
    entries that don't touch existing answers.
 7. Scope: answer questions about features that actually ship today.
-   Do not pre-document unshipped work (cache gc, GGUF inspect, etc.) —
+   Do not pre-document unshipped work (remote PTH inspect, etc.) —
    those get dedicated docs when they land.
 8. Grouping: if a section grows past ~5 entries, consider splitting it.
    If an entry grows past ~6 sentences, consider promoting it to
@@ -338,9 +338,9 @@ A `checksum mismatch` means the file's computed SHA256 does not match the hash H
 
 ### Why does `inspect` say `Source: remote (N range requests, X fetched)`?
 
-Remote `.safetensors` and `.npz` inspect (v0.11.1 and v0.11.0 respectively) both ride the same `HttpRangeReader` substrate, and the line reports the *measured* cost of that run rather than a fixed count — the on-screen proof that `inspect` read metadata, not weights. The reader enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted file cannot silently turn an inspect into a full download. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all.
+Remote `.safetensors`, `.npz`, and `.gguf` inspect (v0.11.1, v0.11.0, and v0.11.2 respectively) all ride the same `HttpRangeReader` substrate, and the line reports the *measured* cost of that run rather than a fixed count — the on-screen proof that `inspect` read metadata, not weights. The reader enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted file cannot silently turn an inspect into a full download. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all.
 
-For `.safetensors`, the header is a little-endian `u64` length prefix followed by the `JSON` header itself, both at the very start of the file — the reader's 4 KiB read-ahead window usually covers both in a single fetch, with a second fetch only when the header is larger than that window (common on many-tensor models). Every remote path on this substrate also bakes in a fixed one-time access probe (2 requests), so a small shard reads e.g. `Source: remote (4 range requests, 8.0 KiB fetched)` (live-measured against `hf-internal-testing/tiny-random-gpt2`). For `.npz`, the requests fetch the `ZIP` central directory and the per-array `NPY` headers — e.g. `Source: remote (6 range requests, 136.0 KiB fetched)` against a 72 MiB GemmaScope archive. Neither format ever downloads tensor data.
+For `.safetensors`, the header is a little-endian `u64` length prefix followed by the `JSON` header itself, both at the very start of the file — the reader's 4 KiB read-ahead window usually covers both in a single fetch, with a second fetch only when the header is larger than that window (common on many-tensor models). Every remote path on this substrate also bakes in a fixed one-time access probe (2 requests), so a small shard reads e.g. `Source: remote (4 range requests, 8.0 KiB fetched)` (live-measured against `hf-internal-testing/tiny-random-gpt2`). For `.npz`, the requests fetch the `ZIP` central directory and the per-array `NPY` headers — e.g. `Source: remote (6 range requests, 136.0 KiB fetched)` against a 72 MiB GemmaScope archive. For `.gguf`, the requests cover the front-loaded metadata KV table and tensor-info table — both live before the tensor-data section, so a single linear scan never touches weight bytes — e.g. `Source: remote (30 range requests, 1.75 MiB fetched)` against an 84 MiB quantized `bartowski/SmolLM2-135M-Instruct-GGUF` shard. No format on this substrate ever downloads tensor data.
 
 ### Why didn't my pipeline catch a download failure?
 
