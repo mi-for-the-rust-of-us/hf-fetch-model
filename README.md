@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/hf-fetch-model)](LICENSE-MIT)
 
-A Rust library and CLI for downloading and inspecting HuggingFace models. Multi-connection parallel downloads, file filtering, checksum verification, retry — plus safetensors header inspection and tensor layout comparison between models, all without downloading weight data.
+A Rust library and CLI for downloading and inspecting HuggingFace models. Multi-connection parallel downloads, file filtering, checksum verification, retry — plus remote tensor-header inspection (`.safetensors`, NumPy `.npz`, `.gguf`) and structural comparison between models, all without downloading weight data.
 
 ## Table of contents
 
@@ -64,7 +64,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 | `hf-fm discover` | Find new model families on the Hub |
 | `hf-fm download-file <REPO_ID> <FILE>` | Download a single file (or glob pattern) |
 | `hf-fm du [REPO_ID\|N]` | Show cache disk usage (by name or `#` index) |
-| `hf-fm inspect <REPO_ID> [FILE]` | Inspect safetensors headers (tensor names, shapes, dtypes) without downloading weights; add `--check-gpu [--context N]` for a GPU-fit verdict (with KV-cache budgeting), or `--pick` to choose the file interactively |
+| `hf-fm inspect <REPO_ID> [FILE]` | Inspect tensor headers (names, shapes, dtypes) without downloading weights — safetensors/NPZ/GGUF remote or cached, PTH cached only; add `--check-gpu [--context N]` for a GPU-fit verdict (with KV-cache budgeting), or `--pick` to choose the file interactively |
 | `hf-fm list-families` | List model families in local cache |
 | `hf-fm list-files <REPO_ID>` | List remote files (sizes, SHA256) without downloading |
 | `hf-fm search <QUERY>` | Search the HuggingFace Hub for models |

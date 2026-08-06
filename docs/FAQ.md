@@ -76,7 +76,7 @@ A living list of the questions we and our early users have actually run into. If
 `hf-fetch-model` is a Rust CLI and library for downloading, inspecting, and comparing HuggingFace models. It overlaps with Python's `huggingface-cli` on the basics (fetch a repo, list files, manage the cache) but diverges in three places:
 
 1. it downloads large files with many parallel HTTP connections,
-2. it can read a `.safetensors` file's tensor-name/dtype/shape metadata **without downloading the weights** by doing a narrow HTTP Range request against the header,
+2. it can read a model's tensor-name/dtype/shape metadata **without downloading the weights**, via narrow HTTP Range requests against the file header — `.safetensors`, `.npz`, and `.gguf` remotely, `.pth` after a download,
 3. it ships as a standalone binary with no Python dependency. It writes to the same cache directory as Python `huggingface_hub`, so the two tools coexist happily.
 
 ### How does it differ from `safetensors_explorer`?
