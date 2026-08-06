@@ -70,3 +70,9 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [candle-3401-p1.md](candle-3401-p1.md) | candle #3401 — LightOnOCR-2-1B | Posted |
 | [candle-3530-p1.md](candle-3530-p1.md) | candle #3530 — 80B NVFP4 fit / double-mapping diagnostic ask | Posted |
 | [candle-3530-p2.md](candle-3530-p2.md) | candle #3530 — best-guess repo identification + corrected on-disk math | Draft |
+| [candle-3617-p1.md](candle-3617-p1.md) | candle #3617 — `.pth` pickle-VM DoS (issue we opened) | Posted |
+| [candle-3617-p2.md](candle-3617-p2.md) | candle #3617 — PR #3628 announced | Posted |
+| [candle-3617-p3.md](candle-3617-p3.md) | candle #3617 — consolidating sibling reports #3619/#3620 | Posted |
+| [candle-3619-p1.md](candle-3619-p1.md) | candle #3619 — `LONG1` overflow panic, already fixed by #3628 | Posted |
+| [candle-3620-p1.md](candle-3620-p1.md) | candle #3620 — pickle memo-bomb, already bounded by #3628 | Posted |
+| [candle-3820-p1.md](candle-3820-p1.md) | candle #3820 — Qwen3.5 GGUF `general.architecture` strings, live-verified | Draft |
