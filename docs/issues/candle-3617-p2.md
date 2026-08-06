@@ -2,7 +2,7 @@
 
 - **Target issue:** https://github.com/huggingface/candle/issues/3617
 - **Status:** Posted (2026-06-18) — [issuecomment-4740892210](https://github.com/huggingface/candle/issues/3617#issuecomment-4740892210)
-- **Context:** Follow-up to the issue body ([p1](candle-3617-p1.md)), posted the same day PR [#3628](https://github.com/huggingface/candle/pull/3628) opened. Announces the PR and summarizes its three controls (working-set floor, depth cap, `BINUNICODE` payload cap) plus the `LONG1` overflow libFuzzer surfaced as a bonus find while validating the other guards — the same bug independently reported four days later in [#3619](https://github.com/huggingface/candle/issues/3619).
+- **Context:** Follow-up to the issue body ([p1](candle-3617-p1.md)), posted the same day PR [#3628](https://github.com/huggingface/candle/pull/3628) opened. Announces the PR and summarizes its three controls (working-set floor, depth cap, `BINUNICODE` payload cap) plus the `LONG1` overflow libFuzzer surfaced as a bonus find while validating the other guards — the same bug independently reported four days *earlier*, in [#3619](https://github.com/huggingface/candle/issues/3619) (2026-06-14), though neither side had cross-referenced the other yet at this point.
 - **Outcome:** See [p3](candle-3617-p3.md) — no maintainer engagement in the six weeks between this post and the next.
 - **Lesson / Leverage angle:** Posting the PR announcement directly on the originating issue (rather than relying on GitHub's automatic cross-link) keeps the thread self-contained for anyone reading the issue in isolation.
 - **Accuracy flags:** None.

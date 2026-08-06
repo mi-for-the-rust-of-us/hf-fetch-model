@@ -2,14 +2,14 @@
 
 - **Target issue:** https://github.com/huggingface/candle/issues/3820
 - **Status:** Draft — not yet posted
-- **Context:** astorise's `quantized_lm` dispatcher has no arm for Qwen3.5 GGUF checkpoints; the issue is explicitly blocked on one fact — *"The `general.architecture` spelling is the one open question... worth confirming against a real checkpoint before the arm is added... I am happy to submit the PR once the architecture string is confirmed."* Zero comments at draft time. `hf-fm inspect` (v0.11.2's remote GGUF support, shipped 2026-08-06) reads exactly this metadata over HTTP Range with no download, so the question is answerable directly against real Hub checkpoints.
+- **Context:** astorise's `quantized_lm` dispatcher has no arm for Qwen3.5 GGUF checkpoints; the issue is explicitly blocked on one fact — *"The `general.architecture` spelling is the one open question... worth confirming against a real checkpoint before the arm is added... I am happy to submit the PR once the architecture string is confirmed."* Zero comments at draft time. `hf-fm inspect`'s remote GGUF support (v0.11.2 internally — implemented and merged to `main` as of 2026-08-06, **not yet tagged, pushed to `origin`, or published to crates.io**; `cargo install hf-fetch-model` currently installs 0.11.1, which does not have this) reads exactly this metadata over HTTP Range with no download, so the question is answerable directly against real Hub checkpoints even before the release ships. **Whoever posts this must re-check release status first** — if v0.11.2 has shipped by then, the reply body's "its new remote GGUF support" wording can be tightened to name the version and point at `cargo install`.
 - **Outcome:** —
-- **Lesson / Leverage angle:** First candle-issue application of v0.11.2's remote GGUF inspect, and the cleanest fit yet for the "one binary fact blocks a ready-to-submit PR" pattern that made #3530 (`--check-gpu --dtypes`) convert — the reporter has already designed the fix and just needs ground truth. Checking *both* the dense and MoE variants (not just the one the issue names) turned out to matter: they use different `general.architecture` strings (`qwen35` vs `qwen35moe`), which also answers most of the sibling #3837's open MoE-config questions for free from the same command.
+- **Lesson / Leverage angle:** First candle-issue application of the (not-yet-released) v0.11.2 remote GGUF inspect work, and the cleanest fit yet for the "one binary fact blocks a ready-to-submit PR" pattern that made #3530 (`--check-gpu --dtypes`) convert — the reporter has already designed the fix and just needs ground truth. Checking *both* the dense and MoE variants (not just the one the issue names) turned out to matter: they use different `general.architecture` strings (`qwen35` vs `qwen35moe`), which also answers most of the sibling #3837's open MoE-config questions for free from the same command.
 - **Accuracy flags:** The two `general.architecture` values and every metadata key quoted below are copied verbatim from live `hf-fm inspect` output against real, currently-hosted Hub repos (`unsloth/Qwen3.5-4B-GGUF` and `unsloth/Qwen3.5-35B-A3B-GGUF`), run at draft time (2026-08-06) — not guessed or inferred from documentation. The `partial_rotary_factor` observation in the reply below is flagged inline as an open question, not asserted as fact — it has not been checked against llama.cpp's conversion script or a real `config.json`.
 
 ---
 
-Ran `hf-fm inspect` (v0.11.2's remote GGUF support — reads the metadata KV table and tensor-info table over HTTP Range, no download) against both variants on the Hub:
+Ran `hf-fm inspect`'s new remote GGUF support (reads the metadata KV table and tensor-info table over HTTP Range, no download) against both variants on the Hub:
 
 ```
 $ hf-fm inspect unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-UD-IQ2_XXS.gguf
@@ -26,6 +26,7 @@ $ hf-fm inspect unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-UD-IQ2_XXS.gguf
     qwen35.attention.head_count=16
     qwen35.attention.head_count_kv=4
     qwen35.attention.key_length=256
+    qwen35.attention.layer_norm_rms_epsilon=0.000001
     qwen35.attention.value_length=256
     qwen35.block_count=32
     qwen35.context_length=262144
@@ -39,6 +40,8 @@ $ hf-fm inspect unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-UD-IQ2_XXS.gguf
     qwen35.ssm.inner_size=4096
     qwen35.ssm.state_size=128
     qwen35.ssm.time_step_rank=32
+    …
+  [chat template + per-tensor table omitted — not relevant here]
 ```
 
 ```
@@ -56,6 +59,7 @@ $ hf-fm inspect unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q3_K_S.gguf
     qwen35moe.attention.head_count=16
     qwen35moe.attention.head_count_kv=2
     qwen35moe.attention.key_length=256
+    qwen35moe.attention.layer_norm_rms_epsilon=0.000001
     qwen35moe.attention.value_length=256
     qwen35moe.block_count=40
     qwen35moe.context_length=262144
@@ -72,6 +76,8 @@ $ hf-fm inspect unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q3_K_S.gguf
     qwen35moe.ssm.inner_size=4096
     qwen35moe.ssm.state_size=128
     qwen35moe.ssm.time_step_rank=32
+    …
+  [chat template + per-tensor table omitted — not relevant here]
 ```
 
 So the two spellings are `qwen35` (dense) and `qwen35moe` (MoE) — confirming your note that `qwen3moe` isn't a substitute: it's a third, distinct string from both, not a spelling variant of either.
