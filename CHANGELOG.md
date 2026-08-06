@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] — Remote GGUF inspect
+
 ### Added
 
 - **Remote `GGUF` inspect — `hf-fm inspect <repo> file.gguf` no longer needs `--cached` or a prior download.** `.gguf` joins `.safetensors` / `.npz` as a remote-inspectable format over the same v0.11.0 [`HttpRangeReader`](src/http_range.rs) substrate. `GGUF` is front-loaded (magic + version + counts, the metadata KV table, and the tensor-info table all live before the tensor-data section), so the parser reads that front matter in a single linear scan and never touches the weight data. Verified offline via a synthetic fixture (`src/http_range.rs`'s `gguf_front_matter_over_range_reader_reads_metadata_not_data`): a 2-tensor / 600 KiB-payload `GGUF` inspects in **1 range request, 64 KiB fetched**, out of the file's ~600 KiB total. Live-verified against a real repo: `bartowski/SmolLM2-135M-Instruct-GGUF`'s uncached `SmolLM2-135M-Instruct-IQ3_XS.gguf` (84.12 MiB, 272 tensors) reads as `Source: remote (30 range requests, 1.75 MiB fetched)` (2% of the file), with `--tree` and `--dtypes` rendering identically to the cached path. Cache-first like the other three formats. New library API: `inspect::inspect_gguf` (async, cache-first, returns `(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>)`, matching `inspect_npz` / `inspect_safetensors`'s shape). `inspect_gguf_cached` and the new remote path now share one `gguf_front_matter_to_header_info` mapping function, so the cached and remote renders cannot drift.
