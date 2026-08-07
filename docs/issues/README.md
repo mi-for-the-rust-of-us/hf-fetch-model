@@ -76,3 +76,4 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [candle-3619-p1.md](candle-3619-p1.md) | candle #3619 — `LONG1` overflow panic, already fixed by #3628 | Posted |
 | [candle-3620-p1.md](candle-3620-p1.md) | candle #3620 — pickle memo-bomb, already bounded by #3628 | Posted |
 | [candle-3820-p1.md](candle-3820-p1.md) | candle #3820 — Qwen3.5 GGUF `general.architecture` strings, live-verified | Draft |
+| [candle-3820-p2.md](candle-3820-p2.md) | candle #3820 — same, plus verification pointer (version to post) | Draft |
