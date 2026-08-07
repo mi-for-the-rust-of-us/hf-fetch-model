@@ -77,4 +77,4 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [candle-3620-p1.md](candle-3620-p1.md) | candle #3620 — pickle memo-bomb, already bounded by #3628 | Posted |
 | [candle-3820-p1.md](candle-3820-p1.md) | candle #3820 — Qwen3.5 GGUF `general.architecture` strings, live-verified | Draft, superseded by candle-3821-p1 |
 | [candle-3820-p2.md](candle-3820-p2.md) | candle #3820 — same, plus verification pointer | Draft, superseded by candle-3821-p1 |
-| [candle-3821-p1.md](candle-3821-p1.md) | candle PR #3821 — `qwen3_5` vs. real `qwen35`/`qwen35moe` string mismatch, live-verified | Draft |
+| [candle-3821-p1.md](candle-3821-p1.md) | candle PR #3821 — `qwen3_5` vs. real `qwen35`/`qwen35moe` string mismatch, live-verified | Posted |
