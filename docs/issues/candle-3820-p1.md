@@ -1,15 +1,15 @@
 # candle #3820 — reply 1 (Draft)
 
 - **Target issue:** https://github.com/huggingface/candle/issues/3820
-- **Status:** Draft — not yet posted
-- **Context:** astorise's `quantized_lm` dispatcher has no arm for Qwen3.5 GGUF checkpoints; the issue is explicitly blocked on one fact — *"The `general.architecture` spelling is the one open question... worth confirming against a real checkpoint before the arm is added... I am happy to submit the PR once the architecture string is confirmed."* Zero comments at draft time. `hf-fm inspect`'s remote GGUF support (v0.11.2 internally — implemented and merged to `main` as of 2026-08-06, **not yet tagged, pushed to `origin`, or published to crates.io**; `cargo install hf-fetch-model` currently installs 0.11.1, which does not have this) reads exactly this metadata over HTTP Range with no download, so the question is answerable directly against real Hub checkpoints even before the release ships. **Whoever posts this must re-check release status first** — if v0.11.2 has shipped by then, the reply body's "its new remote GGUF support" wording can be tightened to name the version and point at `cargo install`.
+- **Status:** Draft (not yet posted)
+- **Context:** astorise's `quantized_lm` dispatcher has no arm for Qwen3.5 GGUF checkpoints; the issue is explicitly blocked on one fact: *"The `general.architecture` spelling is the one open question... worth confirming against a real checkpoint before the arm is added... I am happy to submit the PR once the architecture string is confirmed."* Zero comments at draft time. `hf-fm inspect`'s remote GGUF support, shipped in hf-fm v0.11.2 (published on crates.io 2026-08-06), reads exactly this metadata over HTTP Range with no download, so the question is answerable directly against real Hub checkpoints.
 - **Outcome:** —
-- **Lesson / Leverage angle:** First candle-issue application of the (not-yet-released) v0.11.2 remote GGUF inspect work, and the cleanest fit yet for the "one binary fact blocks a ready-to-submit PR" pattern that made #3530 (`--check-gpu --dtypes`) convert — the reporter has already designed the fix and just needs ground truth. Checking *both* the dense and MoE variants (not just the one the issue names) turned out to matter: they use different `general.architecture` strings (`qwen35` vs `qwen35moe`), which also answers most of the sibling #3837's open MoE-config questions for free from the same command.
-- **Accuracy flags:** The two `general.architecture` values and every metadata key quoted below are copied verbatim from live `hf-fm inspect` output against real, currently-hosted Hub repos (`unsloth/Qwen3.5-4B-GGUF` and `unsloth/Qwen3.5-35B-A3B-GGUF`), run at draft time (2026-08-06) — not guessed or inferred from documentation. The `partial_rotary_factor` observation in the reply below is flagged inline as an open question, not asserted as fact — it has not been checked against llama.cpp's conversion script or a real `config.json`.
+- **Lesson / Leverage angle:** First candle-issue application of hf-fm v0.11.2's remote GGUF inspect, and the cleanest fit yet for the "one binary fact blocks a ready-to-submit PR" pattern that made [#3530](https://github.com/huggingface/candle/issues/3530) (`--check-gpu --dtypes`) convert: the reporter has already designed the fix and just needs ground truth. Checking *both* the dense and MoE variants (not just the one the issue names) turned out to matter: they use different `general.architecture` strings (`qwen35` vs `qwen35moe`), which also answers most of the sibling [#3837](https://github.com/huggingface/candle/issues/3837)'s open MoE-config questions for free from the same command.
+- **Accuracy flags:** The two `general.architecture` values and every metadata key quoted below are copied verbatim from live `hf-fm inspect` output against real, currently-hosted Hub repos (`unsloth/Qwen3.5-4B-GGUF` and `unsloth/Qwen3.5-35B-A3B-GGUF`), run at draft time (2026-08-06), not guessed or inferred from documentation. The `partial_rotary_factor` observation in the reply below is flagged inline as an open question, not asserted as fact; it has not been checked against llama.cpp's conversion script or a real `config.json`.
 
 ---
 
-Ran `hf-fm inspect`'s new remote GGUF support (reads the metadata KV table and tensor-info table over HTTP Range, no download) against both variants on the Hub:
+Ran `hf-fm inspect`'s new remote GGUF support (v0.11.2, reads the metadata KV table and tensor-info table over HTTP Range, no download) against both variants on the Hub:
 
 ```
 $ hf-fm inspect unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-UD-IQ2_XXS.gguf
@@ -41,7 +41,7 @@ $ hf-fm inspect unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-UD-IQ2_XXS.gguf
     qwen35.ssm.state_size=128
     qwen35.ssm.time_step_rank=32
     …
-  [chat template + per-tensor table omitted — not relevant here]
+  [chat template + per-tensor table omitted, not relevant here]
 ```
 
 ```
@@ -77,13 +77,13 @@ $ hf-fm inspect unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q3_K_S.gguf
     qwen35moe.ssm.state_size=128
     qwen35moe.ssm.time_step_rank=32
     …
-  [chat template + per-tensor table omitted — not relevant here]
+  [chat template + per-tensor table omitted, not relevant here]
 ```
 
-So the two spellings are `qwen35` (dense) and `qwen35moe` (MoE) — confirming your note that `qwen3moe` isn't a substitute: it's a third, distinct string from both, not a spelling variant of either.
+So the two spellings are `qwen35` (dense) and `qwen35moe` (MoE), confirming your note that `qwen3moe` isn't a substitute: it's a third, distinct string from both, not a spelling variant of either.
 
-For #3837's sparse-MoE config, the MoE file's own metadata already has the numbers: 256 experts, top-8 routing (`expert_used_count`), a 512-wide routed *and* shared expert FFN, and `full_attention_interval=4` (matching the `layer_types` alternation both of you describe). The Gated-DeltaNet/SSM fields #3832 discusses (`ssm.conv_kernel`, `ssm.group_count`, `ssm.inner_size`, `ssm.state_size`, `ssm.time_step_rank`) are present under the same keys on both the dense and MoE checkpoints.
+For [#3837](https://github.com/huggingface/candle/issues/3837)'s sparse-MoE config, the MoE file's own metadata already has the numbers: 256 experts, top-8 routing (`expert_used_count`), a 512-wide routed *and* shared expert FFN, and `full_attention_interval=4` (matching the `layer_types` alternation both of you describe). The Gated-DeltaNet/SSM fields [#3832](https://github.com/huggingface/candle/issues/3832) discusses (`ssm.conv_kernel`, `ssm.group_count`, `ssm.inner_size`, `ssm.state_size`, `ssm.time_step_rank`) are present under the same keys on both the dense and MoE checkpoints.
 
-One thing worth double-checking rather than trusting from this alone: I don't see a distinct `partial_rotary_factor` key in either file's metadata — only `rope.dimension_count` (64 on both variants) and `rope.freq_base`. It's possible the GGUF conversion tooling already bakes the partial rotary into `rope.dimension_count` directly, rather than candle needing to read a separate field, but I haven't confirmed that against llama.cpp's conversion script or a real `config.json` — worth checking before assuming #3837 needs to plumb `partial_rotary_factor` through at all on the GGUF path specifically (it may only matter for the dense-safetensors loader).
+One thing worth double-checking rather than trusting from this alone: I don't see a distinct `partial_rotary_factor` key in either file's metadata, only `rope.dimension_count` (64 on both variants) and `rope.freq_base`. It's possible the GGUF conversion tooling already bakes the partial rotary into `rope.dimension_count` directly, rather than candle needing to read a separate field, but I haven't confirmed that against llama.cpp's conversion script or a real `config.json`; worth checking before assuming [#3837](https://github.com/huggingface/candle/issues/3837) needs to plumb `partial_rotary_factor` through at all on the GGUF path specifically (it may only matter for the dense-safetensors loader).
 
-Happy to inspect other quant variants, or dump full tensor names/shapes via `--tree`, if that's useful for either PR — no download needed either way.
+Happy to inspect other quant variants, or dump full tensor names/shapes via `--tree`, if that's useful for either PR; no download needed either way.
