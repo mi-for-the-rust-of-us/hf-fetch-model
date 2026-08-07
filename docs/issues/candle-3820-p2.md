@@ -1,7 +1,7 @@
 # candle #3820 — reply 2 (Draft)
 
 - **Target issue:** https://github.com/huggingface/candle/issues/3820
-- **Status:** Draft (not yet posted); this is the version to post, built from [p1](candle-3820-p1.md)
+- **Status:** Draft (not yet posted); superseded before posting by [candle-3821-p1.md](candle-3821-p1.md), which targets PR #3821 directly once live checking found the reporter had already tried to answer this question there, with the wrong string
 - **Context:** Same evidence as [p1](candle-3820-p1.md), plus one addition: a closing pointer to `cargo install hf-fetch-model --features cli`, so astorise (or anyone else reading the thread) can reproduce the two `hf-fm inspect` commands independently rather than take the pasted output on trust. Matches the established archive convention (see the closing PS in [candle-3530-p1.md](candle-3530-p1.md)). Zero comments on the issue, no linked PRs, as of 2026-08-07.
 - **Outcome:** —
 - **Lesson / Leverage angle:** Same as [p1](candle-3820-p1.md): first candle-issue application of hf-fm v0.11.2's remote GGUF inspect, and the cleanest fit yet for the "one binary fact blocks a ready-to-submit PR" pattern that made [#3530](https://github.com/huggingface/candle/issues/3530) convert. The verifiability pointer matters more here than usual: astorise reads as a careful, hands-on contributor across a long run of issues, exactly the kind of reader who would want to check `general.architecture=qwen35`/`qwen35moe` themselves before wiring a PR around it.
