@@ -459,10 +459,10 @@ pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<Strin
     let mut set: tokio::task::JoinSet<Option<(String, u64)>> = tokio::task::JoinSet::new();
 
     for repo_id in repo_ids {
-        let sem = Arc::clone(&semaphore);
+        let limiter = Arc::clone(&semaphore);
         let client = client.clone();
         set.spawn(async move {
-            let _permit = sem.acquire_owned().await.ok()?;
+            let _permit = limiter.acquire_owned().await.ok()?;
             // EXPLICIT: per-repo failure intentionally swallowed — the caller
             // renders the row with "—" rather than aborting the search.
             match fetch_repo_total_size(&repo_id, &client).await {
@@ -501,9 +501,9 @@ pub async fn fetch_tags_concurrent(repo_ids: Vec<String>) -> HashMap<String, Vec
     let mut set: tokio::task::JoinSet<Option<(String, Vec<String>)>> = tokio::task::JoinSet::new();
 
     for repo_id in repo_ids {
-        let sem = Arc::clone(&semaphore);
+        let limiter = Arc::clone(&semaphore);
         set.spawn(async move {
-            let _permit = sem.acquire_owned().await.ok()?;
+            let _permit = limiter.acquire_owned().await.ok()?;
             // EXPLICIT: per-repo failure intentionally swallowed — missing
             // tags mean the row simply doesn't match any --tag filter (the
             // user's listing is not aborted on a single 404 / network blip).

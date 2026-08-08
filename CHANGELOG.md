@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **CI now has an MSRV `1.88` lane** (`.github/workflows/ci.yml`). The manifest has declared `rust-version = "1.88"` all along, but every CI job ran rolling `stable`, so the claim was never actually tested. Adding the lane immediately found that the crate did **not** compile clean on 1.88 (see *Fixed* below). The sibling crates anamnesis and hypomnesis have run a 1.88 lane since their first release; this closes the last gap in the eco-system. The lane runs `clippy --all-targets --all-features -- -D warnings` plus `test --all-features`.
+
+### Fixed
+
+- **`clippy::similar_names` failed the build on Rust 1.88** (`src/discover.rs`). In `fetch_repo_sizes_concurrent` and `fetch_tags_concurrent`, the per-task binding `sem` was flagged as too similar to the enclosing `JoinSet` binding `set`. The lint was relaxed in a later clippy release, so current `stable` is silent and only the new MSRV lane surfaces it. Renamed the binding to `limiter`, which satisfies both toolchains without an `#[allow]` and says what the semaphore is actually for. No behavior change.
+
 ## [0.11.2] — Remote GGUF inspect
 
 ### Added

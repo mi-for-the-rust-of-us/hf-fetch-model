@@ -45,6 +45,24 @@ jobs:
       - run: cargo test
       - run: cargo test --all-features
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The manifest declares `rust-version = "1.88"`. Every other job above
+      # runs rolling `stable`, which cannot prove that claim in either
+      # direction: newer compilers accept code 1.88 rejects, and clippy lints
+      # drift both ways across releases (this lane was added after
+      # `clippy::similar_names` was found firing on 1.88 but not on stable).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest
