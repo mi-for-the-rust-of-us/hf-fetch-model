@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **CI now has an MSRV `1.88` lane** (`.github/workflows/ci.yml`). The manifest has declared `rust-version = "1.88"` all along, but every CI job ran rolling `stable`, so the claim was never actually tested. Adding the lane immediately found that the crate did **not** compile clean on 1.88 (see *Fixed* below). The sibling crates anamnesis and hypomnesis have run a 1.88 lane since their first release; this closes the last gap in the eco-system. The lane runs `clippy --all-targets --all-features -- -D warnings` plus `test --all-features`.
+- **CI now has an MSRV `1.88` lane** (`.github/workflows/ci.yml`). The manifest has declared `rust-version = "1.88"` all along, but every CI job ran rolling `stable`, so the claim was never actually tested. Adding the lane immediately found that the crate did **not** compile clean on 1.88 (see *Fixed* below). The sibling crates anamnesis and hypomnesis have run a 1.88 lane since their first release; this closes the last gap in the eco-system.
+
+  **The lane is lint-only, deliberately:** `clippy --all-targets --all-features -- -D warnings`, with no `cargo test`. `--all-targets` still type-checks the test code, so compile coverage of the MSRV claim is complete and only test *execution* is omitted; the suite continues to run on `stable` across `ubuntu-latest` and `windows-latest`. See *Known issue* below for why.
+
+### Known issue
+
+- **Two tests in `tests/cli.rs` depend on each other's cache state and pass only by scheduling luck.** `dry_run_cached_repo_shows_zero_download` says so in its own comment (`julien-c/dummy-unknown` "should already be cached from other tests"), and `cache_delete_nonexistent_repo` reads the same shared HF cache directory. Rust's harness runs tests in parallel in nondeterministic order, so neither is self-sufficient. Adding a second concurrent full-suite job surfaced this immediately: the MSRV lane lost a race the `test` job won, on identical commands and the same OS. **The flake is pre-existing and has nothing to do with the toolchain; it can still fail the `test` job on any push.** Restricting the MSRV lane to lints reduces exposure but is not a fix. The fix is to give the tests self-sufficient cache setup and serialise the ones that share a cache directory (`serial_test` is not yet a dev-dependency here), after which `cargo test` can be restored to the MSRV lane.
 
 ### Fixed
 
