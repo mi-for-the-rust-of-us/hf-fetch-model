@@ -243,14 +243,14 @@ mod retry;
 
 pub use chunked::build_client;
 pub use config::{
-    compile_glob_patterns, file_matches, has_glob_chars, FetchConfig, FetchConfigBuilder, Filter,
+    FetchConfig, FetchConfigBuilder, Filter, compile_glob_patterns, file_matches, has_glob_chars,
 };
 pub use discover::{DiscoveredFamily, GateStatus, ModelCardMetadata, SearchResult};
 pub use download::DownloadOutcome;
 pub use error::{FetchError, FileFailure};
 pub use http_range::{HttpRangeReader, RangeFetcher, RangeReader, RangeStats};
 pub use inspect::{AdapterConfig, ModelConfig};
-pub use plan::{download_plan, DownloadPlan, FilePlan};
+pub use plan::{DownloadPlan, FilePlan, download_plan};
 pub use progress::{ProgressEvent, ProgressReceiver};
 
 use std::collections::HashMap;

@@ -10,8 +10,8 @@
 
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -582,12 +582,13 @@ async fn prepare_or_resume_temp_file(
             source: e,
         })?;
 
-    if let Some(state) = existing_state {
-        if state.is_compatible_with(etag, total_size, connections) && temp_exists {
-            // Resume: leave the existing partial untouched and reuse the
-            // per-chunk offsets recorded in the sidecar.
-            return Ok(state);
-        }
+    if let Some(state) = existing_state
+        && state.is_compatible_with(etag, total_size, connections)
+        && temp_exists
+    {
+        // Resume: leave the existing partial untouched and reuse the
+        // per-chunk offsets recorded in the sidecar.
+        return Ok(state);
     }
 
     // Either no usable sidecar, an incompatible one, or the partial is

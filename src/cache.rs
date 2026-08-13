@@ -836,10 +836,10 @@ pub fn find_partial_files(repo_filter: Option<&str>) -> Result<Vec<PartialFile>,
 
         // Skip repos that don't match the filter.
         // BORROW: explicit .as_str() instead of Deref coercion
-        if let Some(filter) = repo_filter {
-            if repo_id.as_str() != filter {
-                continue;
-            }
+        if let Some(filter) = repo_filter
+            && repo_id.as_str() != filter
+        {
+            continue;
         }
 
         let blobs_dir = crate::cache_layout::blobs_dir(&entry.path());

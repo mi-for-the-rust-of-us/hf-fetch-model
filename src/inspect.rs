@@ -1775,10 +1775,9 @@ fn model_config_from_raw(raw: RawModelConfig) -> ModelConfig {
     if raw.num_hidden_layers.is_none()
         && raw.num_attention_heads.is_none()
         && raw.hidden_size.is_none()
+        && let Some(text) = raw.text_config
     {
-        if let Some(text) = raw.text_config {
-            return model_config_from_raw(*text);
-        }
+        return model_config_from_raw(*text);
     }
 
     ModelConfig {

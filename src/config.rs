@@ -474,10 +474,10 @@ impl Filter {
 /// either there are no `include` patterns or it matches at least one.
 #[must_use]
 pub fn file_matches(filename: &str, include: Option<&GlobSet>, exclude: Option<&GlobSet>) -> bool {
-    if let Some(exc) = exclude {
-        if exc.is_match(filename) {
-            return false;
-        }
+    if let Some(exc) = exclude
+        && exc.is_match(filename)
+    {
+        return false;
     }
     if let Some(inc) = include {
         return inc.is_match(filename);

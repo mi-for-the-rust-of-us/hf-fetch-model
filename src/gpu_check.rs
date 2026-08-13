@@ -233,10 +233,10 @@ impl KvCachePath {
 /// 6th layer is global). Gemma-2 alternates 1:1 with no explicit key, so it is
 /// recognized by `model_type` and treated as period 2.
 fn sliding_window_period(cfg: &ModelConfig) -> Option<u32> {
-    if let Some(p) = cfg.sliding_window_pattern {
-        if p >= 2 {
-            return Some(p);
-        }
+    if let Some(p) = cfg.sliding_window_pattern
+        && p >= 2
+    {
+        return Some(p);
     }
     // BORROW: explicit .as_deref() for Option<String> → Option<&str>
     if cfg.model_type.as_deref() == Some("gemma2") {
@@ -309,15 +309,15 @@ fn classify_hybrid_layers(cfg: &ModelConfig) -> Option<HybridLayers> {
     }
 
     // 4. full_attention_interval: every N-th layer is attention (Qwen3-Next).
-    if let (Some(interval), Some(total)) = (cfg.full_attention_interval, cfg.num_hidden_layers) {
-        if interval >= 2 {
-            let attn = total / interval;
-            if attn > 0 && attn < total {
-                return Some(HybridLayers {
-                    attn_layers: attn,
-                    recurrent_layers: total - attn,
-                });
-            }
+    if let (Some(interval), Some(total)) = (cfg.full_attention_interval, cfg.num_hidden_layers)
+        && interval >= 2
+    {
+        let attn = total / interval;
+        if attn > 0 && attn < total {
+            return Some(HybridLayers {
+                attn_layers: attn,
+                recurrent_layers: total - attn,
+            });
         }
     }
 
@@ -961,11 +961,11 @@ mod tests {
     )]
 
     use super::{
-        classify_hybrid_layers, dominant_dtype_label, format_params, gpu_check_json,
-        kv_cache_bytes, mamba2_state_bytes_per_layer, sum_tensor_bytes, GpuCheckResult,
-        KvCachePath, KvComputed,
+        GpuCheckResult, KvCachePath, KvComputed, classify_hybrid_layers, dominant_dtype_label,
+        format_params, gpu_check_json, kv_cache_bytes, mamba2_state_bytes_per_layer,
+        sum_tensor_bytes,
     };
-    use hf_fetch_model::inspect::{torch_dtype_bytes, ModelConfig, TensorInfo};
+    use hf_fetch_model::inspect::{ModelConfig, TensorInfo, torch_dtype_bytes};
     use hypomnesis::GpuDeviceInfo;
 
     fn make_tensor(name: &str, dtype: &str, shape: Vec<usize>, byte_len: u64) -> TensorInfo {

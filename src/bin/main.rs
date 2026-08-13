@@ -22,8 +22,8 @@ use hf_fetch_model::inspect;
 use hf_fetch_model::progress::IndicatifProgress;
 use hf_fetch_model::repo;
 use hf_fetch_model::{
-    compile_glob_patterns, file_matches, has_glob_chars, DownloadPlan, FetchConfig,
-    FetchConfigBuilder, FetchError, Filter,
+    DownloadPlan, FetchConfig, FetchConfigBuilder, FetchError, Filter, compile_glob_patterns,
+    file_matches, has_glob_chars,
 };
 
 #[path = "../format.rs"]
@@ -1164,10 +1164,8 @@ fn run_download(args: DownloadArgs) -> Result<(), FetchError> {
         builder = builder.connections_per_file(cpf);
     }
     builder = apply_timeout_overrides(builder, args.timeout_per_file_secs, args.timeout_total_secs);
-    if !flat {
-        if let Some(dir) = args.output_dir {
-            builder = builder.output_dir(dir);
-        }
+    if !flat && let Some(dir) = args.output_dir {
+        builder = builder.output_dir(dir);
     }
 
     // Set up progress reporting: indicatif bars for TTY, periodic stderr for non-TTY.
@@ -1506,10 +1504,8 @@ fn run_download_file(params: DownloadFileParams<'_>) -> Result<(), FetchError> {
         builder = builder.connections_per_file(cpf);
     }
     builder = apply_timeout_overrides(builder, timeout_per_file_secs, timeout_total_secs);
-    if !flat {
-        if let Some(dir) = output_dir {
-            builder = builder.output_dir(dir);
-        }
+    if !flat && let Some(dir) = output_dir {
+        builder = builder.output_dir(dir);
     }
 
     // Set up progress reporting: indicatif bars for TTY, periodic stderr for non-TTY.
@@ -1602,10 +1598,8 @@ fn run_download_file_dry_run(
     // so the plan keeps the default cache root in that case.
     // BORROW: explicit .clone() for owned Option<PathBuf>
     let flat_target = if flat { output_dir.clone() } else { None };
-    if !flat {
-        if let Some(dir) = output_dir {
-            builder = builder.output_dir(dir);
-        }
+    if !flat && let Some(dir) = output_dir {
+        builder = builder.output_dir(dir);
     }
 
     let config = builder.build()?;
@@ -1685,10 +1679,8 @@ fn run_download_file_glob(params: DownloadFileParams<'_>) -> Result<(), FetchErr
         builder = builder.connections_per_file(cpf);
     }
     builder = apply_timeout_overrides(builder, timeout_per_file_secs, timeout_total_secs);
-    if !flat {
-        if let Some(dir) = output_dir {
-            builder = builder.output_dir(dir);
-        }
+    if !flat && let Some(dir) = output_dir {
+        builder = builder.output_dir(dir);
     }
 
     // Set up progress reporting: indicatif bars for TTY, periodic stderr for non-TTY.
@@ -1827,7 +1819,7 @@ fn run_list_families(show: &[ShowFamiliesColumn], tag: Option<&str>) -> Result<(
         .max()
         .unwrap_or(6)
         .max(6); // BORROW: "Models".len()
-                 // BORROW: explicit .as_deref() in the closure below for Option<String> → Option<&str>
+    // BORROW: explicit .as_deref() in the closure below for Option<String> → Option<&str>
     let qw = if show_quant {
         families
             .values()
@@ -2194,7 +2186,9 @@ fn run_info(
         println!();
         println!("  README:");
         if looks_like_default_template(body) {
-            println!("  Note: README appears to be the HuggingFace default template (low information density).");
+            println!(
+                "  Note: README appears to be the HuggingFace default template (low information density)."
+            );
         }
         println!("  {}", "\u{2500}".repeat(70));
         let lines: Vec<&str> = body.lines().collect();
@@ -2294,7 +2288,7 @@ fn strip_yaml_front_matter(text: &str) -> &str {
         // Skip past the closing "---" and the newline after it.
         // CAST: not needed, all offsets are usize
         let body_start = close_pos + 4; // "\n---".len()
-                                        // INDEX: body_start bounded by after_open.len() (find returned a valid position)
+        // INDEX: body_start bounded by after_open.len() (find returned a valid position)
         #[allow(clippy::indexing_slicing)]
         let body = after_open[body_start..].trim_start_matches('\n');
         // BORROW: explicit .trim_start_matches() for &str → &str
@@ -2894,11 +2888,7 @@ fn print_du_repo_json(
 /// Grammar helper for runtime-counted nouns:
 /// `pluralize(n, "file", "files")`.
 const fn pluralize<'a>(n: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if n == 1 {
-        singular
-    } else {
-        plural
-    }
+    if n == 1 { singular } else { plural }
 }
 
 /// Formats a file-count parenthetical with correct singular/plural form.
@@ -3512,15 +3502,11 @@ fn format_verify_line(
             "  \u{2014} {filename:<fw$} {:>10}  no LFS hash",
             format_size(size)
         ),
-        cache::VerifyStatus::Missing => format!(
-            "  ! {filename:<fw$} {:>10}  MISSING",
-            format_size(size)
-        ),
+        cache::VerifyStatus::Missing => {
+            format!("  ! {filename:<fw$} {:>10}  MISSING", format_size(size))
+        }
         // EXPLICIT: future VerifyStatus variants display as UNKNOWN
-        _ => format!(
-            "  ? {filename:<fw$} {:>10}  UNKNOWN",
-            format_size(size)
-        ),
+        _ => format!("  ? {filename:<fw$} {:>10}  UNKNOWN", format_size(size)),
     }
 }
 
@@ -4262,10 +4248,10 @@ fn run_diff(
         let cap = limit.unwrap_or(usize::MAX);
         // Prints a truncation note when `--limit` cut a section short.
         let print_limit_note = |total: usize| {
-            if let Some(n) = limit {
-                if total > n {
-                    println!("    \u{2026} showing {n} of {total} (limit {n})");
-                }
+            if let Some(n) = limit
+                && total > n
+            {
+                println!("    \u{2026} showing {n} of {total} (limit {n})");
             }
         };
 
@@ -5456,11 +5442,12 @@ fn trie_to_tree(segment: String, mut node: TrieNode) -> TreeNode {
     }
 
     // Single-child collapse: if no own tensor and exactly one child, merge segments.
-    if node.tensor.is_none() && node.children.len() == 1 {
-        if let Some((child_segment, child)) = node.children.pop_first() {
-            let merged = format!("{segment}.{child_segment}");
-            return trie_to_tree(merged, child);
-        }
+    if node.tensor.is_none()
+        && node.children.len() == 1
+        && let Some((child_segment, child)) = node.children.pop_first()
+    {
+        let merged = format!("{segment}.{child_segment}");
+        return trie_to_tree(merged, child);
     }
 
     // Multi-child branch: recurse into each, compute aggregates.
@@ -6095,11 +6082,9 @@ fn run_inspect_single(
         println!("  {line}");
     }
 
-    if !no_metadata {
-        if let Some(ref meta) = info.metadata {
-            for line in format_metadata_lines(meta) {
-                println!("  {line}");
-            }
+    if !no_metadata && let Some(ref meta) = info.metadata {
+        for line in format_metadata_lines(meta) {
+            println!("  {line}");
         }
     }
 
@@ -6371,12 +6356,12 @@ fn run_inspect_repo(
 
     if cached {
         // Cache-only: try shard index first, then walk snapshot.
-        if use_shard_fast_path {
-            if let Some(index) = inspect::fetch_shard_index_cached(repo_id, revision)? {
-                print_shard_index_summary(repo_id, &index, filter);
-                print_adapter_config_if_present(repo_id, revision, None, true, json);
-                return Ok(());
-            }
+        if use_shard_fast_path
+            && let Some(index) = inspect::fetch_shard_index_cached(repo_id, revision)?
+        {
+            print_shard_index_summary(repo_id, &index, filter);
+            print_adapter_config_if_present(repo_id, revision, None, true, json);
+            return Ok(());
         }
 
         let results = inspect::inspect_repo_safetensors_cached(repo_id, revision)?;
@@ -6988,13 +6973,13 @@ fn print_shard_index_summary(repo_id: &str, index: &inspect::ShardedIndex, filte
         }
         println!("  {shard:<fw$} {count:>8}");
         // Filtered: list this shard's matched tensor names beneath its row.
-        if filter.is_some() {
-            if let Some(names) = names_by_shard.get(shard.as_str()) {
-                let mut sorted = names.clone();
-                sorted.sort_unstable();
-                for tname in sorted {
-                    println!("    {tname}");
-                }
+        if filter.is_some()
+            && let Some(names) = names_by_shard.get(shard.as_str())
+        {
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            for tname in sorted {
+                println!("    {tname}");
             }
         }
     }
@@ -8479,12 +8464,16 @@ mod tests {
 
     #[test]
     fn parse_size_arg_rejects_missing_digits() {
-        assert!(parse_size_arg("GiB")
-            .unwrap_err()
-            .contains("missing number"));
-        assert!(parse_size_arg("-5GiB")
-            .unwrap_err()
-            .contains("missing number"));
+        assert!(
+            parse_size_arg("GiB")
+                .unwrap_err()
+                .contains("missing number")
+        );
+        assert!(
+            parse_size_arg("-5GiB")
+                .unwrap_err()
+                .contains("missing number")
+        );
     }
 
     #[test]
@@ -8496,9 +8485,11 @@ mod tests {
     fn parse_size_arg_overflow() {
         // Integer overflow path: 2^54 KiB > u64::MAX.
         let huge = format!("{}KiB", u64::MAX);
-        assert!(parse_size_arg(huge.as_str())
-            .unwrap_err()
-            .contains("overflow"));
+        assert!(
+            parse_size_arg(huge.as_str())
+                .unwrap_err()
+                .contains("overflow")
+        );
     }
 
     // ---------- gc fixtures ----------

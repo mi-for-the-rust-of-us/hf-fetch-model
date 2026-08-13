@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hf_hub::api::tokio::ApiRepo;
@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 
 use crate::checksum;
 use crate::chunked;
-use crate::config::{file_matches, FetchConfig, ProgressCallback};
+use crate::config::{FetchConfig, ProgressCallback, file_matches};
 use crate::error::{FetchError, FileFailure};
 use crate::progress;
 use crate::repo::{self, RepoFile};
@@ -289,14 +289,14 @@ pub async fn download_all_files_map(
     let total_timeout_secs = settings.timeout_total.map_or(0, |d| d.as_secs());
 
     for file in files {
-        if let Some(total_limit) = settings.timeout_total {
-            if overall_start.elapsed() >= total_limit {
-                join_set.abort_all();
-                return Err(FetchError::Timeout {
-                    filename: file.filename,
-                    seconds: total_limit.as_secs(),
-                });
-            }
+        if let Some(total_limit) = settings.timeout_total
+            && overall_start.elapsed() >= total_limit
+        {
+            join_set.abort_all();
+            return Err(FetchError::Timeout {
+                filename: file.filename,
+                seconds: total_limit.as_secs(),
+            });
         }
 
         let permit = Arc::clone(&semaphore)
@@ -406,13 +406,11 @@ async fn download_single_file(
 
     // Verify SHA256 if enabled and metadata is available.
     // BORROW: explicit .as_str() instead of Deref coercion
-    if verify_checksums {
-        if let Some(meta) = metadata_map.get(file.filename.as_str()) {
-            if let Some(ref expected_sha) = meta.sha256 {
-                checksum::verify_sha256(&path, file.filename.as_str(), expected_sha.as_str())
-                    .await?;
-            }
-        }
+    if verify_checksums
+        && let Some(meta) = metadata_map.get(file.filename.as_str())
+        && let Some(ref expected_sha) = meta.sha256
+    {
+        checksum::verify_sha256(&path, file.filename.as_str(), expected_sha.as_str()).await?;
     }
 
     Ok(path)
@@ -482,13 +480,11 @@ async fn download_single_file_chunked(
 
     // Verify SHA256 if enabled and metadata is available.
     // BORROW: explicit .as_str() instead of Deref coercion
-    if verify_checksums {
-        if let Some(meta) = metadata_map.get(file.filename.as_str()) {
-            if let Some(ref expected_sha) = meta.sha256 {
-                checksum::verify_sha256(&path, file.filename.as_str(), expected_sha.as_str())
-                    .await?;
-            }
-        }
+    if verify_checksums
+        && let Some(meta) = metadata_map.get(file.filename.as_str())
+        && let Some(ref expected_sha) = meta.sha256
+    {
+        checksum::verify_sha256(&path, file.filename.as_str(), expected_sha.as_str()).await?;
     }
 
     Ok(path)
@@ -843,14 +839,14 @@ async fn collect_results(
 
     while let Some(join_result) = join_set.join_next().await {
         // Check overall timeout between result collections.
-        if let Some(total_limit) = timeout_total {
-            if overall_start.elapsed() >= total_limit {
-                join_set.abort_all();
-                return Err(FetchError::Timeout {
-                    filename: String::from("(overall timeout exceeded)"),
-                    seconds: total_limit.as_secs(),
-                });
-            }
+        if let Some(total_limit) = timeout_total
+            && overall_start.elapsed() >= total_limit
+        {
+            join_set.abort_all();
+            return Err(FetchError::Timeout {
+                filename: String::from("(overall timeout exceeded)"),
+                seconds: total_limit.as_secs(),
+            });
         }
 
         let (file, download_result) =

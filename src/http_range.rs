@@ -313,15 +313,15 @@ impl<F: RangeFetcher> RangeReader<F> {
 
     /// Serves `buf` from the cached tail or window, if `pos` is covered.
     fn copy_cached(&self, buf: &mut [u8]) -> Option<usize> {
-        if let Some(w) = &self.window {
-            if let Some(n) = w.copy_at(self.pos, buf) {
-                return Some(n);
-            }
+        if let Some(w) = &self.window
+            && let Some(n) = w.copy_at(self.pos, buf)
+        {
+            return Some(n);
         }
-        if let Some(t) = &self.tail {
-            if let Some(n) = t.copy_at(self.pos, buf) {
-                return Some(n);
-            }
+        if let Some(t) = &self.tail
+            && let Some(n) = t.copy_at(self.pos, buf)
+        {
+            return Some(n);
         }
         None
     }
@@ -388,10 +388,10 @@ impl<F: RangeFetcher> Read for RangeReader<F> {
             .saturating_sub(1)
             .min(total.saturating_sub(1));
         // Never overlap the cached tail — those bytes are already paid for.
-        if let Some(t) = &self.tail {
-            if self.pos < t.start {
-                end = end.min(t.start.saturating_sub(1));
-            }
+        if let Some(t) = &self.tail
+            && self.pos < t.start
+        {
+            end = end.min(t.start.saturating_sub(1));
         }
         let data = self.checked_fetch(self.pos, end)?;
         self.window = Some(Extent {

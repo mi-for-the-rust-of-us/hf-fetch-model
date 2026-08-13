@@ -231,13 +231,13 @@ pub async fn discover_new_families<S: BuildHasher>(
             // Client-side tag filter: the HF API may ignore the `filter` query
             // parameter when combined with other params, so verify the tag is
             // actually present on each returned model.
-            if let Some(t) = tag {
-                if !model.tags.iter().any(|model_tag| {
+            if let Some(t) = tag
+                && !model.tags.iter().any(|model_tag| {
                     // BORROW: explicit .as_str() instead of Deref coercion
                     model_tag.as_str().eq_ignore_ascii_case(t)
-                }) {
-                    continue;
-                }
+                })
+            {
+                continue;
             }
 
             // BORROW: explicit .as_ref() and .as_deref() for Option<String>
@@ -389,13 +389,13 @@ pub async fn search_models(
                     _ => return false,
                 }
             }
-            if let Some(t) = tag {
-                if !m.tags.iter().any(|model_tag| {
+            if let Some(t) = tag
+                && !m.tags.iter().any(|model_tag| {
                     // BORROW: explicit .as_str() instead of Deref coercion
                     model_tag.as_str().eq_ignore_ascii_case(t)
-                }) {
-                    return false;
-                }
+                })
+            {
+                return false;
             }
             true
         })

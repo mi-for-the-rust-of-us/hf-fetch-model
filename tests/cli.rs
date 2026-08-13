@@ -1429,10 +1429,10 @@ fn find_cached_safetensors_with_metadata() -> Option<(String, String)> {
                 if f.read_exact(&mut json_buf).is_err() {
                     continue;
                 }
-                if let Ok(text) = std::str::from_utf8(&json_buf) {
-                    if text.contains("__metadata__") {
-                        return Some((repo_id, fname));
-                    }
+                if let Ok(text) = std::str::from_utf8(&json_buf)
+                    && text.contains("__metadata__")
+                {
+                    return Some((repo_id, fname));
                 }
             }
         }

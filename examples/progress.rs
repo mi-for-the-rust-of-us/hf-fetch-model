@@ -4,8 +4,8 @@
 //!
 //! Run: `cargo run --example progress --features indicatif`
 
-use hf_fetch_model::progress::IndicatifProgress;
 use hf_fetch_model::FetchConfig;
+use hf_fetch_model::progress::IndicatifProgress;
 
 #[tokio::main]
 async fn main() -> Result<(), hf_fetch_model::FetchError> {

@@ -123,7 +123,9 @@ pub enum FetchError {
     ///
     /// Emitted before any parse attempt so users see a clear format mismatch
     /// rather than a misleading header-parse error.
-    #[error("hf-fm inspect supports .safetensors, .gguf, .npz, or .pth (got .{extension} for {filename})")]
+    #[error(
+        "hf-fm inspect supports .safetensors, .gguf, .npz, or .pth (got .{extension} for {filename})"
+    )]
     UnsupportedInspectFormat {
         /// The filename whose extension is unsupported.
         filename: String,

@@ -152,10 +152,10 @@ impl IndicatifProgress {
     pub fn handle(&self, event: &ProgressEvent) {
         if event.percent >= 100.0 {
             // Remove and finish per-file bar if it exists.
-            if let Ok(mut bars) = self.file_bars.lock() {
-                if let Some(bar) = bars.remove(&event.filename) {
-                    bar.finish_and_clear();
-                }
+            if let Ok(mut bars) = self.file_bars.lock()
+                && let Some(bar) = bars.remove(&event.filename)
+            {
+                bar.finish_and_clear();
             }
             // Deduplicate: chunked downloads fire a streaming 100% event,
             // then the orchestrator fires a completed_event for the same file.
