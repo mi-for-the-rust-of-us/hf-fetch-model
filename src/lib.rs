@@ -267,9 +267,21 @@ use crate::repo::ModelRepo;
 /// `output_dir` (used as the cache root) and carries the requested revision
 /// on the handle.
 ///
+/// **The cache directory is always set explicitly**, never left to `hf-hub`'s
+/// own resolution. `hf-hub` 1.0 derives its default from the `HOME`
+/// environment variable alone, falling back to `/tmp` — and Windows does not
+/// set `HOME` (it uses `USERPROFILE`), so on Windows the default resolves to
+/// `C:\tmp\.cache\huggingface\hub` while every other command in this crate
+/// reads [`cache::hf_cache_dir`]. Pinning it here keeps downloads and cache
+/// introspection pointed at the same directory on every platform, and keeps
+/// [`cache::hf_cache_dir`] the single source of truth it already is for
+/// `du` / `status` / `cache *` / `inspect --cached`.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Api`] if the `hf-hub` client cannot be constructed.
+/// Returns [`FetchError::Io`] if the home directory cannot be determined and
+/// no explicit `output_dir` was configured.
 fn build_model_repo(repo_id: &str, config: &FetchConfig) -> Result<ModelRepo, FetchError> {
     let mut builder = HFClient::builder();
 
@@ -278,10 +290,12 @@ fn build_model_repo(repo_id: &str, config: &FetchConfig) -> Result<ModelRepo, Fe
         builder = builder.token(token.clone());
     }
 
-    if let Some(ref dir) = config.output_dir {
+    let cache_dir = match config.output_dir {
         // BORROW: explicit .clone() for owned PathBuf
-        builder = builder.cache_dir(dir.clone());
-    }
+        Some(ref dir) => dir.clone(),
+        None => cache::hf_cache_dir()?,
+    };
+    builder = builder.cache_dir(cache_dir);
 
     let client = builder.build().map_err(FetchError::Api)?;
 
