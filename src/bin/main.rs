@@ -393,7 +393,7 @@ See also: hf-fm list-families, hf-fm discover")]
     /// multi-hundred-MiB archives; `.gguf` fetches only the front-loaded
     /// metadata and tensor-info table, never the weight data). For `.pth`,
     /// only cached inspect is supported (remote inspect is planned for
-    /// v0.11.3); pass `--cached` after downloading the file.
+    /// v0.11.4); pass `--cached` after downloading the file.
     #[command(after_help = "Examples:\n  \
         hf-fm inspect <repo>                                    # inspect every .safetensors in the repo\n  \
         hf-fm inspect <repo> --filter blocks.0.                 # matched tensor names (per shard/file)\n  \
@@ -5883,7 +5883,7 @@ fn run_inspect_single(
 ) -> Result<(), FetchError> {
     // Classify extension once. .safetensors / .npz (since v0.11.0/v0.11.1)
     // and .gguf (since v0.11.2) all dispatch remote-or-cached over the same
-    // `HttpRangeReader` adapter; .pth remains cached-only until v0.11.3.
+    // `HttpRangeReader` adapter; .pth remains cached-only until v0.11.4.
     let ext_lc = Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
@@ -5904,7 +5904,7 @@ fn run_inspect_single(
 
     if is_pth && !cached {
         return Err(FetchError::InvalidArgument(format!(
-            "remote PTH inspect not yet supported (planned for v0.11.3): \
+            "remote PTH inspect not yet supported (planned for v0.11.4): \
              pass --cached after downloading {filename} with `hf-fm download`"
         )));
     }

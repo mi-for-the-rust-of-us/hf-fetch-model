@@ -2025,8 +2025,8 @@ fn inspect_remote_pth_errors_names_its_release() {
     assert!(!success, "remote PTH inspect must be rejected");
     assert!(
         stderr.contains("remote PTH inspect not yet supported")
-            && stderr.contains("planned for v0.11.3"),
-        "PTH rejection should name v0.11.3, got:\n{stderr}"
+            && stderr.contains("planned for v0.11.4"),
+        "PTH rejection should name v0.11.4, got:\n{stderr}"
     );
 }
 

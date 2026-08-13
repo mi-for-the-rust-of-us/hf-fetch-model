@@ -13,7 +13,7 @@
 //! anamnesis's earlier `inspect_gguf_from_reader`, 0.4.5, is summary-only
 //! and insufficient for `hf-fm`'s per-tensor rendering); `.pth` files are
 //! inspected from the local cache only via the `anamnesis` parser crate
-//! ([`inspect_pth_cached`] — remote inspect is planned for v0.11.3).
+//! ([`inspect_pth_cached`] — remote inspect is planned for v0.11.4).
 //!
 //! The primary types are [`TensorInfo`] (per-tensor metadata),
 //! [`SafetensorsHeaderInfo`] (the format-agnostic parsed-header shape all
@@ -1203,7 +1203,7 @@ pub async fn inspect_repo_safetensors(
 /// ([`list_cached_tensor_files`]) and the CLI's remote listing / numeric
 /// index / `--pick` candidate set. Matches the per-file dispatch in
 /// `hf-fm inspect` (`.safetensors` / `.npz` / `.gguf` remote or cached
-/// since v0.11.0 / v0.11.1 / v0.11.2; `.pth` cached-only until v0.11.3).
+/// since v0.11.0 / v0.11.1 / v0.11.2; `.pth` cached-only until v0.11.4).
 pub const SUPPORTED_TENSOR_EXTENSIONS: [&str; 4] = ["safetensors", "gguf", "npz", "pth"];
 
 /// Returns `true` when `filename`'s extension matches one of

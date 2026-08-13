@@ -124,7 +124,7 @@
 //! [`inspect::inspect_gguf`] each drive an anamnesis reader-based parser
 //! over an [`HttpRangeReader`] — see the [`http_range`] module for the
 //! substrate: tail prefetch, read-ahead, hard transfer budgets, token-free
-//! CDN requests). `PTH` remains cached-only (planned for v0.11.3) and
+//! CDN requests). `PTH` remains cached-only (planned for v0.11.4) and
 //! errors early with a "pass --cached after downloading" recovery hint.
 //!
 //! For discovery — "what tensor files does this cached repo hold?" —

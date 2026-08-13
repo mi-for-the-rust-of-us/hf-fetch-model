@@ -363,7 +363,7 @@ You went from "15 GiB I can't use" to "5 GiB that fits with room to spare" — c
 
 Total bytes downloaded to learn all of that: less than a megabyte. Every command above is also valid input to library callers — see [`examples/candle_inspect.rs`](../../examples/candle_inspect.rs) for the embeddable equivalent.
 
-The companion path (**inspect after you download**) still matters for `.pth` files (`--cached` only; remote inspect is planned for v0.11.3) and for quantization detection on cached safetensors (since v0.10.3). `.gguf` no longer needs it: as the pivot above just showed, it joined `.safetensors` / `.npz` as remote-inspectable in v0.11.2, so `inspect` works the same way (before or after downloading) for three of the four tensor formats.
+The companion path (**inspect after you download**) still matters for `.pth` files (`--cached` only; remote inspect is planned for v0.11.4) and for quantization detection on cached safetensors (since v0.10.3). `.gguf` no longer needs it: as the pivot above just showed, it joined `.safetensors` / `.npz` as remote-inspectable in v0.11.2, so `inspect` works the same way (before or after downloading) for three of the four tensor formats.
 
 For details on every flag in `inspect`, see the [CLI reference](../cli-reference.md). For common follow-up questions, the [FAQ](../FAQ.md) covers gating, cache layout, and the quirks of partial downloads.
 

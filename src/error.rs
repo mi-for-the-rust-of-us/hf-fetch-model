@@ -181,7 +181,7 @@ mod tests {
         // names every format the inspect dispatcher handles — .safetensors,
         // .npz, and .gguf (remote via the `HttpRangeReader` adapter, since
         // v0.11.0/v0.11.1/v0.11.2 respectively, or cached), .pth (cached
-        // only until v0.11.3).
+        // only until v0.11.4).
         let e = FetchError::UnsupportedInspectFormat {
             filename: "weights.pt".to_owned(),
             extension: "pt".to_owned(),

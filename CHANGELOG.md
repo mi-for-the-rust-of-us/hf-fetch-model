@@ -7,9 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] — Edition 2024 & dependency hygiene
+
+No new user-facing features. This release moves the crate onto Rust edition 2024, fixes a dependency defect that was leaking a CLI-only feature into every downstream consumer, and takes the long-deferred `hf-hub` 1.0 / `reqwest` 0.13 port now that `hf-hub` 1.0 has reached stable.
+
+### Changed
+
+- **Rust edition 2021 → 2024.** hf-fetch-model was the last of the three co-developed crates still on 2021; anamnesis and hypomnesis have both been on 2024 for some time. The migration was mechanically clean: running the full `rust-2024-compatibility` lint group over `--all-targets --all-features` surfaced exactly one category, `tail_expr_drop_order`, across 19 sites. Each was inspected individually; all are `while let Some(x) = <expr>.await` loops over `JoinSet::join_next` / `Stream::next` / `Response::chunk`, or async-fn tail expressions. None holds a lock, a `TempFileGuard`, or a semaphore permit across the changed drop point, so there is no behaviour change, and the lint is allow-by-default in edition 2024. Confirmed absent: `unsafe_attr_outside_unsafe`, `impl_trait_overcaptures`, `rust_2024_incompatible_pat`, `keyword_idents_2024`, `static_mut_refs`, `if_let_rescope` (`#![forbid(unsafe_code)]` rules out the unsafe-related migrations by construction). Edition 2024 also makes **resolver v3** (MSRV-aware dependency resolution) the default for this package.
+
+- **28 nested `if` blocks collapsed into let-chains**, the one real work item the edition flip created (`clippy::collapsible_if` fires only once let-chains are available). A previous audit counted 16; that is the lib-only figure — the true total across all targets is 16 library, 11 binary, 1 test. Three sites in `src/download.rs` collapse a triple nesting (`if verify_checksums` / `if let Some(meta)` / `if let Some(expected_sha)`) into one chain. `cargo fmt` additionally applied the 2024 style edition: use-statement reordering, short `if`/`else` bodies on one line, and corrected indentation on several trailing `// BORROW:` / `// INDEX:` annotation comments that the 2021 style edition had been mis-anchoring.
+
+- **`hf-hub` 0.5 → 1.0 and `reqwest` 0.12 → 0.13.** `hf-hub` 1.0 requires `reqwest ^0.13`, so the two moved together — which was exactly the condition the `reqwest` bump had been waiting on. This is a port, not a bump: `hf_hub::api::tokio` is gone (`HFClient` / `HFRepository<T>` replace `Api` / `ApiRepo`), repositories are addressed by `(owner, name)` rather than one `"org/name"` string, the `tokio` feature is gone (async is unconditional), request parameters moved to `bon`-generated builders, the per-backend error types collapsed into one `HFError`, and `ModelInfo::siblings` became `Option<Vec<RepoSibling>>`. The revision also moved off the repo handle onto each call; the new `repo::ModelRepo` pairs a repository with its revision so the download pipeline's signatures are unchanged. The three `*_with_config` entry points, which had carried three byte-identical copies of the client-construction block, now share one `build_model_repo` helper.
+
+- **Minimum supported Rust version 1.88 → 1.91.** A direct consequence of `hf-hub` 1.0, which takes a mandatory `hf-xet` dependency. Worth recording *how* the floor was found, because `cargo`'s own MSRV check **under-reports** it: cargo sees only declared `rust-version` fields, which pointed at 1.89 (`konst ^0.4` and `redb ^3.1`, reached via `xet-runtime` / `xet-client`; every published version of both requires 1.89, so there is no pinnable escape). But `xet-core-structures` declares no `rust-version` at all and calls `str::floor_char_boundary`, stable only since 1.91 — so builds at 1.89 and 1.90 fail with an `E0658` cargo never predicted. The floor was therefore established by **bisection**: 1.90 fails, 1.91 passes. CI's MSRV lane moves to 1.91 and its comment records the method so the next person re-bisects rather than trusting the declarations.
+
+- **`clippy::duration_suboptimal_units` allowed with a reason** (`Cargo.toml`). Raising the MSRV to 1.91 — the release that stabilised `Duration::from_mins` — activated this lint on 32 sites. Allowed rather than applied: every timeout in this crate is *specified* in seconds (the CLI flags are `--timeout-per-file-secs` / `--timeout-total-secs`, and `FetchError::Timeout` carries a `seconds` field), so `from_secs` matches the surface users actually type, and 26 of the 32 sites are tests asserting exactly those second-valued flags.
+
+- **`anamnesis` 0.7.1 → 0.7.3** (Phase 7.2 GGUF-reader parallelisation, Phase 7.3 caller-chosen output dtype). Neither touches an API hf-fm calls — the inspect paths are metadata-only and never reach the dequantisation surface. Plus 119 semver-compatible transitive updates via `cargo update` (`tokio` 1.53.1, `clap` 4.6.6, `hyper` 1.11, `http` 1.5, `zerocopy` 0.8.56, `webpki-roots` 1.0.9, and others).
+
+### Fixed
+
+- **hf-fm no longer force-enables `hypomnesis`'s `cli` feature on every downstream consumer.** The dependency was declared bare (`hypomnesis = "0.2.5"`), and **hypomnesis 0.2.8 made `cli` a default feature** so that `cargo install hypomnesis` ships the `hmn` binary. Cargo unions features across the whole graph, so the bare declaration silently pulled `clap` + `ctrlc` into everything downstream — **overriding candle-mi's own `default-features = false` opt-out**. The defect was latent rather than newly introduced: `^0.2.5` already admitted 0.2.9 and only the lockfile held it back, so any `cargo update` in any consumer would have tripped it.
+
+  The worst of it landed on hf-fm's **library** build, where `clap` is declared `optional = true` precisely so library consumers never pay for it: the no-default-features tree had grown from 180 to 196 crates, pulling in the entire clap stack (`clap`, `clap_builder`, `clap_derive`, `clap_lex`, `anstream`, `anstyle` and its four siblings, `colorchoice`, `heck`, `strsim`, `is_terminal_polyfill`, `once_cell_polyfill`, `utf8parse`) plus `ctrlc`.
+
+  Fixed with `default-features = false` and an explicit feature list on **both** the runtime and dev-dependency entries (dev- and normal dependencies unify in the test build, so a bare dev entry would re-introduce the union). hf-fm calls only `device_info`, for `inspect --check-gpu`, so it now selects just the GPU *source* features it reads. Measured: library build 196 → 180 crates, CLI build 203 → 202 (`clap` stays, since the binary declares its own). `pdh` and `metal` are deliberately retained — `pdh` is Windows-only and shares the `windows` crate `dxgi` already pulls, and `metal` keeps the Apple-Silicon `device_info` path alive (verified that `objc2` / `objc2-metal` / `objc2-foundation` still resolve for `aarch64-apple-darwin`).
+
+- **`list_repo_files` detects a missing repository by type rather than by string.** `hf-hub` 1.0 reports it as a typed `HFError::RepoNotFound` variant, so the old `msg.contains("404")` sniff is gone.
+
+### Removed
+
+- **`cache_layout::repo_folder_name` no longer delegates to `hf-hub`.** `hf-hub` 0.5 exposed the naming through `Repo::folder_name()`; the 1.0 rewrite made its equivalent `pub(crate)`, so there is no upstream function left to call and hf-fm constructs `models--org--name` directly. The algorithm is identical across both versions, and the behaviour-based `cache_layout_matches_hf_hub` integration test still pins it to what `hf-hub` actually writes on disk — which was always the guarantee that mattered.
+
+### Breaking
+
+- `FetchError::Api` now wraps `hf_hub::HFError` instead of `hf_hub::api::tokio::ApiError`.
+- `download::download_all_files`, `download::download_all_files_map`, `download::download_file_by_name`, and `repo::list_repo_files` take `repo::ModelRepo` instead of `hf_hub::api::tokio::ApiRepo`.
+- Minimum supported Rust version is now 1.91.
+
+Checked against the in-tree consumer: candle-mi calls only `download_with_config`, `download_file_blocking`, `download_files_with_config_blocking`, `FetchConfig`, `build_client`, `repo::list_repo_files_with_metadata`, and `range_reader` — none of which names an `hf-hub` type, so it is unaffected apart from the MSRV floor.
+
+### Verification
+
+A dependency swap underneath a download library is not proven by unit tests, so beyond `cargo fmt --check`, `clippy --all-targets --all-features -- -D warnings`, 429 tests, and the 1.91 MSRV lane:
+
+- **Cold-cache live download** (fresh `HF_HOME`): 276.5 KiB in 1.5 s, written to `models--julien-c--dummy-unknown/snapshots/<sha>/` — cache layout unchanged.
+- **Chunked multi-connection download**, forced via `--chunk-threshold-mib 0 --connections-per-file 4`: completed with per-chunk progress and correct cache placement.
+- **Remote Range inspect on `reqwest` 0.13**: `hf-internal-testing/tiny-random-gpt2` reads as `remote (4 range requests, 8.0 KiB fetched)` — byte-identical to the figure v0.11.1 recorded.
+
 ### Added
 
-- **CI now has an MSRV `1.88` lane** (`.github/workflows/ci.yml`). The manifest has declared `rust-version = "1.88"` all along, but every CI job ran rolling `stable`, so the claim was never actually tested. Adding the lane immediately found that the crate did **not** compile clean on 1.88 (see *Fixed* below). The sibling crates anamnesis and hypomnesis have run a 1.88 lane since their first release; this closes the last gap in the eco-system.
+- **CI now has an MSRV lane** (`.github/workflows/ci.yml`). The manifest had declared `rust-version = "1.88"` all along, but every CI job ran rolling `stable`, so the claim was never actually tested. Adding the lane immediately found that the crate did **not** compile clean on 1.88 (see *Fixed* below). The sibling crates anamnesis and hypomnesis have run an MSRV lane since their first release; this closes the last gap in the eco-system. The lane landed at 1.88 and moves to **1.91** later in this same release, when the `hf-hub` 1.0 port raised the floor (see *Changed*).
 
   **The lane is lint-only, deliberately:** `clippy --all-targets --all-features -- -D warnings`, with no `cargo test`. `--all-targets` still type-checks the test code, so compile coverage of the MSRV claim is complete and only test *execution* is omitted; the suite continues to run on `stable` across `ubuntu-latest` and `windows-latest`. See *Known issue* below for why.
 
