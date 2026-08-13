@@ -256,7 +256,44 @@ pub use progress::{ProgressEvent, ProgressReceiver};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use hf_hub::{Repo, RepoType};
+use hf_hub::{HFClient, split_id};
+
+use crate::repo::ModelRepo;
+
+/// Builds an `hf-hub` client and resolves it to a [`ModelRepo`] handle.
+///
+/// Shared by the three `*_with_config` entry points, which differ only in
+/// what they do with the resulting handle. Honours the config's token and
+/// `output_dir` (used as the cache root) and carries the requested revision
+/// on the handle.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Api`] if the `hf-hub` client cannot be constructed.
+fn build_model_repo(repo_id: &str, config: &FetchConfig) -> Result<ModelRepo, FetchError> {
+    let mut builder = HFClient::builder();
+
+    if let Some(ref token) = config.token {
+        // BORROW: explicit .clone() to pass owned String
+        builder = builder.token(token.clone());
+    }
+
+    if let Some(ref dir) = config.output_dir {
+        // BORROW: explicit .clone() for owned PathBuf
+        builder = builder.cache_dir(dir.clone());
+    }
+
+    let client = builder.build().map_err(FetchError::Api)?;
+
+    // `hf-hub` 1.0 addresses repositories by (owner, name) rather than by a
+    // single "org/name" string; `split_id` yields an empty owner for a
+    // canonical-namespace repo such as `gpt2`, which is what the Hub expects.
+    let (owner, name) = split_id(repo_id);
+    Ok(ModelRepo::new(
+        client.model(owner, name),
+        config.revision.clone(),
+    ))
+}
 
 /// Pre-flight check for gated model access.
 ///
@@ -374,29 +411,8 @@ pub async fn download_with_config(
     // BORROW: explicit .as_str() instead of Deref coercion
     preflight_gated_check(repo_id.as_str(), config).await?;
 
-    let mut builder = hf_hub::api::tokio::ApiBuilder::new().high();
-
-    if let Some(ref token) = config.token {
-        // BORROW: explicit .clone() to pass owned String
-        builder = builder.with_token(Some(token.clone()));
-    }
-
-    if let Some(ref dir) = config.output_dir {
-        // BORROW: explicit .clone() for owned PathBuf
-        builder = builder.with_cache_dir(dir.clone());
-    }
-
-    let api = builder.build().map_err(FetchError::Api)?;
-
-    let hf_repo = match config.revision {
-        Some(ref rev) => {
-            // BORROW: explicit .clone() for owned String arguments
-            Repo::with_revision(repo_id.clone(), RepoType::Model, rev.clone())
-        }
-        None => Repo::new(repo_id.clone(), RepoType::Model),
-    };
-
-    let repo = api.repo(hf_repo);
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let repo = build_model_repo(repo_id.as_str(), config)?;
     download::download_all_files(repo, repo_id, Some(config)).await
 }
 
@@ -488,29 +504,8 @@ pub async fn download_files_with_config(
     // BORROW: explicit .as_str() instead of Deref coercion
     preflight_gated_check(repo_id.as_str(), config).await?;
 
-    let mut builder = hf_hub::api::tokio::ApiBuilder::new().high();
-
-    if let Some(ref token) = config.token {
-        // BORROW: explicit .clone() to pass owned String
-        builder = builder.with_token(Some(token.clone()));
-    }
-
-    if let Some(ref dir) = config.output_dir {
-        // BORROW: explicit .clone() for owned PathBuf
-        builder = builder.with_cache_dir(dir.clone());
-    }
-
-    let api = builder.build().map_err(FetchError::Api)?;
-
-    let hf_repo = match config.revision {
-        Some(ref rev) => {
-            // BORROW: explicit .clone() for owned String arguments
-            Repo::with_revision(repo_id.clone(), RepoType::Model, rev.clone())
-        }
-        None => Repo::new(repo_id.clone(), RepoType::Model),
-    };
-
-    let repo = api.repo(hf_repo);
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let repo = build_model_repo(repo_id.as_str(), config)?;
     download::download_all_files_map(repo, repo_id, Some(config)).await
 }
 
@@ -563,29 +558,8 @@ pub async fn download_file(
     // BORROW: explicit .as_str() instead of Deref coercion
     preflight_gated_check(repo_id.as_str(), config).await?;
 
-    let mut builder = hf_hub::api::tokio::ApiBuilder::new().high();
-
-    if let Some(ref token) = config.token {
-        // BORROW: explicit .clone() to pass owned String
-        builder = builder.with_token(Some(token.clone()));
-    }
-
-    if let Some(ref dir) = config.output_dir {
-        // BORROW: explicit .clone() for owned PathBuf
-        builder = builder.with_cache_dir(dir.clone());
-    }
-
-    let api = builder.build().map_err(FetchError::Api)?;
-
-    let hf_repo = match config.revision {
-        Some(ref rev) => {
-            // BORROW: explicit .clone() for owned String arguments
-            Repo::with_revision(repo_id.clone(), RepoType::Model, rev.clone())
-        }
-        None => Repo::new(repo_id.clone(), RepoType::Model),
-    };
-
-    let repo = api.repo(hf_repo);
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let repo = build_model_repo(repo_id.as_str(), config)?;
     download::download_file_by_name(repo, repo_id, filename, config).await
 }
 

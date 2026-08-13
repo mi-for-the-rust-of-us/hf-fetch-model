@@ -18,12 +18,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Benchmark 1: plain hf-hub (sequential, file-by-file)
     println!("=== Plain hf-hub (sequential) ===");
     let start = Instant::now();
-    let api = hf_hub::api::tokio::ApiBuilder::new().high().build()?;
-    let repo = api.model(repo_id.to_owned());
-    let info = repo.info().await?;
-    for sibling in &info.siblings {
-        // BORROW: explicit .as_str() instead of Deref coercion
-        let _path = repo.get(sibling.rfilename.as_str()).await?;
+    let client = hf_hub::HFClient::builder().build()?;
+    let (owner, name) = hf_hub::split_id(repo_id);
+    let repo = client.model(owner, name);
+    let info = repo.info().send().await?;
+    // `siblings` is `Option<Vec<_>>` in hf-hub 1.0 — absent, not empty, when
+    // the info endpoint returns no file listing.
+    for sibling in info.siblings.unwrap_or_default() {
+        let _path = repo
+            .download_file()
+            .filename(sibling.rfilename)
+            .send()
+            .await?;
     }
     let hf_hub_duration = start.elapsed();
     println!("hf-hub sequential: {hf_hub_duration:?}");

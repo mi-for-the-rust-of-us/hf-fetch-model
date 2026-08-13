@@ -12,8 +12,12 @@ use std::path::PathBuf;
 #[non_exhaustive]
 pub enum FetchError {
     /// The `hf-hub` API returned an error.
+    ///
+    /// Wraps `hf_hub::HFError` (was `hf_hub::api::tokio::ApiError` before the
+    /// `hf-hub` 1.0 rewrite, which collapsed the per-backend error types into
+    /// one).
     #[error("hf-hub API error: {0}")]
-    Api(#[from] hf_hub::api::tokio::ApiError),
+    Api(#[from] hf_hub::HFError),
 
     /// An I/O error occurred while accessing the local filesystem.
     #[error("I/O error at {path}: {source}")]

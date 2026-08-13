@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use hf_hub::api::tokio::ApiRepo;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -22,7 +21,7 @@ use crate::chunked;
 use crate::config::{FetchConfig, ProgressCallback, file_matches};
 use crate::error::{FetchError, FileFailure};
 use crate::progress;
-use crate::repo::{self, RepoFile};
+use crate::repo::{self, ModelRepo, RepoFile};
 use crate::retry::{self, RetryPolicy};
 
 /// Default timeout per file when no config is provided (5 minutes).
@@ -139,7 +138,7 @@ impl DownloadSettings {
 /// Returns [`FetchError::NoFilesMatched`] if the repository is empty or all files were filtered out.
 /// Returns [`FetchError::Timeout`] if the overall timeout is exceeded.
 pub async fn download_all_files(
-    repo: ApiRepo,
+    repo: ModelRepo,
     repo_id: String,
     config: Option<&FetchConfig>,
 ) -> Result<DownloadOutcome<PathBuf>, FetchError> {
@@ -187,7 +186,7 @@ pub async fn download_all_files(
 // pipeline.
 #[allow(clippy::too_many_lines)]
 pub async fn download_all_files_map(
-    repo: ApiRepo,
+    repo: ModelRepo,
     repo_id: String,
     config: Option<&FetchConfig>,
 ) -> Result<DownloadOutcome<HashMap<String, PathBuf>>, FetchError> {
@@ -376,7 +375,7 @@ pub async fn download_all_files_map(
 
 /// Downloads a single file with retry and timeout, then optionally verifies its checksum.
 async fn download_single_file(
-    repo: &ApiRepo,
+    repo: &ModelRepo,
     file: &RepoFile,
     metadata_map: &HashMap<String, RepoFile>,
     verify_checksums: bool,
@@ -392,14 +391,13 @@ async fn download_single_file(
         let timeout_dur = timeout;
         async move {
             // BORROW: explicit .as_str() instead of Deref coercion
-            let download_fut = repo.get(fname.as_str());
+            let download_fut = repo.download_file(fname.as_str());
             tokio::time::timeout(timeout_dur, download_fut)
                 .await
                 .map_err(|_elapsed| FetchError::Timeout {
                     filename: fname.clone(),
                     seconds: timeout_dur.as_secs(),
                 })?
-                .map_err(FetchError::Api)
         }
     })
     .await?;
@@ -502,7 +500,7 @@ async fn download_single_file_chunked(
 /// Returns [`FetchError::Api`] on download failure (after retries).
 /// Returns [`FetchError::Checksum`] if verification is enabled and fails.
 pub(crate) async fn download_file_by_name(
-    repo: ApiRepo,
+    repo: ModelRepo,
     repo_id: String,
     filename: &str,
     config: &FetchConfig,
@@ -707,7 +705,7 @@ fn build_shared_state(
 /// 4. Logs the result with timing and throughput
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_download(
-    repo: &ApiRepo,
+    repo: &ModelRepo,
     file: &RepoFile,
     metadata_map: &HashMap<String, RepoFile>,
     chunked_client: Option<&reqwest::Client>,

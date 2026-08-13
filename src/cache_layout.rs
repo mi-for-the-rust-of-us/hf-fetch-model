@@ -2,7 +2,7 @@
 
 //! Centralized `hf-hub` cache path construction.
 //!
-//! All paths follow the `hf-hub` 0.5 cache layout:
+//! All paths follow the `hf-hub` 1.0 cache layout:
 //! `{cache_root}/models--org--name/{snapshots,blobs,refs}/...`
 //!
 //! This module is the single source of truth for cache directory structure.
@@ -11,15 +11,24 @@
 
 use std::path::{Path, PathBuf};
 
-use hf_hub::{Repo, RepoType};
-
 /// Repo folder name: `"models--org--name"`.
 ///
-/// Delegates to [`hf_hub::Repo::folder_name()`].
+/// Constructed here rather than delegated: `hf-hub` 0.5 exposed the naming
+/// through `Repo::folder_name()`, but the 1.0 rewrite made its equivalent
+/// (`cache::storage::repo_folder_name`) `pub(crate)`, so there is no longer
+/// an upstream function to call. The algorithm is unchanged across both
+/// versions — the repo-type plural (`"models"`) followed by the `repo_id`
+/// segments, joined by `--` — and the `cache_layout_matches_hf_hub`
+/// integration test still pins it to what `hf-hub` actually writes on disk,
+/// which is the guarantee that mattered.
 #[must_use]
 pub fn repo_folder_name(repo_id: &str) -> String {
-    // BORROW: explicit .to_owned() for &str → owned String required by Repo::new
-    Repo::new(repo_id.to_owned(), RepoType::Model).folder_name()
+    let mut name = String::from("models");
+    for segment in repo_id.split('/') {
+        name.push_str("--");
+        name.push_str(segment);
+    }
+    name
 }
 
 /// Repo root directory: `{cache_root}/models--org--name/`.

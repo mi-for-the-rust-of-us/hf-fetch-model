@@ -2,7 +2,7 @@
 name = "hf-fetch-model"
 version = "0.11.2"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 description = "Download, inspect, and compare HuggingFace models from Rust. Multi-connection parallel downloads plus safetensors, NPZ, and GGUF header inspection via HTTP Range. No weight data downloaded."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mi-for-the-rust-of-us/hf-fetch-model"
@@ -30,7 +30,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 dirs = "6"
 fs2 = "0.4"
 globset = "0.4"
-hf-hub = { version = "0.5", features = ["tokio"] }
+hf-hub = "1.0"
 # `default-features = false` is load-bearing, not cosmetic. hypomnesis
 # 0.2.8 made `cli` a default feature so `cargo install hypomnesis` ships
 # the `hmn` binary; Cargo unions features across the whole graph, so a
@@ -51,7 +51,7 @@ hypomnesis = { version = "0.2.9", default-features = false, features = [
 ] }
 indicatif = { version = "0.18", optional = true }
 futures-util = "0.3"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -131,3 +131,12 @@ missing_panics_doc = "warn"
 # Allow noisy pedantic lints
 module_name_repetitions = "allow"
 too_many_lines = "allow"
+# `duration_suboptimal_units` wants `Duration::from_mins(5)` wherever the
+# code says `from_secs(300)`. It became visible only when the MSRV moved to
+# 1.91 (the release that stabilised `from_mins`), and it fights this crate's
+# domain vocabulary: every timeout here is *specified* in seconds — the CLI
+# flags are `--timeout-per-file-secs` / `--timeout-total-secs`, and
+# `FetchError::Timeout` carries a `seconds` field — so `from_secs` is what
+# matches the surface the user types and reads. Most of the 32 sites are
+# tests asserting exactly those second-valued flags.
+duration_suboptimal_units = "allow"
