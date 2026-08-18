@@ -2262,6 +2262,41 @@ fn inspect_cached_sharded_limit_shows_shard_column() {
 }
 
 #[test]
+fn inspect_cached_sharded_check_gpu_shows_compact_rollup_not_full_table() {
+    // Regression: `--check-gpu` alone (no `--tree` / `--dtypes` / `--limit`)
+    // used to force the aggregation path into dumping every tensor via
+    // `print_multi_shard_table` before the verdict — thousands of lines of
+    // noise on a many-tensor repo. It must now show the same compact
+    // per-file rollup `inspect <repo> --cached` (no `--check-gpu`) already
+    // shows, with the verdict appended.
+    let Some(repo_id) = find_cached_sharded_repo() else {
+        eprintln!("SKIP: no cached sharded safetensors model found");
+        return;
+    };
+    let (stdout, stderr, success) =
+        run(hf_fm().args(["inspect", &repo_id, "--cached", "--check-gpu"]));
+    assert!(
+        success,
+        "inspect --cached --check-gpu should succeed: {stderr}"
+    );
+    assert!(
+        stdout.contains("aggregated across"),
+        "should still report the aggregated source, got:\n{stdout}"
+    );
+    // `Dtype` only appears in the full per-tensor table's column header
+    // (`print_multi_shard_table`); the compact rollup (`print_multi_file_summary`)
+    // never prints per-tensor rows at all.
+    assert!(
+        !stdout.contains("Dtype"),
+        "check-gpu alone must not force the full per-tensor table, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("File") && stdout.contains("Tensors") && stdout.contains("Params"),
+        "should show the compact per-file rollup header, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn inspect_cached_filter() {
     let Some((repo_id, filename)) = find_cached_safetensors_repo() else {
         eprintln!("SKIP: no cached safetensors repo found");

@@ -6718,6 +6718,31 @@ fn run_inspect_repo_aggregated(
         return print_multi_file_json_with_gpu_check(results, filter, gpu_check_value);
     }
 
+    // `--check-gpu` alone (or with `--filter`, no `--tree` / `--dtypes` /
+    // `--limit`) forces this aggregation path just to sum weight bytes
+    // precisely, but the user never asked for per-tensor detail. Without
+    // this branch the code fell through to the full `print_multi_shard_table`
+    // dump below — for a many-shard MoE checkpoint (tens of thousands of
+    // tensors) that is thousands of lines of noise before the four-line
+    // verdict. `--limit` is excluded here because `print_multi_file_summary`
+    // has no truncation support; that combination keeps using the table
+    // below, exactly as it already did without `--check-gpu`. This mirrors
+    // the non-aggregation bare/`--filter`-only path's `print_multi_file_summary`
+    // call ([`run_inspect_repo`]) — `--check-gpu`'s presence no longer changes
+    // which rollup shape the rest of the flags produce.
+    if !tree && !dtypes && limit.is_none() {
+        let n_shards = results.len();
+        let shard_label = if n_shards == 1 { "shard" } else { "shards" };
+        print_multi_file_summary(
+            repo_id,
+            &format!("aggregated across {n_shards} {shard_label}"),
+            results,
+            filter,
+        );
+        maybe_print_gpu_check(gpu_inputs.as_ref(), gpu_result.as_ref());
+        return Ok(());
+    }
+
     // Header — same shape as the per-file inspect.
     println!("  Repo:   {repo_id}");
     let n_shards = results.len();
