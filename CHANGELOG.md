@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.4] — Remote PTH inspect
+
 ### Added
 
 - **Remote `.pth` inspect.** `hf-fm inspect <repo> file.pth` (no `--cached`) now rides the same `HttpRangeReader` substrate as `.safetensors` / `.npz` / `.gguf` — the fourth and last tensor format anamnesis supports is remotely inspectable, closing the matrix opened in v0.11.0. Wired through the new `inspect::inspect_pth` (cache-first, `HttpRangeReader::open` + `spawn_blocking` running `anamnesis::parse_pth_front_matter_from_reader` on a miss), mirroring `inspect_npz` / `inspect_gguf`'s exact shape so `Source:` renders identically across all four formats. Live-verified against `RWKV/RWKV7-Goose-World-PTH`'s uncached `RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth` (364.49 MiB, 399 tensors): `Source: remote (12 range requests, 113.7 KiB fetched)` — every rendering flag (`--tree` / `--dtypes` / `--filter` / `--limit` / `--json`) composes unchanged, and `--list` / the v0.9.7 numeric index / `--pick` already covered `.pth` uniformly since v0.10.5.
