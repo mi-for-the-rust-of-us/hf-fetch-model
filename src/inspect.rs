@@ -3,17 +3,19 @@
 //! Tensor-file header inspection (local and remote).
 //!
 //! Reads tensor metadata (names, shapes, dtypes, byte offsets) without
-//! downloading full weight data. `.safetensors`, `.npz`, and `.gguf` files
-//! all resolve cache-first with an [`HttpRangeReader`] fallback — `.npz`
-//! since v0.11.0 ([`inspect_npz`] drives `anamnesis::inspect_npz_from_reader`
-//! over the reader), `.safetensors` since v0.11.1 ([`inspect_safetensors`]
-//! drives `anamnesis::parse_safetensors_header_from_reader` over the same
-//! reader), `.gguf` since v0.11.2 ([`inspect_gguf`] drives
+//! downloading full weight data. All four supported formats resolve
+//! cache-first with an [`HttpRangeReader`] fallback — `.npz` since v0.11.0
+//! ([`inspect_npz`] drives `anamnesis::inspect_npz_from_reader` over the
+//! reader), `.safetensors` since v0.11.1 ([`inspect_safetensors`] drives
+//! `anamnesis::parse_safetensors_header_from_reader` over the same reader),
+//! `.gguf` since v0.11.2 ([`inspect_gguf`] drives
 //! `anamnesis::parse_gguf_front_matter_from_reader` over the same reader —
 //! anamnesis's earlier `inspect_gguf_from_reader`, 0.4.5, is summary-only
-//! and insufficient for `hf-fm`'s per-tensor rendering); `.pth` files are
-//! inspected from the local cache only via the `anamnesis` parser crate
-//! ([`inspect_pth_cached`] — remote inspect is planned for v0.11.4).
+//! and insufficient for `hf-fm`'s per-tensor rendering), and `.pth` since
+//! v0.11.4 ([`inspect_pth`] drives `anamnesis::parse_pth_front_matter_from_reader`
+//! over the same reader — anamnesis's earlier `inspect_pth_from_reader`,
+//! 0.6.x, is likewise summary-only; the full-detail counterpart shipped in
+//! anamnesis 0.7.5).
 //!
 //! The primary types are [`TensorInfo`] (per-tensor metadata),
 //! [`SafetensorsHeaderInfo`] (the format-agnostic parsed-header shape all
@@ -998,27 +1000,15 @@ pub async fn inspect_npz(
 /// Inspects a `.pth` file's metadata from the local `HuggingFace` cache.
 ///
 /// Delegates to [`anamnesis::parse_pth`] for the on-disk parse, then uses
-/// the metadata-only `ParsedPth::tensor_info()` view (new in anamnesis
-/// `0.5.0`) to enumerate `(name, shape, dtype, byte_len)` per tensor — no
-/// further I/O beyond the initial mmap. The earlier `.tensors()` method
-/// would materialise each tensor's data via `Cow<'a, [u8]>`, which is
-/// unnecessary for inspect-only use.
+/// the metadata-only `ParsedPth::tensor_info()` view to enumerate
+/// `(name, shape, dtype, byte_len)` per tensor — no further I/O beyond the
+/// initial mmap. The earlier `.tensors()` method would materialise each
+/// tensor's data via `Cow<'a, [u8]>`, which is unnecessary for inspect-only
+/// use.
 ///
-/// **Synthesised offsets.** As with NPZ, anamnesis exposes per-tensor
-/// `byte_len` but not on-disk byte offsets (PTH tensors live inside a
-/// ZIP archive; offsets are not part of the inspect surface). hf-fm's
-/// `TensorInfo::data_offsets` is synthesised as cumulative `(start, end)`
-/// pairs so `byte_len()` (= `end - start`) renders the actual storage size.
-///
-/// **Metadata.** `metadata: None` — PTH has no metadata block analogous
-/// to safetensors's `__metadata__` or GGUF's KV table. The format-level
-/// `big_endian` flag (rare, near-always `false`) is not surfaced here;
-/// can be added as a synthetic `pth.big_endian` key in a future patch if
-/// real users request it.
-///
-/// **Header size.** Always `0` — PTH has no discrete header analogous
-/// to safetensors's `u64`-length-prefix + JSON. Mirrors the GGUF / NPZ
-/// convention.
+/// See `pth_tensor_info_to_header_info` for the synthesised-offsets,
+/// metadata, and header-size conventions shared with the remote path
+/// ([`inspect_pth`]).
 ///
 /// **Blocking I/O:** anamnesis's PTH parser mmaps the file; this function
 /// is synchronous and should be wrapped in [`tokio::task::spawn_blocking`]
@@ -1053,7 +1043,41 @@ pub fn inspect_pth_cached(
         reason: format!("failed to parse PTH: {e}"),
     })?;
 
-    let pth_tensors = parsed.tensor_info();
+    Ok(pth_tensor_info_to_header_info(
+        parsed.tensor_info(),
+        file_size,
+    ))
+}
+
+/// Maps anamnesis `.pth` per-tensor info into the format-agnostic
+/// [`SafetensorsHeaderInfo`] shape used by hf-fm's render path.
+///
+/// Shared by the cached ([`inspect_pth_cached`], via `anamnesis::parse_pth`
+/// → `ParsedPth::tensor_info()`) and remote ([`inspect_pth`], via
+/// `anamnesis::parse_pth_front_matter_from_reader` → `PthFrontMatter::tensors`)
+/// paths, so the two cannot drift — mirrors [`npz_info_to_header_info`] /
+/// [`gguf_front_matter_to_header_info`].
+///
+/// **Synthesised offsets.** As with NPZ, anamnesis exposes per-tensor
+/// `byte_len` but not on-disk byte offsets (PTH tensors live inside a
+/// ZIP archive; offsets are not part of the inspect surface). hf-fm's
+/// `TensorInfo::data_offsets` is synthesised as cumulative `(start, end)`
+/// pairs so `byte_len()` (= `end - start`) renders the actual storage size.
+/// The remote path synthesises them identically.
+///
+/// **Metadata.** `metadata: None` — PTH has no metadata block analogous
+/// to safetensors's `__metadata__` or GGUF's KV table. The format-level
+/// `big_endian` flag (rare, near-always `false`) is not surfaced here;
+/// can be added as a synthetic `pth.big_endian` key in a future patch if
+/// real users request it.
+///
+/// **Header size.** Always `0` — PTH has no discrete header analogous
+/// to safetensors's `u64`-length-prefix + JSON. Mirrors the GGUF / NPZ
+/// convention.
+fn pth_tensor_info_to_header_info(
+    pth_tensors: Vec<anamnesis::PthTensorInfo>,
+    file_size: Option<u64>,
+) -> SafetensorsHeaderInfo {
     let mut tensors: Vec<TensorInfo> = Vec::with_capacity(pth_tensors.len());
     let mut cursor: u64 = 0;
     for t in pth_tensors {
@@ -1072,14 +1096,89 @@ pub fn inspect_pth_cached(
         });
     }
 
-    Ok(SafetensorsHeaderInfo {
+    SafetensorsHeaderInfo {
         tensors,
         metadata: None,
         header_size: 0,
         file_size,
         // PTH has no quant-method metadata; quant_info stays None.
         quant_info: None,
+    }
+}
+
+/// Inspects a single `.pth` file's metadata (cache-first, remote fallback).
+///
+/// Checks the local `HF` cache first. If the file is cached, delegates to
+/// [`inspect_pth_cached`] with zero network requests. Otherwise, opens an
+/// [`HttpRangeReader`] over the file and runs
+/// `anamnesis::parse_pth_front_matter_from_reader` against it on a blocking
+/// thread (v0.11.4, on anamnesis 0.7.5's reader-generic `PthFrontMatter` —
+/// the full-detail counterpart to the summary-only `inspect_pth_from_reader`
+/// anamnesis shipped earlier). `.pth`'s metadata lives in a `data.pkl`
+/// pickle stream located via the ZIP central directory; the parser reads
+/// only that entry and never touches the tensor-data files (`data/0`,
+/// `data/1`, ...), so a multi-GiB checkpoint inspects in a handful of range
+/// requests. Mirrors [`inspect_npz`] / [`inspect_gguf`]'s shape so the
+/// `hf-fm` CLI renders all four formats' `Source:` line identically.
+///
+/// The third tuple element reports the remote transfer statistics
+/// ([`RangeStats`]: request count + bytes fetched); `None` on the cached
+/// path.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the Range probe or a range request
+/// fails — including gated repos, which surface as `returned status
+/// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
+/// diagnosis).
+/// Returns [`FetchError::SafetensorsHeader`] if the PTH file is malformed
+/// (cached or remote).
+pub async fn inspect_pth(
+    repo_id: &str,
+    filename: &str,
+    token: Option<&str>,
+    revision: Option<&str>,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
+    let rev = revision.unwrap_or("main");
+
+    // Try local cache first (mirrors `inspect_gguf` / `inspect_npz`).
+    if resolve_cached_path(repo_id, rev, filename).is_some() {
+        let info = inspect_pth_cached(repo_id, filename, revision)?;
+        return Ok((info, InspectSource::Cached, None));
+    }
+
+    // Fall back to HTTP Range requests: probe eagerly (typed errors here),
+    // then hand the reader to a blocking thread for the sync parse.
+    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    let file_size = reader.total_size();
+
+    let (parse_result, stats, transport_error) = tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        // `&mut` keeps ownership here so stats and the typed transport
+        // error survive the parse (std's blanket `Read`/`Seek` for `&mut R`).
+        let result = anamnesis::parse_pth_front_matter_from_reader(&mut reader);
+        (result, reader.stats(), reader.take_last_error())
     })
+    .await
+    .map_err(|e| FetchError::Http(format!("failed to join PTH inspect task: {e}")))?;
+
+    match parse_result {
+        Ok(front) => Ok((
+            pth_tensor_info_to_header_info(front.tensors, Some(file_size)),
+            InspectSource::Remote,
+            Some(stats),
+        )),
+        // Prefer the typed transport error over anamnesis's io-flattened
+        // wrapper — an HTTP 401/403 must stay recognisable for the CLI's
+        // gated-repo diagnosis.
+        Err(e) => Err(
+            transport_error.unwrap_or_else(|| FetchError::SafetensorsHeader {
+                // BORROW: explicit .to_owned() for owned String in the error variant
+                filename: filename.to_owned(),
+                reason: format!("failed to parse PTH: {e}"),
+            }),
+        ),
+    }
 }
 
 /// Stringifies a scalar `GgufMetadataValue` from anamnesis.
@@ -1202,8 +1301,9 @@ pub async fn inspect_repo_safetensors(
 /// Single source of truth shared by the cached listing
 /// ([`list_cached_tensor_files`]) and the CLI's remote listing / numeric
 /// index / `--pick` candidate set. Matches the per-file dispatch in
-/// `hf-fm inspect` (`.safetensors` / `.npz` / `.gguf` remote or cached
-/// since v0.11.0 / v0.11.1 / v0.11.2; `.pth` cached-only until v0.11.4).
+/// `hf-fm inspect` — all four formats remote or cached (`.npz` since
+/// v0.11.0, `.safetensors` since v0.11.1, `.gguf` since v0.11.2, `.pth`
+/// since v0.11.4).
 pub const SUPPORTED_TENSOR_EXTENSIONS: [&str; 4] = ["safetensors", "gguf", "npz", "pth"];
 
 /// Returns `true` when `filename`'s extension matches one of

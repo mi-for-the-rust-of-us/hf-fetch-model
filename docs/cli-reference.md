@@ -48,7 +48,7 @@ cargo install hf-fetch-model --features cli
 | `cache delete <REPO_ID\|N>` | Delete a cached model (entire `models--org--name/` directory) |
 | `cache path <REPO_ID\|N>` | Print the snapshot directory path for scripting |
 | `cache verify <REPO_ID\|N>` | Re-verify SHA256 digests of cached files against HuggingFace LFS metadata |
-| `inspect <REPO_ID> [FILENAME]` | Inspect `.safetensors` / `.npz` headers (remote or cached) and `.gguf` / `.pth` files (cached only) — tensor names, shapes, dtypes; auto-detects PEFT adapter config |
+| `inspect <REPO_ID> [FILENAME]` | Inspect `.safetensors` / `.npz` / `.gguf` / `.pth` headers (remote or cached) — tensor names, shapes, dtypes; auto-detects PEFT adapter config |
 | `list-families` | List model families (`model_type`) in local cache |
 | `list-files <REPO_ID>` | List files in a remote repo (filenames, sizes, SHA256) without downloading |
 | `search <QUERY>` | Search the HuggingFace Hub for models (by downloads) |
@@ -192,7 +192,7 @@ hf-fm info mistralai/Ministral-3-3B-Instruct-2512 --revision v1.0
 
 ## Inspect examples
 
-For a narrative walkthrough using a real 4-shard model, see the [Inspect tutorial](tutorials/inspect-before-downloading.md). `inspect` covers `.safetensors` (remote or cached — remote since v0.11.1 via the same `HttpRangeReader` substrate as `.npz`, typically 3–4 total requests: a fixed 2-request access probe plus one or two header fetches, since the header is sequential at the start of the file), NumPy `.npz` (remote or cached since v0.11.0 — a handful of HTTP Range requests fetch the `ZIP` directory and array headers, typically 100–200 KiB even on multi-hundred-MiB archives), and `.gguf` (remote or cached since v0.11.2 — the front-loaded metadata and tensor-info table fetch in a handful of range requests, no weight data downloaded), and for all three formats the `Source:` line reports the exact request/byte cost, plus `.pth` (v0.10.3) for **cached** files only; remote `.pth` inspect is planned for v0.11.4. An unsupported extension is rejected with a clear error.
+For a narrative walkthrough using a real 4-shard model, see the [Inspect tutorial](tutorials/inspect-before-downloading.md). `inspect` covers all four tensor formats remote or cached: `.safetensors` (remote since v0.11.1 via the same `HttpRangeReader` substrate as `.npz`, typically 3–4 total requests: a fixed 2-request access probe plus one or two header fetches, since the header is sequential at the start of the file), NumPy `.npz` (remote since v0.11.0 — a handful of HTTP Range requests fetch the `ZIP` directory and array headers, typically 100–200 KiB even on multi-hundred-MiB archives), `.gguf` (remote since v0.11.2 — the front-loaded metadata and tensor-info table fetch in a handful of range requests, no weight data downloaded), and `.pth` (remote since v0.11.4 — only the `data.pkl` pickle stream inside the `ZIP` archive is fetched via the central directory, e.g. 12 range requests / 113.7 KiB fetched on a 364 MiB `PyTorch` checkpoint). The `Source:` line reports the exact request/byte cost for every format. An unsupported extension is rejected with a clear error.
 
 Gated repos (Meta Llama, Google Gemma, …) need an accepted license plus a token for `inspect`'s Range requests; on a 401/403 the error names the gate and the license URL instead of the raw status (v0.10.5). Note that a gated repo's file *listing* is public — `--list` or `list-files` succeeding does not prove content access. See the [FAQ entry on tokens and gated models](FAQ.md#how-do-i-pass-a-huggingface-token-why-does-a-gated-model-fail).
 
@@ -267,8 +267,12 @@ hf-fm inspect meta-llama/Llama-3.2-1B --cached --check-gpu --json
 # Will it fit *with* a 32K context? Folds the KV cache into the verdict (weights + KV)
 hf-fm inspect meta-llama/Llama-3.2-3B --cached --check-gpu --context 32768
 
-# Inspect a cached .gguf file (v0.10.2+, anamnesis-powered; remote .gguf planned for v0.11)
-hf-fm inspect bartowski/Mistral-7B-Instruct-v0.3-GGUF Mistral-7B-Instruct-v0.3-Q4_K_M.gguf --cached
+# Inspect a .gguf file (remote or cached, anamnesis-powered)
+hf-fm inspect bartowski/Mistral-7B-Instruct-v0.3-GGUF Mistral-7B-Instruct-v0.3-Q4_K_M.gguf
+
+# Inspect a PyTorch .pth checkpoint (remote or cached, since v0.11.4 — reads
+# only the data.pkl pickle stream, never the tensor-data files)
+hf-fm inspect RWKV/RWKV7-Goose-World-PTH RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth --dtypes
 ```
 
 ## Diff examples

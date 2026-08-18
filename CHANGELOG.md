@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Remote `.pth` inspect.** `hf-fm inspect <repo> file.pth` (no `--cached`) now rides the same `HttpRangeReader` substrate as `.safetensors` / `.npz` / `.gguf` — the fourth and last tensor format anamnesis supports is remotely inspectable, closing the matrix opened in v0.11.0. Wired through the new `inspect::inspect_pth` (cache-first, `HttpRangeReader::open` + `spawn_blocking` running `anamnesis::parse_pth_front_matter_from_reader` on a miss), mirroring `inspect_npz` / `inspect_gguf`'s exact shape so `Source:` renders identically across all four formats. Live-verified against `RWKV/RWKV7-Goose-World-PTH`'s uncached `RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth` (364.49 MiB, 399 tensors): `Source: remote (12 range requests, 113.7 KiB fetched)` — every rendering flag (`--tree` / `--dtypes` / `--filter` / `--limit` / `--json`) composes unchanged, and `--list` / the v0.9.7 numeric index / `--pick` already covered `.pth` uniformly since v0.10.5.
+
+### Changed
+
+- **`anamnesis` `0.7.3` → `0.7.5`.** 0.7.5 adds the reader-generic `PthFrontMatter` type + `parse_pth_front_matter_from_reader(_with_limits)` — the full per-tensor list `.pth`'s remote inspect needs, direct counterpart to 0.7.1's `GgufFrontMatter`. Requested via a dogfooding report written from this repo before the release shipped; anamnesis's `inspect_pth_from_reader` stays byte-for-byte unchanged (now a thin wrapper over the same core).
+
 ## [0.11.3] — Edition 2024 & dependency hygiene
 
 No new user-facing features. This release moves the crate onto Rust edition 2024, fixes a dependency defect that was leaking a CLI-only feature into every downstream consumer, and takes the long-deferred `hf-hub` 1.0 / `reqwest` 0.13 port now that `hf-hub` 1.0 has reached stable.

@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-08-06, hf-fm v0.11.2 (remote GGUF inspect) -->
+<!-- Last updated: 2026-08-18, hf-fm v0.11.4 (remote PTH inspect) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -24,7 +24,7 @@ STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
    top whenever any answer text changes — not for typo fixes or new
    entries that don't touch existing answers.
 7. Scope: answer questions about features that actually ship today.
-   Do not pre-document unshipped work (remote PTH inspect, etc.) —
+   Do not pre-document unshipped work (the `peek` subcommand, etc.) —
    those get dedicated docs when they land.
 8. Grouping: if a section grows past ~5 entries, consider splitting it.
    If an entry grows past ~6 sentences, consider promoting it to
@@ -63,6 +63,7 @@ A living list of the questions we and our early users have actually run into. If
   - [My download was interrupted — do I have to start over?](#my-download-was-interrupted--do-i-have-to-start-over)
 - [Errors and unexpected output](#errors-and-unexpected-output)
   - [Which file formats can `inspect` read?](#which-file-formats-can-inspect-read)
+  - [Is it safe to `inspect` a `.pth` file from a repo I don't trust?](#is-it-safe-to-inspect-a-pth-file-from-a-repo-i-dont-trust)
   - [I got a `checksum mismatch` error — what do I do?](#i-got-a-checksum-mismatch-error--what-do-i-do)
   - [Why does `inspect` say `Source: remote (N range requests, X fetched)`?](#why-does-inspect-say-source-remote-n-range-requests-x-fetched)
   - [Why didn't my pipeline catch a download failure?](#why-didnt-my-pipeline-catch-a-download-failure)
@@ -76,7 +77,7 @@ A living list of the questions we and our early users have actually run into. If
 `hf-fetch-model` is a Rust CLI and library for downloading, inspecting, and comparing HuggingFace models. It overlaps with Python's `huggingface-cli` on the basics (fetch a repo, list files, manage the cache) but diverges in three places:
 
 1. it downloads large files with many parallel HTTP connections,
-2. it can read a model's tensor-name/dtype/shape metadata **without downloading the weights**, via narrow HTTP Range requests against the file header — `.safetensors`, `.npz`, and `.gguf` remotely, `.pth` after a download,
+2. it can read a model's tensor-name/dtype/shape metadata **without downloading the weights**, via narrow HTTP Range requests against the file header — `.safetensors`, `.npz`, `.gguf`, and `.pth`, all remotely,
 3. it ships as a standalone binary with no Python dependency. It writes to the same cache directory as Python `huggingface_hub`, so the two tools coexist happily.
 
 ### How does it differ from `safetensors_explorer`?
@@ -85,7 +86,7 @@ A living list of the questions we and our early users have actually run into. If
 
 1. `safetensors_explorer` is an interactive **TUI** that shines at exploring a model locally with the keyboard; `hf-fm inspect` is a **CLI** that produces printable output (pipeable into other tools, pasteable into bug reports),
 2. `safetensors_explorer` reads **local files only**; `hf-fm inspect` additionally reads the tensor metadata of a **remote** model via HTTP Range, before anything is downloaded,
-3. `safetensors_explorer` currently covers **safetensors and GGUF**; hf-fm covers **safetensors, NumPy `.npz`, and GGUF** (remote or cached — remote NPZ since v0.11.0, remote GGUF since v0.11.2) plus **PyTorch `.pth`** for cached files only (since v0.10.2–v0.10.3), with remote `.pth` inspect on the roadmap (v0.11.4).
+3. `safetensors_explorer` currently covers **safetensors and GGUF**; hf-fm covers **safetensors, NumPy `.npz`, GGUF, and PyTorch `.pth`** — all four remote or cached (remote NPZ since v0.11.0, remote safetensors since v0.11.1, remote GGUF since v0.11.2, remote `.pth` since v0.11.4).
 
 Reach for `safetensors_explorer` when you want to sit at a TUI and explore a model locally; reach for `hf-fm inspect` when you want to preview a remote model before downloading, or when you want text output you can pipe and paste.
 
@@ -330,7 +331,11 @@ No. As of v0.9.8, hf-fm preserves the partial `.chunked.part` file plus a small 
 
 ### Which file formats can `inspect` read?
 
-Four tensor formats: `.safetensors`, NumPy `.npz`, and `.gguf` (remote via HTTP Range, or cached; remote NPZ since v0.11.0, remote GGUF since v0.11.2) and PyTorch `.pth` (cached only: pass `--cached` after downloading; remote inspect is on the roadmap for v0.11.4). Two errors point at the edges of that support: an unsupported extension (`.bin`, etc.) gives `hf-fm inspect supports .safetensors, .gguf, .npz, or .pth (got .bin for …)`, and inspecting a `.pth` file *without* `--cached` gives `remote PTH inspect not yet supported (planned for v0.11.4): pass --cached after downloading`. On a repo you have not fetched yet, `hf-fm list-files <repo>` shows what is available first.
+Four tensor formats, all remote via HTTP Range or cached: `.safetensors` (remote since v0.11.1), NumPy `.npz` (remote since v0.11.0), `.gguf` (remote since v0.11.2), and PyTorch `.pth` (remote since v0.11.4 — only the `data.pkl` pickle stream inside the `ZIP` archive is fetched, never the tensor-data files). One error points at the edge of that support: an unsupported extension (`.bin`, etc.) gives `hf-fm inspect supports .safetensors, .gguf, .npz, or .pth (got .bin for …)`. On a repo you have not fetched yet, `hf-fm list-files <repo>` shows what is available first.
+
+### Is it safe to `inspect` a `.pth` file from a repo I don't trust?
+
+Yes — hf-fm never executes arbitrary code from a `.pth` file, cached or remote. PyTorch's `.pth` format is a ZIP archive containing a pickle stream (`data.pkl`); Python's own `pickle.load()` can execute arbitrary code embedded in that stream, which is the well-known reason `torch.load(weights_only=False)` is considered unsafe on untrusted files. hf-fm never touches Python's pickle loader — the `anamnesis` parser crate implements its own minimal pickle interpreter (~36 opcodes) with an explicit `GLOBAL` allowlist: only PyTorch tensor-reconstruction calls (`torch._utils._rebuild_tensor_v2` and friends) and `collections.OrderedDict` are permitted, and any other reference is rejected before it can do anything. The parser is additionally hardened against unguarded-allocation denial of service — a crafted file that declares an astronomical pickle size or tensor count fails fast with a clear error instead of driving a multi-GiB allocation. `inspect` reads metadata only — no tensor data is ever materialised, cached or remote — so the blast radius of a malicious `.pth` is "the parse returns an error," not "arbitrary code runs."
 
 ### I got a `checksum mismatch` error — what do I do?
 

@@ -2014,19 +2014,33 @@ fn inspect_cached_pth_renders() {
 }
 
 #[test]
-fn inspect_remote_pth_errors_names_its_release() {
-    // v0.11.2: `.gguf` left the cached-only gate (remote GGUF rides the same
-    // `HttpRangeReader` adapter as NPZ/safetensors, via anamnesis's new
-    // `parse_gguf_front_matter_from_reader`); `.pth` remains cached-only and
-    // the rejection still names its actual planned release. The dispatch
-    // rejects before any network I/O, so this test runs offline.
+fn inspect_remote_pth_reaches_the_network_layer() {
+    // v0.11.4: `.pth` left the cached-only gate (remote PTH rides the same
+    // `HttpRangeReader` adapter as NPZ/safetensors/GGUF, via anamnesis
+    // 0.7.5's `parse_pth_front_matter_from_reader`) — the old synchronous
+    // "not yet supported" rejection is gone, so a remote `.pth` inspect
+    // against a nonexistent repo now fails with a network-shaped error
+    // instead of the static pre-v0.11.4 message.
     let (_stdout, stderr, success) =
-        run(hf_fm().args(["inspect", "some-org/some-model", "weights.pth"]));
-    assert!(!success, "remote PTH inspect must be rejected");
+        run(hf_fm().args(["inspect", "fake/nonexistent-repo-12345", "weights.pth"]));
+    assert!(!success, "inspect of a nonexistent repo should fail");
     assert!(
-        stderr.contains("remote PTH inspect not yet supported")
-            && stderr.contains("planned for v0.11.4"),
-        "PTH rejection should name v0.11.4, got:\n{stderr}"
+        !stderr.contains("remote PTH inspect not yet supported"),
+        "the pre-v0.11.4 static rejection must be gone, got:\n{stderr}"
+    );
+    // The probe in `HttpRangeReader::open` / `classify_no_range_support`
+    // (src/http_range.rs) always formats a 4xx/5xx as "Range request for
+    // <file> returned status <code + reqwest's Title-Case reason phrase>"
+    // (e.g. "401 Unauthorized", "403 Forbidden", "404 Not Found") or, for a
+    // connection-level failure, "failed to probe <file>: <e>". Checking the
+    // fixed "returned status" substring — rather than a specific status
+    // code or a lowercase "not found" — is deterministic regardless of
+    // whether the CI environment's token state makes HF return 401/403/404
+    // for this fake repo, unlike matching on a particular code's exact,
+    // differently-cased reason phrase.
+    assert!(
+        stderr.contains("returned status") || stderr.contains("failed to probe"),
+        "error should indicate the repo/file is inaccessible over HTTP, got:\n{stderr}"
     );
 }
 

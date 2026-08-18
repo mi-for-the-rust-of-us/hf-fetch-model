@@ -179,9 +179,9 @@ mod tests {
     fn unsupported_format_error_lists_all_four_formats() {
         // v0.10.3 Phase B commit 7: the `UnsupportedInspectFormat` wording
         // names every format the inspect dispatcher handles — .safetensors,
-        // .npz, and .gguf (remote via the `HttpRangeReader` adapter, since
-        // v0.11.0/v0.11.1/v0.11.2 respectively, or cached), .pth (cached
-        // only until v0.11.4).
+        // .npz, .gguf, and .pth, all remote (via the `HttpRangeReader`
+        // adapter, since v0.11.0/v0.11.1/v0.11.2/v0.11.4 respectively) or
+        // cached.
         let e = FetchError::UnsupportedInspectFormat {
             filename: "weights.pt".to_owned(),
             extension: "pt".to_owned(),

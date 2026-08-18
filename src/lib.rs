@@ -120,12 +120,13 @@
 //!
 //! Remote inspect via HTTP Range (without going through the cache) shipped
 //! incrementally: `NPZ` in v0.11.0, safetensors in v0.11.1, `GGUF` in
-//! v0.11.2 ([`inspect::inspect_npz`] / [`inspect::inspect_safetensors`] /
-//! [`inspect::inspect_gguf`] each drive an anamnesis reader-based parser
+//! v0.11.2, `PTH` in v0.11.4 ([`inspect::inspect_npz`] /
+//! [`inspect::inspect_safetensors`] / [`inspect::inspect_gguf`] /
+//! [`inspect::inspect_pth`] each drive an anamnesis reader-based parser
 //! over an [`HttpRangeReader`] — see the [`http_range`] module for the
 //! substrate: tail prefetch, read-ahead, hard transfer budgets, token-free
-//! CDN requests). `PTH` remains cached-only (planned for v0.11.4) and
-//! errors early with a "pass --cached after downloading" recovery hint.
+//! CDN requests). All four formats are now remote-capable, closing the
+//! matrix opened in v0.11.0.
 //!
 //! For discovery — "what tensor files does this cached repo hold?" —
 //! [`inspect::list_cached_tensor_files`] (v0.10.5) enumerates
