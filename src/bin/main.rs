@@ -5453,8 +5453,33 @@ fn trie_to_tree(segment: String, mut node: TrieNode) -> TreeNode {
     }
 
     // Multi-child branch: recurse into each, compute aggregates.
-    let mut children: Vec<TreeNode> = node
-        .children
+    //
+    // `node.children` is a `BTreeMap<String, _>`, so its default iteration
+    // order is lexicographic-by-string ("0", "1", "10", "11", ..., "2", "3",
+    // ...) — correct for named siblings, but wrong once a purely-numeric
+    // sibling set (transformer block/layer/expert indices) reaches double
+    // digits. `try_collapse_range` already re-sorts numerically before
+    // checking collapsibility, so a *successful* collapse always displays
+    // correctly regardless of this order — but when collapse fails entirely
+    // (e.g. a hybrid Mamba/Attention stack whose layer types differ
+    // per-index, not just at the edges), the pre-collapse order survives
+    // untouched into the rendered tree. Sorting here, once, up front, fixes
+    // both paths at the source instead of only the one that happens to
+    // re-derive a numeric order today.
+    let mut entries: Vec<(String, TrieNode)> = node.children.into_iter().collect();
+    if entries
+        .iter()
+        // BORROW: explicit .as_str() instead of Deref coercion
+        .all(|(seg, _)| seg.as_str().parse::<usize>().is_ok())
+    {
+        entries.sort_by_key(|(seg, _)| {
+            // `unwrap_or` never falls through in practice: every entry's
+            // segment already parsed successfully per the `all()` check above.
+            // BORROW: explicit .as_str() instead of Deref coercion
+            seg.as_str().parse::<usize>().unwrap_or(usize::MAX)
+        });
+    }
+    let mut children: Vec<TreeNode> = entries
         .into_iter()
         .map(|(seg, child)| trie_to_tree(seg, child))
         .collect();
@@ -9423,6 +9448,75 @@ mod tests {
         };
         let count = ranged.range_end - ranged.range_start + 1;
         assert_eq!(ranged.total_tensors, 2 * count);
+    }
+
+    #[test]
+    fn tree_children_sort_numerically_even_when_collapse_fails() {
+        // Mirrors the real `ai21labs/Jamba-tiny-dev` shape found live: >= 10
+        // numeric siblings where two non-edge indices are periodically
+        // structurally different (a hybrid Mamba/Attention stack — layers 4
+        // and 8 carry an extra `attn.weight` tensor the other 10 lack).
+        // Middle outliers are never tolerated, so collapse must fail
+        // entirely — and the fallback must still render children in numeric
+        // order, not `BTreeMap`'s lexicographic string order
+        // ("0, 1, 10, 11, 2, 3, ..."), which is exactly the bug this test
+        // guards against.
+        let mut tensors = Vec::new();
+        for i in 0..12 {
+            tensors.push(make_tensor_info(
+                &format!("layers.{i}.mlp.weight"),
+                "F32",
+                vec![4],
+                16,
+            ));
+            tensors.push(make_tensor_info(
+                &format!("layers.{i}.norm.weight"),
+                "F32",
+                vec![4],
+                16,
+            ));
+            if i == 4 || i == 8 {
+                tensors.push(make_tensor_info(
+                    &format!("layers.{i}.attn.weight"),
+                    "F32",
+                    vec![2],
+                    8,
+                ));
+            }
+        }
+
+        let forest = collapse_ranges(build_tree(&tensors));
+        assert_eq!(forest.len(), 1);
+        let TreeNode::Branch(layers) = &forest[0] else {
+            panic!(
+                "expected the layers branch to remain uncollapsed, got {:?}",
+                forest[0]
+            );
+        };
+        assert_eq!(layers.segment, "layers");
+        assert_eq!(
+            layers.children.len(),
+            12,
+            "middle outliers must never collapse — every layer stands alone"
+        );
+
+        let order: Vec<usize> = layers
+            .children
+            .iter()
+            .map(|c| {
+                let TreeNode::Branch(b) = c else {
+                    panic!("expected every child to remain an individual Branch, got {c:?}");
+                };
+                b.segment
+                    .parse::<usize>()
+                    .expect("every child segment is numeric by construction")
+            })
+            .collect();
+        assert_eq!(
+            order,
+            (0..12).collect::<Vec<_>>(),
+            "children must render in numeric order, not lexicographic (0,1,10,11,...)"
+        );
     }
 
     // ---------- looks_like_default_template ----------
