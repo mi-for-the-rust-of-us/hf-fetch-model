@@ -345,6 +345,13 @@ pub struct ModelConfig {
     /// Period of full-attention layers — every `N`-th layer is attention, the
     /// rest recurrent (Qwen3-Next). Alternative hybrid-layout signal.
     pub full_attention_interval: Option<u32>,
+    /// Offset before the first attention layer (Jamba): attention layers occur
+    /// at index `offset`, then every `period`-th layer after. Alternative
+    /// hybrid-layout signal, used together with `attn_layer_period`.
+    pub attn_layer_offset: Option<u32>,
+    /// Period between attention layers when combined with `attn_layer_offset`
+    /// (Jamba: offset 4, period 8 ⇒ attention at layers 4, 12, 20, ...).
+    pub attn_layer_period: Option<u32>,
     /// Mamba2 SSM head count (`mamba_n_heads` / `mamba_num_heads`).
     pub mamba_n_heads: Option<u32>,
     /// Mamba2 SSM per-head dimension (`mamba_d_head` / `mamba_head_dim`).
@@ -1852,6 +1859,10 @@ struct RawModelConfig {
     attn_layer_indices: Option<Vec<u32>>,
     #[serde(default)]
     full_attention_interval: Option<u32>,
+    #[serde(default)]
+    attn_layer_offset: Option<u32>,
+    #[serde(default)]
+    attn_layer_period: Option<u32>,
     #[serde(default, alias = "mamba_num_heads")]
     mamba_n_heads: Option<u32>,
     #[serde(default, alias = "mamba_head_dim")]
@@ -1897,6 +1908,8 @@ fn model_config_from_raw(raw: RawModelConfig) -> ModelConfig {
         hybrid_override_pattern: raw.hybrid_override_pattern,
         attn_layer_indices: raw.attn_layer_indices,
         full_attention_interval: raw.full_attention_interval,
+        attn_layer_offset: raw.attn_layer_offset,
+        attn_layer_period: raw.attn_layer_period,
         mamba_n_heads: raw.mamba_n_heads,
         mamba_d_head: raw.mamba_d_head,
         mamba_d_state: raw.mamba_d_state,

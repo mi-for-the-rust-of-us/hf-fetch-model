@@ -256,13 +256,15 @@ struct HybridLayers {
 /// Classifies a hybrid model's layers into attention vs recurrent counts, or
 /// `None` for a non-hybrid (pure transformer) model.
 ///
-/// Tries four config signals in order: `layer_types` (Granite-4),
+/// Tries five config signals in order: `layer_types` (Granite-4),
 /// `hybrid_override_pattern` (Nemotron-H: `*` = attention, `M` = Mamba,
-/// `-` = FFN-only), `attn_layer_indices` (Bamba), and `full_attention_interval`
-/// (Qwen3-Next: every `N`-th layer is attention). Returns `None` when no
-/// recurrent layers are found — a pure transformer that merely lists
-/// `layer_types` (e.g. Gemma-3's all-attention list) is not hybrid and falls
-/// through to the standard path.
+/// `-` = FFN-only), `attn_layer_indices` (Bamba), `full_attention_interval`
+/// (Qwen3-Next: every `N`-th layer is attention), and `attn_layer_offset` +
+/// `attn_layer_period` (Jamba: attention at layer `offset`, then every
+/// `period`-th layer after — e.g. offset 4, period 8 ⇒ layers 4, 12, 20, ...).
+/// Returns `None` when no recurrent layers are found — a pure transformer that
+/// merely lists `layer_types` (e.g. Gemma-3's all-attention list) is not
+/// hybrid and falls through to the standard path.
 fn classify_hybrid_layers(cfg: &ModelConfig) -> Option<HybridLayers> {
     // 1. layer_types: explicit per-layer kind list.
     if let Some(types) = &cfg.layer_types {
@@ -313,6 +315,25 @@ fn classify_hybrid_layers(cfg: &ModelConfig) -> Option<HybridLayers> {
         && interval >= 2
     {
         let attn = total / interval;
+        if attn > 0 && attn < total {
+            return Some(HybridLayers {
+                attn_layers: attn,
+                recurrent_layers: total - attn,
+            });
+        }
+    }
+
+    // 5. attn_layer_offset + attn_layer_period: attention at `offset`, then
+    //    every `period`-th layer after (Jamba: offset 4, period 8 ⇒ layers 4, 12).
+    if let (Some(offset), Some(period), Some(total)) = (
+        cfg.attn_layer_offset,
+        cfg.attn_layer_period,
+        cfg.num_hidden_layers,
+    ) && period >= 1
+        && offset < total
+    {
+        // Count of {offset, offset + period, offset + 2*period, ...} < total.
+        let attn = total.saturating_sub(offset).saturating_sub(1) / period + 1;
         if attn > 0 && attn < total {
             return Some(HybridLayers {
                 attn_layers: attn,
@@ -1209,6 +1230,28 @@ mod tests {
     }
 
     #[test]
+    fn classify_hybrid_via_attn_layer_offset_period() {
+        // Jamba-tiny-dev's real config: 16 layers, attn at offset 4, period 8
+        // (layers 4 and 12; the other 14 are Mamba). None of the other four
+        // signals fire on Jamba's config — this is the one that must.
+        let mut c = model(16, 8, Some(2), Some(64));
+        c.attn_layer_offset = Some(4);
+        c.attn_layer_period = Some(8);
+        let h = classify_hybrid_layers(&c).expect("hybrid");
+        assert_eq!(h.attn_layers, 2);
+        assert_eq!(h.recurrent_layers, 14);
+    }
+
+    #[test]
+    fn classify_hybrid_offset_out_of_range_is_none() {
+        // An offset at or past the layer count must not be misread as hybrid.
+        let mut c = model(16, 8, Some(2), Some(64));
+        c.attn_layer_offset = Some(16);
+        c.attn_layer_period = Some(8);
+        assert!(classify_hybrid_layers(&c).is_none());
+    }
+
+    #[test]
     fn classify_pure_transformer_layer_types_is_not_hybrid() {
         // Gemma-3-style: layer_types all attention ⇒ not hybrid.
         let mut c = model(4, 8, Some(2), Some(64));
@@ -1301,6 +1344,40 @@ mod tests {
         assert_eq!(attn_layers, 12);
         assert_eq!(recurrent_layers, 36);
         assert_eq!(kv_bytes, 201_326_592);
+        assert_eq!(recurrent_bytes, None);
+    }
+
+    #[test]
+    fn kv_hybrid_jamba_offset_period_matches_real_config() {
+        // ai21labs/Jamba-tiny-dev's actual config.json: 16 layers, 8 attn
+        // heads, 2 kv heads, hidden_size 512 (head_dim 64 derived), attn at
+        // offset 4 / period 8 (layers 4, 12 — none of the other four hybrid
+        // signals fire on this config), bf16. This is the exact shape that
+        // silently fell through to the standard (all-16-layers) formula
+        // before the fifth signal was added — the live command printed
+        // 64.00 MiB (16 layers' worth) instead of the correct 8 MiB (2
+        // layers' worth) at ctx=8192, confirmed by hand and live-verified
+        // against the real repo after the fix.
+        let mut c = model(16, 8, Some(2), Some(64));
+        c.attn_layer_offset = Some(4);
+        c.attn_layer_period = Some(8);
+        let (bytes, path) = kv_cache_bytes(&c, 8192, 2);
+        // KV: per_layer 2*2*64*2 = 512; * 2 attn layers * 8192 ctx = 8_388_608 (8 MiB).
+        assert_eq!(bytes, Some(8 * 1024 * 1024));
+        let KvCachePath::Hybrid {
+            attn_layers,
+            recurrent_layers,
+            kv_bytes,
+            recurrent_bytes,
+        } = path
+        else {
+            panic!("expected Hybrid, got {path:?}");
+        };
+        assert_eq!(attn_layers, 2);
+        assert_eq!(recurrent_layers, 14);
+        assert_eq!(kv_bytes, 8 * 1024 * 1024);
+        // Jamba is Mamba1 (mamba_dt_rank, no mamba_n_heads/mamba_d_head), so
+        // the Mamba2-only recurrent-state term is correctly absent.
         assert_eq!(recurrent_bytes, None);
     }
 
