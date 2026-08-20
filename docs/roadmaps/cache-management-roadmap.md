@@ -585,6 +585,17 @@ The v0.11 minor is dedicated to **remote inspection**. v0.11.0 builds an `HttpRa
 | `--max <SIZE>` size cap | The footgun guard — accidentally peeking `model.safetensors` with no flags is rejected with a clear error pointing at `inspect` for tensor formats and at raising `--max` for genuine large-text cases. Default 10 MiB keeps `peek` honest. |
 | `--cached` not provided | Peek is remote-only by design. The cached equivalent is `cat $(hf-fm cache path <repo>)/<file>` (or `Get-Content` on PowerShell); adding a `--cached` flag would duplicate that pattern with worse ergonomics. |
 
+**Implementation order.** Three build steps, each a hard prerequisite for the next — `--gunzip`'s own spec ("composes with `--head`, rejects `--tail`") can't be written, let alone tested, until both flags already exist to compose against.
+
+| Order | Feature | Effort estimate | Why this order |
+|---|---|---|---|
+| 1 | Core `peek <repo> <file>` streaming + `--max <SIZE>` cap | Small (~15–20 LOC + tests) | Foundational — nothing else has a stream to attach to until the bare fetch-and-stream-to-stdout path exists over the v0.11.0 `HttpRangeReader`. `--max` ships with it, not after: the footgun guard (rejecting an uncapped tensor-file peek) is part of the core safety contract, not a bolt-on. |
+| 2 | `--head N` / `--tail N` (`--bytes` variant) | Medium (~25–35 LOC + tests) | The bulk of the real work: `--head` is a bounded read of the step-1 stream, but `--tail` needs a Range-from-end request (`--bytes`) and a chunked backward newline-scan (`--lines`, the default) — genuinely more than the one-line table entry suggests. Must land before step 3, since gunzip integrates with `--head` and must explicitly reject `--tail`. |
+| 3 | `--gunzip` / `--no-gunzip` | Small–Medium (~15–20 LOC + tests) | Wraps step 1's stream in `flate2::read::GzDecoder`, adds `.gz`-suffix default-on detection, and the clap-time mutual-exclusion check against `--tail` — which only has something to reject once step 2 exists. |
+| — | `--cached` not provided | None (deliberately not built) | A scope decision, not an implementation step — see the row above. Listed here only so the table matches the feature table 1:1. |
+
+Revises the section's original "~50 LOC" whole-feature estimate slightly upward (to ~55–75 LOC) now that `--tail`'s backward-scan is broken out explicitly rather than folded into a single flags line.
+
 Sample sessions:
 
 ```
@@ -611,7 +622,7 @@ $ hf-fm peek bluelightai/clt-qwen3-1.7b-base-20k features/index.json.gz --gunzip
 - **Cached file path.** Already covered by `cat $(hf-fm cache path <repo>)/<file>` (see `--cached` row above).
 - **Range across multiple files.** Single-file scope. Multi-file scans are `hf-fm list-files` + a shell loop.
 
-~50 LOC + tests on top of v0.11.0's `HttpRangeReader`. `flate2` is the only new candidate direct dep; first check whether it's already transitively present via `reqwest` (for `Content-Encoding: gzip`) or `zip` (the `.zip` decompression path used by NPZ / PTH) before adding it explicitly. If transitive, no Cargo.toml change beyond the new subcommand wiring.
+~55–75 LOC + tests on top of v0.11.0's `HttpRangeReader` — see the **Implementation order** table above for the per-step breakdown. `flate2` is the only new candidate direct dep; first check whether it's already transitively present via `reqwest` (for `Content-Encoding: gzip`) or `zip` (the `.zip` decompression path used by NPZ / PTH) before adding it explicitly. If transitive, no Cargo.toml change beyond the new subcommand wiring.
 
 ---
 
