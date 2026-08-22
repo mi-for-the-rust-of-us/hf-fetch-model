@@ -513,7 +513,7 @@ See also: hf-fm list-families, hf-fm discover")]
     ///
     /// No `--cached` flag — the cached equivalent is
     /// `cat $(hf-fm cache path <REPO_ID>)/<FILE>` (`Get-Content` on
-    /// PowerShell), which doesn't need duplicating.
+    /// `PowerShell`), which doesn't need duplicating.
     Peek {
         /// The repository identifier (e.g., `"google/gemma-2-2b-it"`).
         repo_id: String,
