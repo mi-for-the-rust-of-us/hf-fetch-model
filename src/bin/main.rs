@@ -5,7 +5,7 @@
 //! Installed as both `hf-fetch-model` and `hf-fm`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 use hf_fetch_model::cache;
 use hf_fetch_model::discover;
 use hf_fetch_model::inspect;
+use hf_fetch_model::peek;
 use hf_fetch_model::progress::IndicatifProgress;
 use hf_fetch_model::repo;
 use hf_fetch_model::{
@@ -502,6 +503,55 @@ See also: hf-fm list-families, hf-fm discover")]
         #[arg(long, value_name = "N", requires = "check_gpu")]
         context: Option<u32>,
     },
+    /// Peek at a small file's content — remote-only, no anamnesis dispatch.
+    ///
+    /// Reuses the same `HttpRangeReader` substrate as `inspect`, but for
+    /// everything `inspect` doesn't cover: `config.yaml`, `README.md`,
+    /// license texts, `.gz`-compressed sidecars. Never parses tensor
+    /// headers — `hf-fm inspect` rejects `.safetensors`/`.gguf`/`.npz`/
+    /// `.pth` files with a pointer back here.
+    ///
+    /// No `--cached` flag — the cached equivalent is
+    /// `cat $(hf-fm cache path <REPO_ID>)/<FILE>` (`Get-Content` on
+    /// PowerShell), which doesn't need duplicating.
+    Peek {
+        /// The repository identifier (e.g., `"google/gemma-2-2b-it"`).
+        repo_id: String,
+        /// The file to peek at (any path within the repo).
+        filename: String,
+        /// Git revision (branch, tag, or commit SHA).
+        #[arg(long)]
+        revision: Option<String>,
+        /// Authentication token (or set `HF_TOKEN` env var).
+        #[arg(long)]
+        token: Option<String>,
+        /// Print only the first N lines (or bytes, with `--bytes`).
+        #[arg(long, value_name = "N", conflicts_with = "tail")]
+        head: Option<u64>,
+        /// Print only the last N lines (or bytes, with `--bytes`).
+        ///
+        /// Lines mode does a backward chunk scan bounded by `--max`; bytes
+        /// mode is a single Range-from-end request. Not supported with
+        /// `--gunzip` (gzip is sequential) — decompress with `--head`
+        /// instead and pipe through `tail`.
+        #[arg(long, value_name = "N", conflicts_with_all = ["head", "gunzip"])]
+        tail: Option<u64>,
+        /// Count `--head`/`--tail` in bytes instead of lines.
+        #[arg(long)]
+        bytes: bool,
+        /// Transparently gzip-decode the stream. Default on when the
+        /// filename ends in `.gz`.
+        #[arg(long, conflicts_with_all = ["no_gunzip", "tail"])]
+        gunzip: bool,
+        /// Disable gzip auto-detection for a `.gz`-suffixed filename.
+        #[arg(long, conflicts_with = "gunzip")]
+        no_gunzip: bool,
+        /// Safety cap on content read (post-decompression). Rejects an
+        /// oversized `cat`-mode peek (e.g. an accidental tensor file)
+        /// instead of dumping partial binary output to the terminal.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size_arg, default_value = "10MiB")]
+        max: u64,
+    },
     /// List files in a remote `HuggingFace` repository (no download).
     ListFiles {
         /// The repository identifier (e.g., `"google/gemma-2-2b-it"`).
@@ -721,6 +771,7 @@ fn main() -> ExitCode {
             | Commands::Diff { .. }
             | Commands::Du { .. }
             | Commands::Inspect { .. }
+            | Commands::Peek { .. }
             | Commands::ListFiles { .. }
             | Commands::Cache { .. },
         ) => false,
@@ -954,6 +1005,30 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             tree,
             check_gpu,
             context,
+        ),
+        // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
+        Some(Commands::Peek {
+            repo_id,
+            filename,
+            revision,
+            token,
+            head,
+            tail,
+            bytes,
+            gunzip,
+            no_gunzip,
+            max,
+        }) => run_peek(
+            repo_id.as_str(),
+            filename.as_str(),
+            revision.as_deref(),
+            token.as_deref(),
+            head,
+            tail,
+            bytes,
+            gunzip,
+            no_gunzip,
+            max,
         ),
         // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
         Some(Commands::ListFiles {
@@ -4879,6 +4954,68 @@ fn run_inspect(
         )
         .map_err(|e| enrich_gated_content_error(e, repo_id, token)),
     }
+}
+
+/// Runs `hf-fm peek <repo> <file>` — streams a small remote file to stdout.
+///
+/// Resolves the raw clap flags into a [`peek::PeekOptions`]
+/// ([`peek::resolve_mode`] for `--head`/`--tail`/`--bytes`,
+/// [`peek::resolve_gunzip`] for `--gunzip`/`--no-gunzip`/`.gz` detection),
+/// then drives [`peek::peek`] on its own `tokio` runtime (mirrors
+/// `run_inspect_single`'s remote branch). Content goes to stdout via a
+/// single `write_all` — peek buffers the whole (already `--max`-capped)
+/// result in memory, so there's nothing to stream incrementally by the
+/// time this function has it. A `--max`-driven truncation note (never a
+/// `--head`/`--tail` count being naturally shorter than the file) prints
+/// to stderr, keeping stdout exactly the peeked bytes and safe to pipe.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+fn run_peek(
+    repo_id: &str,
+    filename: &str,
+    revision: Option<&str>,
+    token: Option<&str>,
+    head: Option<u64>,
+    tail: Option<u64>,
+    bytes: bool,
+    gunzip: bool,
+    no_gunzip: bool,
+    max: u64,
+) -> Result<(), FetchError> {
+    let mode = peek::resolve_mode(head, tail, bytes)?;
+    let effective_gunzip = peek::resolve_gunzip(gunzip, no_gunzip, filename);
+    // BORROW: explicit .to_owned() for the owned PeekOptions::filename field
+    let options = peek::PeekOptions::new(mode, effective_gunzip, max, filename.to_owned());
+
+    // BORROW: explicit String::from for Option<&str> → Option<String>
+    let owned_token = token
+        .map(String::from)
+        .or_else(|| std::env::var("HF_TOKEN").ok());
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
+        path: PathBuf::from("<runtime>"),
+        source: e,
+    })?;
+    // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+    let outcome = rt
+        .block_on(peek::peek(
+            repo_id,
+            filename,
+            owned_token.as_deref(),
+            revision,
+            options,
+        ))
+        .map_err(|e| enrich_gated_content_error(e, repo_id, owned_token.as_deref()))?;
+
+    std::io::stdout()
+        .write_all(&outcome.content)
+        .map_err(|e| FetchError::Io {
+            path: PathBuf::from("<stdout>"),
+            source: e,
+        })?;
+    if let Some(note) = outcome.truncated {
+        eprintln!("{note}");
+    }
+    Ok(())
 }
 
 /// Returns `true` when an inspect-path error is an HTTP `401` / `403`

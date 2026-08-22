@@ -237,6 +237,7 @@ pub mod download;
 pub mod error;
 pub mod http_range;
 pub mod inspect;
+pub mod peek;
 pub mod plan;
 pub mod progress;
 pub mod repo;

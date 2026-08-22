@@ -67,6 +67,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 | `hf-fm inspect <REPO_ID> [FILE]` | Inspect tensor headers (names, shapes, dtypes) without downloading weights — safetensors/NPZ/GGUF/PTH remote or cached; add `--check-gpu [--context N]` for a GPU-fit verdict (with KV-cache budgeting), or `--pick` to choose the file interactively |
 | `hf-fm list-families` | List model families in local cache |
 | `hf-fm list-files <REPO_ID>` | List remote files (sizes, SHA256) without downloading |
+| `hf-fm peek <REPO_ID> <FILE>` | Print a small file's content (config, README, `.gz` sidecar) without downloading — `--head`/`--tail` bound the read, `--gunzip` decodes, `--max` caps the size (no tensor formats — use `inspect` for those) |
 | `hf-fm search <QUERY>` | Search the HuggingFace Hub for models |
 | `hf-fm status [REPO_ID]` | Per-repo: per-file download status (complete / partial / missing / excluded). With no `REPO_ID`: a table of all cached repos, each marked `ok` or `PARTIAL`. |
 

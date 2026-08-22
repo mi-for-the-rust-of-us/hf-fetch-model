@@ -15,6 +15,7 @@ cargo install hf-fetch-model --features cli
 - [Search examples](#search-examples)
 - [Info examples](#info-examples)
 - [Inspect examples](#inspect-examples)
+- [Peek examples](#peek-examples)
 - [Diff examples](#diff-examples)
 - [Disk usage examples](#disk-usage-examples)
 - [Du flags](#du-flags)
@@ -32,6 +33,7 @@ cargo install hf-fetch-model --features cli
 - [Status flags](#status-flags)
 - [Info flags](#info-flags)
 - [Inspect flags](#inspect-flags)
+- [Peek flags](#peek-flags)
 - [General flags](#general-flags)
 
 ## Subcommands
@@ -51,6 +53,7 @@ cargo install hf-fetch-model --features cli
 | `inspect <REPO_ID> [FILENAME]` | Inspect `.safetensors` / `.npz` / `.gguf` / `.pth` headers (remote or cached) — tensor names, shapes, dtypes; auto-detects PEFT adapter config |
 | `list-families` | List model families (`model_type`) in local cache |
 | `list-files <REPO_ID>` | List files in a remote repo (filenames, sizes, SHA256) without downloading |
+| `peek <REPO_ID> <FILENAME>` | Print a small file's content — `config.yaml`, `README.md`, `.gz` sidecars — without downloading. No tensor formats (use `inspect`); no anamnesis dispatch |
 | `search <QUERY>` | Search the HuggingFace Hub for models (by downloads) |
 | `status [REPO_ID]` | Show download status — per-repo detail, or cache-wide summary |
 
@@ -273,6 +276,39 @@ hf-fm inspect bartowski/Mistral-7B-Instruct-v0.3-GGUF Mistral-7B-Instruct-v0.3-Q
 # Inspect a PyTorch .pth checkpoint (remote or cached, since v0.11.4 — reads
 # only the data.pkl pickle stream, never the tensor-data files)
 hf-fm inspect RWKV/RWKV7-Goose-World-PTH RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth --dtypes
+```
+
+## Peek examples
+
+`peek` reuses the same `HttpRangeReader` substrate as `inspect`, but for everything `inspect` doesn't cover — `config.yaml`, `README.md`, license texts, `.gz`-compressed sidecars — with no anamnesis dispatch. `inspect` continues to reject tensor-format files with a pointer here for anything else. Remote-only by design; the cached equivalent is `cat $(hf-fm cache path <REPO_ID>)/<FILE>` (`Get-Content` on PowerShell).
+
+```sh
+# cat-like: stream the whole file (bounded by --max, default 10 MiB)
+hf-fm peek julien-c/dummy-unknown README.md
+
+# First N lines (default) or bytes (--bytes)
+hf-fm peek julien-c/dummy-unknown config.json --head 3
+hf-fm peek julien-c/dummy-unknown merges.txt --head 10 --bytes
+
+# Last N lines (backward chunk scan) or bytes (single Range-from-end request)
+hf-fm peek julien-c/dummy-unknown README.md --tail 1
+hf-fm peek julien-c/dummy-unknown README.md --tail 3 --bytes
+
+# .gz sidecar: --gunzip is on by default for a .gz-suffixed filename
+hf-fm peek bluelightai/clt-qwen3-1.7b-base-20k features/index.json.gz --head 5 --bytes
+
+# Explicit --gunzip (redundant here, but needed for a .gz-less filename that's
+# actually gzip-compressed); composes with --head, not with --tail (gzip is
+# sequential — decompress with --head instead and pipe through `tail`)
+hf-fm peek bluelightai/clt-qwen3-1.7b-base-20k features/index.json.gz --gunzip --head 2
+
+# Footgun guard: peeking a large file with no bound is rejected before any
+# content byte is fetched, not truncated to raw (possibly binary) output
+hf-fm peek some-org/some-model model.safetensors
+# error: some-org/some-model model.safetensors is 15.40 GiB (exceeds --max 10.00 MiB); use `hf-fm inspect` for tensor files
+
+# Raise the cap for a genuinely large text file
+hf-fm peek some-org/some-model CHANGELOG.md --max 50MiB
 ```
 
 ## Diff examples
@@ -579,6 +615,21 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--tree` | Show a hierarchical tree view grouped by dotted namespace prefix; numeric sibling groups with identical sub-structure collapse to `[0..N]`, tolerating one structurally-different sibling at each edge of the range (v0.11.4 — e.g. a first block that fuses an extra input-embedding `LayerNorm`), rendered standalone next to the collapsed majority. Composes with `--filter` and `--json`. Conflicts with `--dtypes` and `--limit`. | off |
 | `--revision` | Git revision (branch, tag, SHA) | main |
 | `--token` | Auth token (or set `HF_TOKEN` env var). Required for gated repos, together with an accepted license — each gated family (Llama 3.1 vs 3.2, …) is licensed separately. | — |
+
+## Peek flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--bytes` | Count `--head`/`--tail` in bytes instead of lines. Requires `--head` or `--tail`. | off (lines) |
+| `--gunzip` | Transparently gzip-decode the stream via `flate2::read::GzDecoder`. Default on when the filename ends in `.gz` (case-insensitive); pass explicitly to decode a differently-named gzip stream. Composes with `--head`; conflicts with `--tail` (gzip is sequential — decompress with `--head` and pipe through `tail` instead) and with `--no-gunzip`. | auto (`.gz` suffix) |
+| `--head N` | Print only the first `N` lines (or bytes, with `--bytes`). A bound satisfied before `--max` is reached exits cleanly; hitting `--max` first prints what was read and notes the truncation on stderr. Conflicts with `--tail`. | — |
+| `--max SIZE` | Safety cap on content read (post-decompression when gunzip is active). A bare `peek` (no `--head`/`--tail`) whose known size exceeds the cap is **rejected before any content byte is fetched** — pointing at `hf-fm inspect` for a recognized tensor extension, at raising `--max` otherwise — rather than dumping partial, possibly binary, output to the terminal. Same binary-unit parser as `cache gc --max-size` (`KiB`/`MiB`/`GiB`/`TiB`). | `10MiB` |
+| `--no-gunzip` | Disable gzip auto-detection for a `.gz`-suffixed filename (read the raw compressed bytes). Conflicts with `--gunzip`. | off |
+| `--revision` | Git revision (branch, tag, SHA) | main |
+| `--tail N` | Print only the last `N` lines (backward chunk scan, doubling the window each round, bounded by `--max`) or bytes (`--bytes`; a single Range-from-end request). A short file's fewer-than-`N` lines print in full with no truncation note. Conflicts with `--head` and `--gunzip`. | — |
+| `--token` | Auth token (or set `HF_TOKEN` env var). Required for gated repos, same as `inspect`. | — |
+
+No `--cached` flag — the cached equivalent is `cat $(hf-fm cache path <REPO_ID>)/<FILE>` (`Get-Content` on PowerShell), which doesn't need duplicating. No `--json`: `peek` prints raw file content, not structured data.
 
 ## General flags
 

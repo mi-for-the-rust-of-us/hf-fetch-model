@@ -49,6 +49,7 @@ A living list of the questions we and our early users have actually run into. If
 - [Discovery — finding what to inspect or download](#discovery--finding-what-to-inspect-or-download)
   - [A repo has many `.safetensors` files — how do I pick one to inspect?](#a-repo-has-many-safetensors-files--how-do-i-pick-one-to-inspect)
   - [A repo has many `.safetensors` files — can I pick one interactively?](#a-repo-has-many-safetensors-files--can-i-pick-one-interactively)
+  - [How do I read a small config or README file from a repo without downloading it?](#how-do-i-read-a-small-config-or-readme-file-from-a-repo-without-downloading-it)
   - [How do I see a model's tensor names without downloading it?](#how-do-i-see-a-models-tensor-names-without-downloading-it)
   - [How do I compare two HuggingFace models structurally?](#how-do-i-compare-two-huggingface-models-structurally)
   - [How do I know if a model fits on my GPU?](#how-do-i-know-if-a-model-fits-on-my-gpu)
@@ -196,6 +197,23 @@ Under `--pick`, the positional argument is a **case-insensitive substring** filt
 
 `--pick` requires an interactive terminal (stdin and stderr attached). In scripts and CI, use `--list` + the numeric index instead — the two workflows coexist and share the same alphabetically-sorted file universe, so `#3` means the same file in both.
 
+### How do I read a small config or README file from a repo without downloading it?
+
+Use `peek` (v0.11.5) — it reuses `inspect`'s HTTP Range substrate, but for everything `inspect` doesn't cover: `config.yaml`, `README.md`, license texts, `.gz`-compressed sidecars. It never parses tensor headers (`inspect` rejects `.safetensors`/`.gguf`/`.npz`/`.pth` and points you back here for anything else):
+
+```
+hf-fm peek julien-c/dummy-unknown README.md
+hf-fm peek julien-c/dummy-unknown config.json --head 5
+```
+
+`--head N` / `--tail N` bound the read (lines by default, `--bytes` for raw byte counts); `--tail --bytes` is one cheap Range-from-end request, `--tail` lines does a bounded backward scan. A `.gz`-suffixed file is transparently decoded (composes with `--head`, not with `--tail` — gzip is sequential, so decompress with `--head` and pipe through `tail` instead):
+
+```
+hf-fm peek bluelightai/clt-qwen3-1.7b-base-20k features/index.json.gz --head 5 --bytes
+```
+
+`--max <SIZE>` (default `10 MiB`) is the safety cap: an unbounded `peek` of a file over the cap is **rejected before any content byte is fetched**, not truncated to raw output — accidentally peeking a multi-gigabyte weight file gets a clear error pointing at `inspect` instead of binary garbage on your terminal. There's no `--cached` flag; the cached equivalent is `cat $(hf-fm cache path <repo>)/<file>` (`Get-Content` on PowerShell).
+
 ### How do I see a model's tensor names without downloading it?
 
 Run `hf-fm inspect <repo>` with no filename for a per-file (or, on sharded repos, per-shard) rollup — tensor *counts* and parameters. To see the tensor *names*, either name a specific file (or an index from `--list`), or add `--filter "<substring>"`, which lists the matching names nested under each shard/file (e.g. `--filter "layers.0."` for everything in block 0; the match is case-insensitive). Internally, hf-fm fetches only the JSON header via an HTTP Range request — for a typical 2 GiB safetensors file, you transfer maybe 70 KiB of metadata. Add `--tree` for the hierarchical view that groups numeric layers (`layers.[0..27]   (×28)`), or `--dtypes` for a dtype-and-parameter summary. For a complete walkthrough on a real 4-shard model, see [Inspect before you download](tutorials/inspect-before-downloading.md).
@@ -331,7 +349,7 @@ No. As of v0.9.8, hf-fm preserves the partial `.chunked.part` file plus a small 
 
 ### Which file formats can `inspect` read?
 
-Four tensor formats, all remote via HTTP Range or cached: `.safetensors` (remote since v0.11.1), NumPy `.npz` (remote since v0.11.0), `.gguf` (remote since v0.11.2), and PyTorch `.pth` (remote since v0.11.4 — only the `data.pkl` pickle stream inside the `ZIP` archive is fetched, never the tensor-data files). One error points at the edge of that support: an unsupported extension (`.bin`, etc.) gives `hf-fm inspect supports .safetensors, .gguf, .npz, or .pth (got .bin for …)`. On a repo you have not fetched yet, `hf-fm list-files <repo>` shows what is available first.
+Four tensor formats, all remote via HTTP Range or cached: `.safetensors` (remote since v0.11.1), NumPy `.npz` (remote since v0.11.0), `.gguf` (remote since v0.11.2), and PyTorch `.pth` (remote since v0.11.4 — only the `data.pkl` pickle stream inside the `ZIP` archive is fetched, never the tensor-data files). One error points at the edge of that support: an unsupported extension (`.bin`, etc.) gives `hf-fm inspect supports .safetensors, .gguf, .npz, or .pth (got .bin for …)`. On a repo you have not fetched yet, `hf-fm list-files <repo>` shows what is available first. For everything else in a repo — `config.yaml`, `README.md`, `.gz` sidecars — use `peek` (v0.11.5) instead; see [the Discovery entry above](#how-do-i-read-a-small-config-or-readme-file-from-a-repo-without-downloading-it).
 
 ### Is it safe to `inspect` a `.pth` file from a repo I don't trust?
 

@@ -2411,6 +2411,215 @@ fn inspect_cached_repo_filter_lists_names() {
 }
 
 // -----------------------------------------------------------------------
+// peek subcommand
+// -----------------------------------------------------------------------
+//
+// v0.11.5. Network tests reuse `julien-c/dummy-unknown` (the file listing
+// verified live 2026-08-22: `.gitattributes` 391 B, `README.md` 1114 B,
+// `config.json` 496 B, `merges.txt` 36 B, `vocab.json` 239 B,
+// `tf_model.h5` 157312 B, `pytorch_model.bin` 65074 B — none of the last
+// two are a supported tensor extension, so they're used for the
+// oversized-cap footgun test rather than tripping `inspect`'s own gate).
+// The same live pass caught and fixed a real pre-existing bug in
+// `chunked::probe_range_support` (see `resolve_redirect_url` in
+// `src/chunked.rs`): non-LFS files redirect through a relative
+// `/api/resolve-cache/...` `Location`, which `reqwest::Client::get`
+// cannot resolve on its own. `inspect` never exercised this path — every
+// tensor format it targets is Git-LFS, whose redirects are absolute.
+
+#[test]
+fn peek_cat_streams_full_content() {
+    let (stdout, stderr, success) =
+        run(hf_fm().args(["peek", "julien-c/dummy-unknown", "README.md"]));
+    assert!(success, "peek README.md should succeed: {stderr}");
+    assert!(
+        stdout.contains("Dummy model used for unit testing"),
+        "got:\n{stdout}"
+    );
+    assert!(stderr.is_empty(), "no truncation note expected: {stderr}");
+}
+
+#[test]
+fn peek_head_lines_stops_at_n() {
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "config.json",
+        "--head",
+        "3",
+    ]));
+    assert!(success, "peek --head should succeed: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "got:\n{stdout}");
+    assert_eq!(lines.first().map(|l| l.trim()), Some("{"), "got:\n{stdout}");
+}
+
+#[test]
+fn peek_head_bytes_exact_count() {
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "merges.txt",
+        "--head",
+        "10",
+        "--bytes",
+    ]));
+    assert!(success, "peek --head --bytes should succeed: {stderr}");
+    assert_eq!(stdout.len(), 10, "got:\n{stdout:?}");
+}
+
+#[test]
+fn peek_tail_bytes_matches_the_real_end_of_file() {
+    // README.md's last three bytes ("`\n" preceded by one more backtick,
+    // verified live) — a direct Range-from-end request, no line scanning.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "README.md",
+        "--tail",
+        "3",
+        "--bytes",
+    ]));
+    assert!(success, "peek --tail --bytes should succeed: {stderr}");
+    assert_eq!(stdout.len(), 3, "got:\n{stdout:?}");
+    assert!(stdout.ends_with('\n'), "got:\n{stdout:?}");
+}
+
+#[test]
+fn peek_tail_lines_matches_the_real_end_of_file() {
+    let (stdout, stderr, success) =
+        run(hf_fm().args(["peek", "julien-c/dummy-unknown", "README.md", "--tail", "1"]));
+    assert!(success, "peek --tail should succeed: {stderr}");
+    assert_eq!(stdout.trim_end(), "```", "got:\n{stdout:?}");
+}
+
+#[test]
+fn peek_footgun_guard_rejects_oversized_cat_with_max_hint() {
+    // pytorch_model.bin (65074 B) is not a supported tensor extension
+    // (`.safetensors`/`.gguf`/`.npz`/`.pth`), so the error should point at
+    // raising `--max`, not at `hf-fm inspect`.
+    let (_stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "pytorch_model.bin",
+        "--max",
+        "100B",
+    ]));
+    assert!(!success, "oversized bare peek should be rejected");
+    assert!(stderr.contains("exceeds --max"), "got:\n{stderr}");
+    assert!(stderr.contains("pass --max"), "got:\n{stderr}");
+    assert!(!stderr.contains("hf-fm inspect"), "got:\n{stderr}");
+}
+
+#[test]
+fn peek_head_survives_a_tiny_max_with_a_stderr_truncation_note() {
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "README.md",
+        "--head",
+        "500",
+        "--max",
+        "50B",
+    ]));
+    assert!(success, "a --max-bounded --head still exits 0: {stderr}");
+    assert_eq!(
+        stdout.len(),
+        50,
+        "stdout must be exactly the cap: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("truncated") && stderr.contains("--max"),
+        "got:\n{stderr}"
+    );
+}
+
+#[test]
+fn peek_nonexistent_repo_fails_network_shaped() {
+    let (_stdout, stderr, success) =
+        run(hf_fm().args(["peek", "fake/nonexistent-repo-12345", "anything.txt"]));
+    assert!(!success, "peek of a nonexistent repo should fail");
+    assert!(
+        stderr.contains("returned status") || stderr.contains("failed to probe"),
+        "got:\n{stderr}"
+    );
+}
+
+#[test]
+fn peek_tail_bytes_over_max_is_rejected_before_any_content_fetch() {
+    let (_stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "config.json",
+        "--tail",
+        "999999999",
+        "--bytes",
+        "--max",
+        "10B",
+    ]));
+    assert!(
+        !success,
+        "an over-cap --tail --bytes count should be rejected"
+    );
+    assert!(stderr.contains("--max"), "got:\n{stderr}");
+}
+
+// ---------- clap-level conflicts (offline — no network) ----------
+
+#[test]
+fn peek_head_and_tail_conflict() {
+    let (_stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "config.json",
+        "--head",
+        "1",
+        "--tail",
+        "1",
+    ]));
+    assert!(!success, "--head and --tail must conflict");
+    assert!(stderr.contains("cannot be used with"), "got:\n{stderr}");
+}
+
+#[test]
+fn peek_gunzip_and_tail_conflict() {
+    let (_stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "config.json",
+        "--gunzip",
+        "--tail",
+        "1",
+    ]));
+    assert!(!success, "--gunzip and --tail must conflict");
+    assert!(stderr.contains("cannot be used with"), "got:\n{stderr}");
+}
+
+#[test]
+fn peek_gunzip_and_no_gunzip_conflict() {
+    let (_stdout, stderr, success) = run(hf_fm().args([
+        "peek",
+        "julien-c/dummy-unknown",
+        "config.json",
+        "--gunzip",
+        "--no-gunzip",
+    ]));
+    assert!(!success, "--gunzip and --no-gunzip must conflict");
+    assert!(stderr.contains("cannot be used with"), "got:\n{stderr}");
+}
+
+#[test]
+fn peek_bytes_without_head_or_tail_is_rejected() {
+    let (_stdout, stderr, success) =
+        run(hf_fm().args(["peek", "julien-c/dummy-unknown", "config.json", "--bytes"]));
+    assert!(!success, "--bytes with no bound should be rejected");
+    assert!(
+        stderr.contains("--bytes requires --head or --tail"),
+        "got:\n{stderr}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // diff subcommand (cache-only tests — no network)
 // -----------------------------------------------------------------------
 

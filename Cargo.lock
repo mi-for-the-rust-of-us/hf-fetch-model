@@ -939,6 +939,7 @@ dependencies = [
  "anamnesis",
  "clap",
  "dirs",
+ "flate2",
  "fs2",
  "futures-util",
  "globset",

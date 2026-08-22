@@ -510,8 +510,49 @@ impl HttpRangeReader {
         filename: &str,
         token: Option<&str>,
     ) -> Result<Self, FetchError> {
+        Self::open_with_limits(
+            repo_id,
+            revision,
+            filename,
+            token,
+            MAX_RANGE_REQUESTS,
+            MAX_TRANSFER_BUDGET,
+        )
+        .await
+    }
+
+    /// Opens a range reader with explicit safety budgets (see
+    /// [`RangeReader::with_limits`]) instead of the [`MAX_RANGE_REQUESTS`] /
+    /// [`MAX_TRANSFER_BUDGET`] defaults [`HttpRangeReader::open`] uses.
+    ///
+    /// The defaults are tuned for archive-header parsing (`inspect`'s
+    /// `.safetensors` / `.gguf` / `.npz` / `.pth` paths) — a handful of
+    /// requests, well under 1 MiB. A caller with its own, larger,
+    /// user-facing byte budget (`hf-fm peek`'s `--max`) needs its transport
+    /// budget sized to match, or safety limits tuned for header parsing cut
+    /// it off first with a misleading "pathological archive layout" error.
+    ///
+    /// Same preconditions as [`HttpRangeReader::open`] (must be called from
+    /// within a `tokio` runtime; the reader is then driven from a blocking
+    /// context).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`HttpRangeReader::open`].
+    pub async fn open_with_limits(
+        repo_id: &str,
+        revision: Option<&str>,
+        filename: &str,
+        token: Option<&str>,
+        max_requests: u32,
+        max_transfer_bytes: u64,
+    ) -> Result<Self, FetchError> {
         let fetcher = HttpRangeFetcher::open(repo_id, revision, filename, token).await?;
-        Ok(RangeReader::new(fetcher))
+        Ok(RangeReader::with_limits(
+            fetcher,
+            max_requests,
+            max_transfer_bytes,
+        ))
     }
 }
 
