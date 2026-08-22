@@ -201,9 +201,9 @@ pub(crate) async fn probe_range_support(
     // for the file size. The redirected URL itself is deliberately not
     // retained — see `RangeInfo::resolve_url`.
     let content_length = if let Some(ref loc) = redirect_url {
-        // BORROW: explicit .as_str() for request URL
+        let redirect_absolute = resolve_redirect_url(url.as_str(), loc.as_str())?;
         let cdn_response = client
-            .get(loc.as_str())
+            .get(redirect_absolute)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await
@@ -229,6 +229,32 @@ pub(crate) async fn probe_range_support(
         etag,
         resolve_url: url,
     }))
+}
+
+/// Resolves a `Location` header value against the request URL it came from.
+///
+/// Per HTTP redirect semantics (RFC 9110 §10.2.2), `Location` may be a
+/// relative reference; a correct client resolves it against the request's
+/// effective URI. `HuggingFace`'s CDN-backed redirects (Git-LFS files —
+/// every tensor format `inspect` targets) happen to always be absolute, so
+/// this went unexercised until `peek` (v0.11.5) started probing
+/// non-LFS files: small, git-tracked files (`README.md`, `config.json`)
+/// redirect through a **relative** `/api/resolve-cache/...` path, which
+/// `reqwest::Client::get` cannot resolve on its own — passing it directly
+/// fails with a `url::ParseError::RelativeUrlWithoutBase`-shaped "builder
+/// error" before any request is even sent. `Url::join` handles both cases
+/// uniformly: an already-absolute `location` is returned unchanged.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if `base` or the joined result fails to
+/// parse as a URL.
+fn resolve_redirect_url(base: &str, location: &str) -> Result<reqwest::Url, FetchError> {
+    let base_url = reqwest::Url::parse(base)
+        .map_err(|e| FetchError::Http(format!("invalid base URL {base:?}: {e}")))?;
+    base_url
+        .join(location)
+        .map_err(|e| FetchError::Http(format!("invalid redirect location {location:?}: {e}")))
 }
 
 /// Parses the total file size from a `Content-Range: bytes 0-0/{size}` header.
@@ -1054,6 +1080,48 @@ mod tests {
     )]
 
     use super::*;
+
+    // ---------- resolve_redirect_url ----------
+
+    #[test]
+    fn resolve_redirect_url_resolves_a_relative_location() {
+        // The exact shape HF serves for non-LFS (small, git-tracked) files —
+        // `README.md`, `config.json` — as opposed to the absolute CDN URLs
+        // Git-LFS files redirect to. Passing this straight to
+        // `reqwest::Client::get` fails with a "builder error" (relative URL
+        // without a base); live-verified 2026-08-22 while dogfooding `peek`
+        // (v0.11.5) against `julien-c/dummy-unknown`'s `README.md`.
+        let resolved = resolve_redirect_url(
+            "https://huggingface.co/julien-c/dummy-unknown/resolve/main/README.md",
+            "/api/resolve-cache/models/julien-c/dummy-unknown/abc123/README.md?etag=%22x%22",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            "https://huggingface.co/api/resolve-cache/models/julien-c/dummy-unknown/abc123/README.md?etag=%22x%22"
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_url_passes_an_already_absolute_location_through() {
+        // The Git-LFS case: HF's CDN redirects have always been absolute,
+        // which is why this path went unexercised until a non-LFS file was
+        // probed. `Url::join` returns an absolute input unchanged.
+        let resolved = resolve_redirect_url(
+            "https://huggingface.co/org/model/resolve/main/model.safetensors",
+            "https://cdn-lfs.huggingface.co/repos/ab/cd/deadbeef?Expires=123",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            "https://cdn-lfs.huggingface.co/repos/ab/cd/deadbeef?Expires=123"
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_url_rejects_an_invalid_base() {
+        assert!(resolve_redirect_url("not a url", "/x").is_err());
+    }
 
     #[test]
     fn test_repo_folder_name() {

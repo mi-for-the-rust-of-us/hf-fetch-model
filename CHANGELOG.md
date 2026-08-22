@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`inspect`'s `HttpRangeReader` substrate silently failed on any non-Git-LFS file with a "builder error" and no further detail.** `chunked::probe_range_support` took the HTTP `Location` header from HF's redirect response and passed it straight to `reqwest::Client::get`, which requires an absolute URL. Every tensor format `inspect` targets is Git-LFS-tracked, and Git-LFS redirects are always absolute CDN URLs (`cdn-lfs.huggingface.co` or the Xet CDN) — so this path was never exercised until a small, plain git-tracked file (not Git-LFS) was Range-fetched through it for the first time: `README.md`/`config.json`-class files redirect through a **relative** `/api/resolve-cache/...` path per HF's `resolve-cache` mechanism, which `reqwest` cannot resolve on its own (`url::ParseError::RelativeUrlWithoutBase`, surfaced as the unhelpful `HTTP error: builder error`). Fixed with a new `resolve_redirect_url` helper that joins the `Location` header against the original request URL via `Url::join` — per RFC 9110 §10.2.2, `Location` may be relative, and a correct client resolves it against the request's effective URI; `Url::join` also passes an already-absolute location through unchanged, so the existing Git-LFS/CDN path is untouched. Purely latent since the v0.11.0 substrate shipped — no `inspect` invocation across v0.11.0–v0.11.4 could have hit it. Live-verified against `julien-c/dummy-unknown/README.md` (the exact failure and fix); 3 new regression tests (relative location, already-absolute location, invalid base).
+
 ## [0.11.4] — Remote PTH inspect
 
 ### Added
