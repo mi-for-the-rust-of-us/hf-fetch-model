@@ -78,3 +78,5 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [candle-3820-p1.md](candle-3820-p1.md) | candle #3820 — Qwen3.5 GGUF `general.architecture` strings, live-verified | Draft, superseded by candle-3821-p1 |
 | [candle-3820-p2.md](candle-3820-p2.md) | candle #3820 — same, plus verification pointer | Draft, superseded by candle-3821-p1 |
 | [candle-3821-p1.md](candle-3821-p1.md) | candle PR #3821 — `qwen3_5` vs. real `qwen35`/`qwen35moe` string mismatch, live-verified | Posted, confirmed by astorise |
+| [candle-2875-p1.md](candle-2875-p1.md) | candle #2875 — FP8 `tensor-tools quantize` error; correct dtype breakdown, stale conclusion | Posted (2026-04-15), superseded by p2 |
+| [candle-2875-p2.md](candle-2875-p2.md) | candle #2875 — corrected: fixed by #2989/0.10.0; per-tensor FP8, upcast faithful | Posted (2026-08-24) |
