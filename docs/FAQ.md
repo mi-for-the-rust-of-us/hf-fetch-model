@@ -295,6 +295,7 @@ hf-fm inspect meta-llama/Llama-3.2-3B --cached --check-gpu --context 32768
   KV cache @ ctx=32768:  3.50 GiB  (BF16)
   Total:          9.48 GiB  (weights + KV)
   Fit:            ✓ 4.20 GiB headroom (weights + KV; runtime extra)
+  Spilling:       not sampled (platform supports detection)
 ```
 
 The estimate is **parameter-driven, not a per-model lookup table** — it applies the universal formula `2 × layers × kv_heads × head_dim × N × dtype_bytes` to the model's actual architecture integers, so a model hf-fm has never seen computes correctly. It is architecture-aware where the simple formula breaks:
