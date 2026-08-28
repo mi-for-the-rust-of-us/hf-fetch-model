@@ -2016,54 +2016,199 @@ pub fn fetch_model_config_cached(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::panic)]
+    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
-    use std::collections::HashMap;
+    use std::io::Write as _;
 
     use super::is_supported_tensor_file;
 
+    /// Builds a minimal `.npy` v1.0 header + data blob (`NumPy`'s on-disk
+    /// array format), matching the exact byte layout `anamnesis`'s own
+    /// reader expects — the same layout `anamnesis`'s own test suite builds
+    /// via an identical private helper.
+    fn make_npy_v1(header_str: &str, data: &[u8]) -> Vec<u8> {
+        const NPY_MAGIC: &[u8; 6] = b"\x93NUMPY";
+        let header_bytes = header_str.as_bytes();
+        // Pad header to 64-byte alignment (magic=6 + version=2 + len=2 = 10).
+        let total_before_pad = 10 + header_bytes.len();
+        let padding = (64 - (total_before_pad % 64)) % 64;
+        let padded_len = header_bytes.len() + padding;
+
+        let mut npy = Vec::new();
+        npy.extend_from_slice(NPY_MAGIC);
+        npy.push(1); // major
+        npy.push(0); // minor
+        // CAST: usize → u16, header length is a few dozen bytes in these tests.
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        npy.extend_from_slice(&(padded_len as u16).to_le_bytes());
+        npy.extend_from_slice(header_bytes);
+        if padding > 0 {
+            npy.extend(std::iter::repeat_n(b' ', padding - 1));
+            npy.push(b'\n');
+        }
+        npy.extend_from_slice(data);
+        npy
+    }
+
+    /// Builds a minimal in-memory `.npz` archive (a `ZIP` of `.npy` entries)
+    /// from `(array_name, npy_header, data)` triples. `anamnesis::NpzInspectInfo`
+    /// / `NpzTensorInfo` became `#[non_exhaustive]` in `anamnesis` 0.7.6, so
+    /// tests that need one build real bytes and parse them through
+    /// `anamnesis::inspect_npz_from_reader` — the same entry point
+    /// [`super::inspect_npz`] uses in production — instead of hand-constructing
+    /// the parsed struct via a literal.
+    fn make_in_memory_npz(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, header, data) in entries {
+                zip.start_file(format!("{name}.npy"), options)
+                    .expect("zip start_file");
+                zip.write_all(&make_npy_v1(header, data))
+                    .expect("zip write_all");
+            }
+            zip.finish().expect("zip finish");
+        }
+        buf
+    }
+
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn npz_info_to_header_info_synthesises_cumulative_offsets() {
         // The mapping shared by `inspect_npz_cached` (v0.10.3) and the
         // remote `inspect_npz` (v0.11.0): synthesised cumulative offsets
         // from per-tensor `byte_len`, no metadata block, zero header size.
-        let parsed = anamnesis::NpzInspectInfo {
-            tensors: vec![
-                anamnesis::NpzTensorInfo {
-                    name: "w_enc".to_owned(),
-                    shape: vec![2, 3],
-                    dtype: anamnesis::NpzDtype::F32,
-                    byte_len: 24,
-                },
-                anamnesis::NpzTensorInfo {
-                    name: "b_dec".to_owned(),
-                    shape: vec![4],
-                    dtype: anamnesis::NpzDtype::F32,
-                    byte_len: 16,
-                },
-            ],
-            total_bytes: 40,
-            dtypes: vec![anamnesis::NpzDtype::F32],
-        };
+        let bytes = make_in_memory_npz(&[
+            (
+                "w_enc",
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }",
+                &[0u8; 24],
+            ),
+            (
+                "b_dec",
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (4,), }",
+                &[0u8; 16],
+            ),
+        ]);
+        let parsed = anamnesis::inspect_npz_from_reader(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(parsed.tensors.len(), 2, "sanity: both entries parsed");
 
         let info = super::npz_info_to_header_info(parsed, Some(1234));
 
         assert_eq!(info.tensors.len(), 2);
-        let first = info.tensors.first().unwrap();
-        let second = info.tensors.get(1).unwrap();
-        assert_eq!(first.data_offsets, (0, 24));
-        assert_eq!(second.data_offsets, (24, 40));
-        assert_eq!(first.dtype, "F32");
-        assert_eq!(second.shape, vec![4]);
+        // NPZ/ZIP entry order is not a contract this test should hardcode —
+        // verify the cumulative-offset invariant generically instead of
+        // assuming a specific position for each tensor.
+        let mut cursor = 0u64;
+        for t in &info.tensors {
+            let (start, end) = t.data_offsets;
+            assert_eq!(
+                start, cursor,
+                "tensor {} should start where the previous one ended",
+                t.name
+            );
+            assert!(end >= start);
+            cursor = end;
+        }
+        assert_eq!(
+            cursor, 40,
+            "cumulative end should equal the total bytes across both tensors"
+        );
         assert_eq!(info.header_size, 0);
         assert_eq!(info.file_size, Some(1234));
         assert!(info.metadata.is_none());
         assert!(info.quant_info.is_none());
+
+        let w_enc = info
+            .tensors
+            .iter()
+            .find(|t| t.name == "w_enc")
+            .expect("w_enc present");
+        assert_eq!(w_enc.dtype, "F32");
+        assert_eq!(w_enc.shape, vec![2, 3]);
+        let b_dec = info
+            .tensors
+            .iter()
+            .find(|t| t.name == "b_dec")
+            .expect("b_dec present");
+        assert_eq!(b_dec.shape, vec![4]);
+    }
+
+    /// Tiny big-endian-field binary builder for a minimal `GGUF` file,
+    /// mirroring `anamnesis`'s own private `GgufBuilder` test helper (`GGUF`
+    /// itself is little-endian; every multi-byte field below is `to_le_bytes`).
+    struct GgufBuilder {
+        buf: Vec<u8>,
+    }
+
+    impl GgufBuilder {
+        fn new() -> Self {
+            Self { buf: Vec::new() }
+        }
+
+        fn push_bytes(&mut self, bytes: &[u8]) {
+            self.buf.extend_from_slice(bytes);
+        }
+
+        fn push_u32(&mut self, v: u32) {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        fn push_u64(&mut self, v: u64) {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        fn push_string(&mut self, s: &str) {
+            // CAST: usize → u64, test fixture strings are a handful of bytes.
+            #[allow(clippy::as_conversions)]
+            self.push_u64(s.len() as u64);
+            self.buf.extend_from_slice(s.as_bytes());
+        }
+
+        fn push_kv_string(&mut self, key: &str, value: &str) {
+            self.push_string(key);
+            self.push_u32(8); // GGUF metadata type: STRING
+            self.push_string(value);
+        }
+
+        fn push_kv_string_array(&mut self, key: &str, values: &[&str]) {
+            self.push_string(key);
+            self.push_u32(9); // GGUF metadata type: ARRAY
+            self.push_u32(8); // inner type: STRING
+            // CAST: usize → u64, test fixture arrays are a handful of entries.
+            #[allow(clippy::as_conversions)]
+            self.push_u64(values.len() as u64);
+            for v in values {
+                self.push_string(v);
+            }
+        }
+
+        fn push_tensor_info(&mut self, name: &str, shape: &[u64], dtype_disc: u32, offset: u64) {
+            self.push_string(name);
+            // CAST: usize → u32, test fixture shapes have at most a few dims.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+            self.push_u32(shape.len() as u32);
+            for &d in shape {
+                self.push_u64(d);
+            }
+            self.push_u32(dtype_disc);
+            self.push_u64(offset);
+        }
+
+        fn pad_to_alignment(&mut self, alignment: usize) {
+            while !self.buf.len().is_multiple_of(alignment) {
+                self.buf.push(0);
+            }
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.buf
+        }
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn gguf_front_matter_to_header_info_maps_tensors_and_metadata() {
         // The mapping shared by `inspect_gguf_cached` (v0.10.2, via
         // `anamnesis::parse_gguf` → `ParsedGguf`) and the remote
@@ -2072,45 +2217,72 @@ mod tests {
         // absolute per-tensor offsets carry over directly, scalar metadata
         // is stringified, array metadata is skipped, and the format
         // version/alignment land under synthetic `gguf.*` keys.
-        let tensor_infos = vec![
-            anamnesis::GgufTensorInfo {
-                name: "blk.0.attn_q.weight".to_owned(),
-                shape: vec![4, 4],
-                dtype: anamnesis::GgufType::F32,
-                data_offset: 0,
-                byte_len: Some(64),
-            },
-            anamnesis::GgufTensorInfo {
-                name: "blk.0.attn_k.weight".to_owned(),
-                shape: vec![2],
-                dtype: anamnesis::GgufType::F32,
-                data_offset: 64,
-                byte_len: None,
-            },
-        ];
-        let mut metadata: HashMap<String, anamnesis::GgufMetadataValue> = HashMap::new();
-        metadata.insert(
-            "general.architecture".to_owned(),
-            anamnesis::GgufMetadataValue::String("llama".to_owned()),
-        );
-        metadata.insert(
-            "tokenizer.ggml.tokens".to_owned(),
-            anamnesis::GgufMetadataValue::Array(Box::new(anamnesis::GgufMetadataArray::String(
-                vec!["<bos>".to_owned()],
-            ))),
-        );
+        //
+        // `anamnesis::GgufTensorInfo`/`GgufMetadataValue` became
+        // `#[non_exhaustive]` in `anamnesis` 0.7.6, so this builds a real
+        // minimal `GGUF` file and parses it through
+        // `anamnesis::parse_gguf_front_matter_from_reader` — the same entry
+        // point [`super::inspect_gguf`] uses in production. Both tensors use
+        // `F32` (dtype discriminant 0): every `GgufType` variant `anamnesis`
+        // currently knows about has a tabulated `type_size`, so `byte_len:
+        // None` (tested against a hand-built value in earlier versions of
+        // this test) is no longer reachable through a successful real parse.
+        let mut b = GgufBuilder::new();
+        b.push_bytes(b"GGUF");
+        b.push_u32(3); // version
+        b.push_u64(2); // tensor_count
+        b.push_u64(2); // kv_count
+        b.push_kv_string("general.architecture", "llama");
+        b.push_kv_string_array("tokenizer.ggml.tokens", &["<bos>"]);
+        // tensor 0 — F32 [4, 4] → 64 bytes at relative offset 0
+        b.push_tensor_info("blk.0.attn_q.weight", &[4, 4], 0, 0);
+        // tensor 1 — F32 [2] → 8 bytes at relative offset 64
+        b.push_tensor_info("blk.0.attn_k.weight", &[2], 0, 64);
+        b.pad_to_alignment(32);
+        b.push_bytes(&[0u8; 64]); // blk.0.attn_q.weight data
+        b.push_bytes(&[0u8; 8]); // blk.0.attn_k.weight data
+        let bytes = b.finish();
 
-        let info =
-            super::gguf_front_matter_to_header_info(&tensor_infos, &metadata, 3, 32, Some(9999));
+        let front =
+            anamnesis::parse_gguf_front_matter_from_reader(&mut std::io::Cursor::new(bytes))
+                .unwrap();
+        assert_eq!(front.tensor_infos.len(), 2, "sanity: both tensors parsed");
+        assert_eq!(front.version, 3);
+        assert_eq!(front.alignment, 32);
+
+        let info = super::gguf_front_matter_to_header_info(
+            &front.tensor_infos,
+            &front.metadata,
+            front.version,
+            front.alignment,
+            Some(9999),
+        );
 
         assert_eq!(info.tensors.len(), 2);
-        let first = info.tensors.first().unwrap();
-        let second = info.tensors.get(1).unwrap();
-        assert_eq!(first.name, "blk.0.attn_q.weight");
-        assert_eq!(first.data_offsets, (0, 64));
-        assert_eq!(first.dtype, "F32");
-        // `byte_len: None` maps to `end == start` — no byte length known.
-        assert_eq!(second.data_offsets, (64, 64));
+        let q_proj = info
+            .tensors
+            .iter()
+            .find(|t| t.name == "blk.0.attn_q.weight")
+            .expect("blk.0.attn_q.weight present");
+        // `GgufTensorInfo::data_offset` is absolute within the file (the
+        // tensor-data section start plus each tensor's relative offset), not
+        // relative to the header — so anchor on the parser's own start
+        // rather than hardcoding a byte count derived from this fixture's
+        // exact header layout.
+        let q_start = q_proj.data_offsets.0;
+        assert_eq!(
+            q_start % u64::from(front.alignment),
+            0,
+            "tensor data should start at an aligned offset"
+        );
+        assert_eq!(q_proj.data_offsets, (q_start, q_start + 64));
+        assert_eq!(q_proj.dtype, "F32");
+        let k_proj = info
+            .tensors
+            .iter()
+            .find(|t| t.name == "blk.0.attn_k.weight")
+            .expect("blk.0.attn_k.weight present");
+        assert_eq!(k_proj.data_offsets, (q_start + 64, q_start + 72));
 
         let meta = info.metadata.unwrap();
         assert_eq!(

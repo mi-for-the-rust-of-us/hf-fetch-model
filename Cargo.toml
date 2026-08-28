@@ -29,7 +29,7 @@ cli = ["dep:clap", "dep:tracing-subscriber", "indicatif"]
 # lines fire on cached BnB / GPTQ / AWQ safetensors (without them the
 # tensors classify as `Passthrough` and `detect_scheme` returns
 # `Unquantized` — silently no-op for the families the feature targets).
-anamnesis = { version = "0.7.5", features = ["gguf", "npz", "pth", "bnb", "gptq", "awq"] }
+anamnesis = { version = "0.7.7", features = ["gguf", "npz", "pth", "bnb", "gptq", "awq"] }
 clap = { version = "4", features = ["derive"], optional = true }
 dirs = "6"
 fs2 = "0.4"
@@ -109,6 +109,15 @@ serde_json = "1"
 # to a direct dev-dependency so `tests/cli.rs` can isolate tests that would
 # otherwise race on the shared global HF cache via a per-test `HF_HOME`.
 tempfile = "3"
+# NOT transitively present — `anamnesis` uses `zip` only as its own dev-
+# dependency to build synthetic `.npz` (ZIP) fixtures in its test suite, never
+# exposing it downstream. Added here for the same reason, on `src/inspect.rs`
+# unit tests that build a minimal in-memory `.npz` archive to exercise
+# `anamnesis::inspect_npz_from_reader` (its `NpzInspectInfo`/`NpzTensorInfo`
+# became `#[non_exhaustive]` in anamnesis 0.7.6, so hand-constructing them via
+# struct literals — the previous approach — no longer compiles). `STORED`
+# (uncompressed) entries only, so no compression-backend feature is needed.
+zip = { version = "2", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
