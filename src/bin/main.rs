@@ -364,14 +364,16 @@ See also: hf-fm list-families, hf-fm discover")]
         /// `model.layers.3.mlp.gate_proj.weight` becomes
         /// `model.layers.{N}.mlp.gate_proj.weight`) and groups only-A / only-B
         /// / differ independently by the resulting pattern — the tool-side
-        /// counterpart to the `jq` recipe in docs/FAQ.md. Composes with
+        /// counterpart to the `jq` recipe in `docs/FAQ.md`. Composes with
         /// --filter (grouping runs over filtered tensors only). Conflicts
         /// with --summary and --dtypes.
         #[arg(long, conflicts_with_all = ["summary", "dtypes"])]
         collapse: bool,
         /// Show only the first N tensors per section (only-A / only-B / differ), applied after `--filter`.
         ///
-        /// Under `--collapse`, caps grouped rows per section instead of raw tensors.
+        /// Text mode only: under `--collapse`, caps grouped rows per section
+        /// instead of raw tensors. `--json`'s `collapsed` field is always
+        /// complete regardless of `--limit` (like `--dtypes`'s `dtype_histograms`).
         #[arg(long)]
         limit: Option<usize>,
         /// Output the full diff as JSON.
@@ -4999,7 +5001,7 @@ fn print_diff_dtypes(
 
 /// Replaces every maximal run of ASCII digits in `name` with `"{N}"`,
 /// mirroring the `gsub("[0-9]+"; "{N}")` step in the `jq` recipe shipped in
-/// docs/FAQ.md. Pure, allocation-only — no `regex` dependency needed for a
+/// `docs/FAQ.md`. Pure, allocation-only — no `regex` dependency needed for a
 /// single fixed substitution.
 fn collapse_numeric_segments(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
@@ -5538,12 +5540,35 @@ fn diff_config_column_widths(rows: &[&ConfigFieldDiff]) -> DiffConfigColumnWidth
     }
 }
 
+/// Hint line printed under [`run_diff_config`] when a repo has no
+/// `config.json`. Under `--cached` the absence is ambiguous — the repo may
+/// genuinely have no config, or its `config.json` may simply not have been
+/// downloaded yet (the local-only lookup can't tell the two apart) — so the
+/// wording covers both rather than asserting the file doesn't exist.
+fn missing_config_hint(cached: bool) -> &'static str {
+    if cached {
+        "Hint: not every repo ships a config.json (e.g. non-model repos) — or it just isn't cached locally yet; retry without --cached."
+    } else {
+        "Hint: not every repo ships a config.json (e.g. non-model repos)."
+    }
+}
+
 /// Compares two model repos' `config.json` architecture fields.
+///
+/// Fetches both sides through [`inspect::fetch_model_config`] /
+/// [`inspect::fetch_model_config_cached`] directly (not the best-effort
+/// [`fetch_model_config_for_inspect`] wrapper used by `--check-gpu
+/// --context`'s KV budgeting) so a real fetch failure — a network error, a
+/// gated repo, a malformed cached file — surfaces as an error instead of
+/// being misreported as "no config.json found". Only a genuine `Ok(None)`
+/// (confirmed absent, or `--cached` cache miss) renders the friendly hint.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the network request fails (non-`--cached`).
-/// Returns [`FetchError::Io`] if a cached `config.json` cannot be read.
+/// Returns [`FetchError::Io`] if a cached `config.json` cannot be read, or the
+/// async runtime cannot be created (non-`--cached`).
+/// Returns [`FetchError::SafetensorsHeader`] if a fetched `config.json` is malformed.
 #[allow(clippy::too_many_arguments)] // diff-family orchestration function; mirrors run_diff's shape
 fn run_diff_config(
     repo_a: &str,
@@ -5555,14 +5580,46 @@ fn run_diff_config(
     all: bool,
     json: bool,
 ) -> Result<(), FetchError> {
-    let Some(config_a) = fetch_model_config_for_inspect(repo_a, revision_a, token, cached) else {
-        println!("No config.json found in {repo_a}.");
-        println!("Hint: not every repo ships a config.json (e.g. non-model repos).");
+    let (config_a, config_b) = if cached {
+        (
+            inspect::fetch_model_config_cached(repo_a, revision_a)?,
+            inspect::fetch_model_config_cached(repo_b, revision_b)?,
+        )
+    } else {
+        // BORROW: explicit String::from for Option<&str> → Option<String>
+        let resolved_token = token
+            .map(String::from)
+            .or_else(|| std::env::var("HF_TOKEN").ok());
+        let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
+            path: PathBuf::from("<runtime>"),
+            source: e,
+        })?;
+        // Both sides are independent fetches; run them concurrently on one
+        // runtime instead of building a runtime per side and serializing
+        // the network round-trips.
+        // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+        let (result_a, result_b) = rt.block_on(async {
+            tokio::join!(
+                inspect::fetch_model_config(repo_a, resolved_token.as_deref(), revision_a),
+                inspect::fetch_model_config(repo_b, resolved_token.as_deref(), revision_b),
+            )
+        });
+        (
+            result_a.map_err(|e| enrich_gated_content_error(e, repo_a, token))?,
+            result_b.map_err(|e| enrich_gated_content_error(e, repo_b, token))?,
+        )
+    };
+
+    let print_missing = |repo: &str| {
+        println!("No config.json found in {repo}.");
+        println!("{}", missing_config_hint(cached));
+    };
+    let Some(config_a) = config_a else {
+        print_missing(repo_a);
         return Ok(());
     };
-    let Some(config_b) = fetch_model_config_for_inspect(repo_b, revision_b, token, cached) else {
-        println!("No config.json found in {repo_b}.");
-        println!("Hint: not every repo ships a config.json (e.g. non-model repos).");
+    let Some(config_b) = config_b else {
+        print_missing(repo_b);
         return Ok(());
     };
 
@@ -5571,7 +5628,9 @@ fn run_diff_config(
 
     if json {
         let result = DiffConfigResult {
+            // BORROW: explicit .to_owned() for &str → owned String
             repo_a: repo_a.to_owned(),
+            // BORROW: explicit .to_owned() for &str → owned String
             repo_b: repo_b.to_owned(),
             fields,
             differing_count,

@@ -3190,6 +3190,57 @@ fn diff_config_missing_config_json_reports_hint() {
 }
 
 #[test]
+fn diff_config_nonexistent_repo_fails_instead_of_reporting_missing_config() {
+    // REAL validation: a real fetch failure (here, a nonexistent repo) must
+    // propagate as an error, not get misreported as the generic "no
+    // config.json found -- not every repo ships one" hint, which would be
+    // actively misleading (the repo doesn't exist at all, it isn't just
+    // missing a config.json).
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff-config",
+        "totally-nonexistent-org/totally-nonexistent-repo-xyz",
+        "openai/gpt-oss-20b",
+    ]));
+    assert!(
+        !success,
+        "diff-config on a nonexistent repo must fail, got stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("No config.json found"),
+        "a fetch failure must not be reported as a missing config.json, got:\n{stdout}"
+    );
+    assert!(!stderr.is_empty(), "a failure must report an error message");
+}
+
+#[test]
+fn diff_config_cached_miss_mentions_not_cached_in_hint() {
+    // REAL validation: under --cached, the hint must acknowledge the
+    // ambiguity (genuinely no config vs. simply not downloaded yet) rather
+    // than flatly asserting the repo has no config.json. Uses an isolated,
+    // guaranteed-empty HF_HOME rather than relying on the ambient machine's
+    // cache state (which repo's config.json happens to be cached varies by
+    // machine and by what earlier tests downloaded).
+    let (_dir, stdout, stderr, success) = run_isolated(hf_fm().args([
+        "diff-config",
+        "RedHatAI/Llama-3.2-1B-Instruct-FP8",
+        "casperhansen/llama-3.2-1b-instruct-awq",
+        "--cached",
+    ]));
+    assert!(
+        success,
+        "diff-config --cached miss should still exit 0: {stderr}"
+    );
+    assert!(
+        stdout.contains("No config.json found"),
+        "should report the missing config.json, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--cached"),
+        "the --cached hint should mention retrying without --cached, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn info_json_output() {
     let (stdout, stderr, success) = run(hf_fm().args(["info", "julien-c/dummy-unknown", "--json"]));
     assert!(success, "info --json should succeed: {stderr}");
