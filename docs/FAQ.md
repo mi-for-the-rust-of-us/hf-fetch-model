@@ -24,8 +24,8 @@ STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
    top whenever any answer text changes — not for typo fixes or new
    entries that don't touch existing answers.
 7. Scope: answer questions about features that actually ship today.
-   Do not pre-document unshipped work (the `peek` subcommand, etc.) —
-   those get dedicated docs when they land.
+   Do not pre-document unshipped work — those get dedicated docs when
+   they land.
 8. Grouping: if a section grows past ~5 entries, consider splitting it.
    If an entry grows past ~6 sentences, consider promoting it to
    docs/tutorials/ or docs/case-studies/ and linking from here.
