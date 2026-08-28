@@ -20,7 +20,19 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      # No Swatinem/rust-cache here, deliberately. This job runs `cargo
+      # publish` (not --dry-run), which packages and verify-builds the crate
+      # under `target/package/<name>-<version>/` -- a nested tree with its
+      # own `tests/` directory mirroring the real one. rust-cache's post-run
+      # cleanup (its trybuild-cache support since v2.7.0) treats that as
+      # another crate root and unconditionally opendir()s
+      # `tests/trybuild`/`tests/target` under it with no existence check;
+      # this crate doesn't use trybuild, so those never exist, and every
+      # publish run logs two ENOENT `##[error]` annotations (harmless --
+      # caught internally, doesn't fail the step -- but noisy). `ci.yml`
+      # never runs `cargo publish`/`cargo package`, so it never creates that
+      # nested tree and keeps rust-cache; this job runs once per release, not
+      # a hot path, so the caching isn't worth the noise here.
 
       # Full CI checks before publishing
       - name: Check formatting
