@@ -5680,24 +5680,37 @@ fn collapse_node(node: TreeNode) -> TreeNode {
     }
 }
 
+/// Maximum number of structurally-different siblings tolerated at each edge of an
+/// otherwise-uniform numeric range before [`try_collapse_range`] gives up on
+/// collapsing it. `3` matches `DeepSeek-V3`'s `first_k_dense_replace=3` — the
+/// motivating case for raising this past the `v0.11.4` value of `1`. Live
+/// verification against a real `DeepSeek-V3`-class checkpoint remains
+/// impractical (670B+ params, 160+ shards); this value is documented as
+/// unverified-but-bounded, the same posture the `v0.11.4` `RWKV` tolerance had
+/// before its own live check landed. See
+/// `docs/dogfooding-feedbacks/numeric-sibling-collapse-edge-outlier-validation.md`.
+const MAX_EDGE_OUTLIERS: usize = 3;
+
 /// Checks whether a branch's children form a collapsible contiguous numeric range
-/// `0..N`, tolerating up to one structurally-different sibling at the front and/or
-/// the back before giving up. Real tensor-naming conventions commonly fuse extra
-/// state into the first or last block (e.g. `RWKV` folding the input-embedding
-/// `LayerNorm` into `blocks.0`, giving it two tensors its 1..N siblings lack) —
-/// without this tolerance, a single edge outlier defeats collapsing entirely even
-/// when every other sibling is identical.
+/// `0..N`, tolerating up to [`MAX_EDGE_OUTLIERS`] structurally-different siblings
+/// at the front and/or the back before giving up. Real tensor-naming conventions
+/// commonly fuse extra state into the first or last few blocks (e.g. `RWKV`
+/// folding the input-embedding `LayerNorm` into `blocks.0`, or `DeepSeek-V3`'s
+/// `first_k_dense_replace=3` dense layers before the `MoE` layers begin) —
+/// without this tolerance, edge outliers defeat collapsing entirely even when
+/// every other sibling is identical.
 ///
 /// Returns the branch's replacement node: a bare `Ranged` when every child
 /// collapses (`v0.9.6` behavior, unchanged), a `Branch` whose children mix the
 /// outlier(s) — rendered individually, in position — with one `Ranged` node for the
-/// collapsed majority (`v0.11.4`), or `None` if nothing worth collapsing exists,
-/// even after tolerating both edges.
+/// collapsed majority (`v0.11.4`; the tolerance itself widened from exactly one
+/// outlier per edge to up to [`MAX_EDGE_OUTLIERS`] in `v0.12.0`), or `None` if
+/// nothing worth collapsing exists, even after tolerating both edges.
 ///
 /// Deliberately does not search for outliers anywhere but the two edges: a middle
-/// outlier (or more than one per edge) would mean picking among several disjoint
-/// collapsible runs — a materially bigger rendering problem for a shape that does
-/// not occur in real tensor-name conventions.
+/// outlier would mean picking among several disjoint collapsible runs — a
+/// materially bigger rendering problem for a shape that does not occur in real
+/// tensor-name conventions.
 fn try_collapse_range(branch: &BranchNode) -> Option<TreeNode> {
     // Require at least 2 children; a single numeric child isn't a range.
     if branch.children.len() < 2 {
@@ -5724,88 +5737,97 @@ fn try_collapse_range(branch: &BranchNode) -> Option<TreeNode> {
     }
 
     let n = indexed.len();
-    // Candidates in order of preference (most-collapsed first): no outliers (the
-    // original all-or-nothing check), a leading outlier, a trailing outlier, one
-    // of each. `n` is a tensor-name nesting width — never near `usize::MAX` — so
-    // `skip_front + skip_back` cannot overflow.
-    for (skip_front, skip_back) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-        if skip_front + skip_back >= n {
-            continue;
-        }
-        // INDEX: `skip_front + skip_back < n` just checked, so this range is valid.
-        #[allow(clippy::indexing_slicing)]
-        let inner = &indexed[skip_front..n - skip_back];
-        // A single collapsed instance isn't a range; need at least 2 to group.
-        if inner.len() < 2 {
-            continue;
-        }
-        // INDEX: inner.len() >= 2 just checked, so inner[0] and inner[1..] are valid.
-        #[allow(clippy::indexing_slicing)]
-        let (start_idx, template_branch) = inner[0];
-        #[allow(clippy::indexing_slicing)]
-        let uniform = inner[1..]
-            .iter()
-            .all(|(_, other)| branches_structurally_equal(template_branch, other));
-        if !uniform {
-            continue;
-        }
+    // Candidates in order of preference (most-collapsed first): ascending total
+    // skip (`skip_front + skip_back`), preferring to skip from the front first at
+    // equal totals. This exactly reproduces the `v0.11.4` four-case order
+    // `(0,0), (1,0), (0,1), (1,1)` when `MAX_EDGE_OUTLIERS == 1`. `n` is a
+    // tensor-name nesting width — never near `usize::MAX` — so `skip_front +
+    // skip_back` cannot overflow.
+    for total in 0..=MAX_EDGE_OUTLIERS.saturating_mul(2) {
+        let skip_front_min = total.saturating_sub(MAX_EDGE_OUTLIERS);
+        let skip_front_max = total.min(MAX_EDGE_OUTLIERS);
+        for skip_front in (skip_front_min..=skip_front_max).rev() {
+            // EXPLICIT: skip_front <= total by construction (skip_front_max <=
+            // total), so this subtraction cannot underflow.
+            let skip_back = total - skip_front;
+            if skip_front + skip_back >= n {
+                continue;
+            }
+            // INDEX: `skip_front + skip_back < n` just checked, so this range is valid.
+            #[allow(clippy::indexing_slicing)]
+            let inner = &indexed[skip_front..n - skip_back];
+            // A single collapsed instance isn't a range; need at least 2 to group.
+            if inner.len() < 2 {
+                continue;
+            }
+            // INDEX: inner.len() >= 2 just checked, so inner[0] and inner[1..] are valid.
+            #[allow(clippy::indexing_slicing)]
+            let (start_idx, template_branch) = inner[0];
+            #[allow(clippy::indexing_slicing)]
+            let uniform = inner[1..]
+                .iter()
+                .all(|(_, other)| branches_structurally_equal(template_branch, other));
+            if !uniform {
+                continue;
+            }
 
-        let count = inner.len();
-        // CAST: usize → u64, count is bounded by tensor-name nesting width, never
-        // near u64::MAX
-        #[allow(clippy::as_conversions)]
-        let count_u64 = count as u64;
-        let ranged = RangedNode {
-            // A partial collapse keeps the parent as a real `Branch` header above
-            // it (see below), so the range prints as bare `[1..11]`, no repeated
-            // segment. A full collapse has no wrapping `Branch` — the `Ranged`
-            // node IS the branch's replacement — so it carries the original
-            // segment, unchanged from `v0.9.6`'s `blocks.[0..11]` rendering.
-            segment: if skip_front == 0 && skip_back == 0 {
-                branch.segment.clone()
-            } else {
-                String::new()
-            },
-            range_start: start_idx,
-            range_end: start_idx.saturating_add(count).saturating_sub(1),
-            template: template_branch.children.clone(),
-            // Structurally-equal siblings have identical per-instance totals (same
-            // shapes and dtypes imply identical byte_len/params), so multiplying
-            // the template's own totals by the instance count is exact, not an
-            // approximation.
-            total_tensors: template_branch.total_tensors.saturating_mul(count),
-            total_params: template_branch.total_params.saturating_mul(count_u64),
-            total_bytes: template_branch.total_bytes.saturating_mul(count_u64),
-        };
+            let count = inner.len();
+            // CAST: usize → u64, count is bounded by tensor-name nesting width, never
+            // near u64::MAX
+            #[allow(clippy::as_conversions)]
+            let count_u64 = count as u64;
+            let ranged = RangedNode {
+                // A partial collapse keeps the parent as a real `Branch` header above
+                // it (see below), so the range prints as bare `[1..11]`, no repeated
+                // segment. A full collapse has no wrapping `Branch` — the `Ranged`
+                // node IS the branch's replacement — so it carries the original
+                // segment, unchanged from `v0.9.6`'s `blocks.[0..11]` rendering.
+                segment: if skip_front == 0 && skip_back == 0 {
+                    branch.segment.clone()
+                } else {
+                    String::new()
+                },
+                range_start: start_idx,
+                range_end: start_idx.saturating_add(count).saturating_sub(1),
+                template: template_branch.children.clone(),
+                // Structurally-equal siblings have identical per-instance totals (same
+                // shapes and dtypes imply identical byte_len/params), so multiplying
+                // the template's own totals by the instance count is exact, not an
+                // approximation.
+                total_tensors: template_branch.total_tensors.saturating_mul(count),
+                total_params: template_branch.total_params.saturating_mul(count_u64),
+                total_bytes: template_branch.total_bytes.saturating_mul(count_u64),
+            };
 
-        if skip_front == 0 && skip_back == 0 {
-            return Some(TreeNode::Ranged(ranged));
-        }
+            if skip_front == 0 && skip_back == 0 {
+                return Some(TreeNode::Ranged(ranged));
+            }
 
-        // Partial collapse: keep the outlier(s) as individual branches, in
-        // position, alongside the one collapsed range.
-        let mut children =
-            Vec::with_capacity(skip_front.saturating_add(1).saturating_add(skip_back));
-        // INDEX: `skip_front < n` (checked via `skip_front + skip_back < n` above)
-        #[allow(clippy::indexing_slicing)]
-        for (_, b) in &indexed[..skip_front] {
-            children.push(TreeNode::Branch((*b).clone()));
+            // Partial collapse: keep the outlier(s) as individual branches, in
+            // position, alongside the one collapsed range.
+            let mut children =
+                Vec::with_capacity(skip_front.saturating_add(1).saturating_add(skip_back));
+            // INDEX: `skip_front < n` (checked via `skip_front + skip_back < n` above)
+            #[allow(clippy::indexing_slicing)]
+            for (_, b) in &indexed[..skip_front] {
+                children.push(TreeNode::Branch((*b).clone()));
+            }
+            children.push(TreeNode::Ranged(ranged));
+            // INDEX: `n - skip_back <= n` by construction
+            #[allow(clippy::indexing_slicing)]
+            for (_, b) in &indexed[n - skip_back..] {
+                children.push(TreeNode::Branch((*b).clone()));
+            }
+            return Some(TreeNode::Branch(BranchNode {
+                segment: branch.segment.clone(),
+                children,
+                // Unchanged: regrouping the same children into outliers + one Ranged
+                // node doesn't change which tensors exist under this branch.
+                total_tensors: branch.total_tensors,
+                total_params: branch.total_params,
+                total_bytes: branch.total_bytes,
+            }));
         }
-        children.push(TreeNode::Ranged(ranged));
-        // INDEX: `n - skip_back <= n` by construction
-        #[allow(clippy::indexing_slicing)]
-        for (_, b) in &indexed[n - skip_back..] {
-            children.push(TreeNode::Branch((*b).clone()));
-        }
-        return Some(TreeNode::Branch(BranchNode {
-            segment: branch.segment.clone(),
-            children,
-            // Unchanged: regrouping the same children into outliers + one Ranged
-            // node doesn't change which tensors exist under this branch.
-            total_tensors: branch.total_tensors,
-            total_params: branch.total_params,
-            total_bytes: branch.total_bytes,
-        }));
     }
 
     None
@@ -9373,16 +9395,17 @@ mod tests {
 
     /// Builds `count` uniform `blocks.<i>.x.weight` / `blocks.<i>.y.weight`
     /// tensors starting at `start`, optionally appending one extra
-    /// `blocks.<outlier_idx>.z.weight` tensor that makes that one block
-    /// structurally different from the rest (an extra child throws off
-    /// `branches_structurally_equal`'s `children.len()` check). Every block
-    /// needs at least two tensors so its trie node stays a `Branch` rather
-    /// than single-child-collapsing straight down into a `Leaf` — the same
-    /// shape real multi-tensor transformer blocks have.
+    /// `blocks.<i>.z.weight` tensor for each `i` in `outlier_indices` that
+    /// makes that block structurally different from the rest (an extra
+    /// child throws off `branches_structurally_equal`'s `children.len()`
+    /// check). Every block needs at least two tensors so its trie node
+    /// stays a `Branch` rather than single-child-collapsing straight down
+    /// into a `Leaf` — the same shape real multi-tensor transformer blocks
+    /// have.
     fn make_block_tensors(
         start: usize,
         count: usize,
-        outlier_idx: Option<usize>,
+        outlier_indices: &[usize],
     ) -> Vec<inspect::TensorInfo> {
         let mut tensors = Vec::new();
         for i in start..start + count {
@@ -9398,7 +9421,7 @@ mod tests {
                 vec![8],
                 32,
             ));
-            if outlier_idx == Some(i) {
+            if outlier_indices.contains(&i) {
                 tensors.push(make_tensor_info(
                     &format!("blocks.{i}.z.weight"),
                     "F32",
@@ -9428,7 +9451,7 @@ mod tests {
     fn tree_collapse_full_range_unchanged_with_no_outlier() {
         // Regression guard: 4 uniform blocks still collapse into one bare
         // `Ranged` node exactly as before this change (v0.9.6 behavior).
-        let tensors = make_block_tensors(0, 4, None);
+        let tensors = make_block_tensors(0, 4, &[]);
         let forest = collapse_ranges(build_tree(&tensors));
         assert_eq!(forest.len(), 1, "expected one top-level `blocks` node");
         match &forest[0] {
@@ -9449,7 +9472,7 @@ mod tests {
         // Block 0 has an extra tensor (mirrors RWKV's blocks.0.ln0.*); blocks
         // 1..3 are uniform. Expect blocks. to stay a real Branch with a
         // standalone block-0 child plus one Ranged([1..3]) child.
-        let tensors = make_block_tensors(0, 4, Some(0));
+        let tensors = make_block_tensors(0, 4, &[0]);
         let forest = collapse_ranges(build_tree(&tensors));
         let children = blocks_children(&forest);
         assert_eq!(children.len(), 2, "outlier + one collapsed range");
@@ -9483,7 +9506,7 @@ mod tests {
     #[test]
     fn tree_collapse_tolerates_trailing_outlier() {
         // Mirror case: the LAST block is the outlier, blocks 0..2 are uniform.
-        let tensors = make_block_tensors(0, 4, Some(3));
+        let tensors = make_block_tensors(0, 4, &[3]);
         let forest = collapse_ranges(build_tree(&tensors));
         let children = blocks_children(&forest);
         assert_eq!(children.len(), 2, "one collapsed range + outlier");
@@ -9514,7 +9537,7 @@ mod tests {
     fn tree_collapse_tolerates_outlier_at_both_edges() {
         // Both the first AND last block are outliers (distinct blocks, so
         // both extra-tensor markers are present); blocks 1..3 are uniform.
-        let mut tensors = make_block_tensors(0, 5, Some(0));
+        let mut tensors = make_block_tensors(0, 5, &[0]);
         tensors.push(make_tensor_info("blocks.4.w.weight", "F32", vec![1], 4));
         let forest = collapse_ranges(build_tree(&tensors));
         let children = blocks_children(&forest);
@@ -9548,16 +9571,114 @@ mod tests {
     }
 
     #[test]
-    fn tree_collapse_refuses_a_middle_outlier() {
-        // Only edge outliers are tolerated by design (see try_collapse_range's
-        // doc comment) — a mismatch in the middle must fall back to the fully
-        // expanded tree, not a partial collapse around it.
-        let tensors = make_block_tensors(0, 4, Some(2));
+    fn tree_collapse_tolerates_k_outliers_per_edge() {
+        // MAX_EDGE_OUTLIERS leading outliers (mirrors DeepSeek-V3's
+        // first_k_dense_replace=3 dense-layer prefix); blocks 3..6 are
+        // uniform. Expect the 3 outliers rendered standalone, in position,
+        // plus one Ranged([3..6]) child.
+        let tensors = make_block_tensors(0, 7, &[0, 1, 2]);
+        let forest = collapse_ranges(build_tree(&tensors));
+        let children = blocks_children(&forest);
+        assert_eq!(children.len(), 4, "3 outliers + one collapsed range");
+
+        for (i, child) in children.iter().take(3).enumerate() {
+            match child {
+                TreeNode::Branch(b) => assert_eq!(b.segment, i.to_string()),
+                // EXPLICIT: test assertion — any non-Branch result is a failure to report
+                other @ (TreeNode::Leaf(_) | TreeNode::Ranged(_)) => {
+                    panic!("expected block {i} standalone, got {other:?}")
+                }
+            }
+        }
+        // INDEX: children.len() == 4 just asserted above.
+        #[allow(clippy::indexing_slicing)]
+        match &children[3] {
+            TreeNode::Ranged(r) => assert_eq!((r.range_start, r.range_end), (3, 6)),
+            // EXPLICIT: test assertion — any non-Ranged result is a failure to report
+            other @ (TreeNode::Leaf(_) | TreeNode::Branch(_)) => {
+                panic!("expected the [3..6] range, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn tree_collapse_refuses_more_than_k_outliers_at_one_edge() {
+        // MAX_EDGE_OUTLIERS + 1 leading outliers exceeds the tolerance —
+        // must fall back to full expansion, same as a middle outlier.
+        let tensors = make_block_tensors(0, 8, &[0, 1, 2, 3]);
         let forest = collapse_ranges(build_tree(&tensors));
         let children = blocks_children(&forest);
         assert_eq!(
             children.len(),
-            4,
+            8,
+            "no collapse at all — every block stands alone"
+        );
+        for child in children {
+            assert!(
+                matches!(child, TreeNode::Branch(_)),
+                "expected every child to remain an individual Branch, got {child:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_collapse_tolerates_k_outliers_at_both_edges() {
+        // MAX_EDGE_OUTLIERS outliers at the front AND MAX_EDGE_OUTLIERS at
+        // the back, with a uniform run in between.
+        let tensors = make_block_tensors(0, 9, &[0, 1, 2, 6, 7, 8]);
+        let forest = collapse_ranges(build_tree(&tensors));
+        let children = blocks_children(&forest);
+        assert_eq!(
+            children.len(),
+            7,
+            "3 leading outliers + range + 3 trailing outliers"
+        );
+
+        for (i, child) in children.iter().take(3).enumerate() {
+            match child {
+                TreeNode::Branch(b) => assert_eq!(b.segment, i.to_string()),
+                // EXPLICIT: test assertion — any non-Branch result is a failure to report
+                other @ (TreeNode::Leaf(_) | TreeNode::Ranged(_)) => {
+                    panic!("expected block {i} standalone, got {other:?}")
+                }
+            }
+        }
+        // INDEX: children.len() == 7 just asserted above.
+        #[allow(clippy::indexing_slicing)]
+        match &children[3] {
+            TreeNode::Ranged(r) => assert_eq!((r.range_start, r.range_end), (3, 5)),
+            // EXPLICIT: test assertion — any non-Ranged result is a failure to report
+            other @ (TreeNode::Leaf(_) | TreeNode::Branch(_)) => {
+                panic!("expected the [3..5] range, got {other:?}")
+            }
+        }
+        for (offset, i) in (6..9).enumerate() {
+            // INDEX: children.len() == 7 just asserted above; 4 + offset < 7.
+            #[allow(clippy::indexing_slicing)]
+            match &children[4 + offset] {
+                TreeNode::Branch(b) => assert_eq!(b.segment, i.to_string()),
+                // EXPLICIT: test assertion — any non-Branch result is a failure to report
+                other @ (TreeNode::Leaf(_) | TreeNode::Ranged(_)) => {
+                    panic!("expected block {i} standalone, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tree_collapse_refuses_a_middle_outlier() {
+        // Only edge outliers are tolerated by design (see try_collapse_range's
+        // doc comment) — a mismatch in the middle must fall back to the fully
+        // expanded tree, not a partial collapse around it. With
+        // MAX_EDGE_OUTLIERS = 3, "the middle" means more than 3 blocks away
+        // from both edges — block 4 of 9 (index 4, 4 blocks from the front
+        // and 4 from the back) is out of reach of either edge's skip budget.
+        let tensors = make_block_tensors(0, 9, &[4]);
+        let forest = collapse_ranges(build_tree(&tensors));
+        let children = blocks_children(&forest);
+        assert_eq!(
+            children.len(),
+            9,
             "no collapse at all — every block stands alone"
         );
         for child in children {
@@ -9572,7 +9693,7 @@ mod tests {
     fn tree_collapse_refuses_when_too_few_survive() {
         // 2 blocks total, one is an outlier: removing it leaves only 1
         // survivor, which isn't a "range" — no collapse should occur.
-        let tensors = make_block_tensors(0, 2, Some(0));
+        let tensors = make_block_tensors(0, 2, &[0]);
         let forest = collapse_ranges(build_tree(&tensors));
         let children = blocks_children(&forest);
         assert_eq!(children.len(), 2);
@@ -9585,7 +9706,7 @@ mod tests {
     fn tree_collapse_partial_totals_match_full_expansion() {
         // The wrapping Branch's aggregate totals must equal the sum over
         // every block regardless of how the children are grouped for display.
-        let tensors = make_block_tensors(0, 6, Some(0));
+        let tensors = make_block_tensors(0, 6, &[0]);
         let expected_tensors = tensors.len();
         let expected_params: u64 = tensors.iter().map(inspect::TensorInfo::num_elements).sum();
         let forest = collapse_ranges(build_tree(&tensors));
