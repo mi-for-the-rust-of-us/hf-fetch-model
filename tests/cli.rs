@@ -39,6 +39,20 @@ fn parse_json(stdout: &str) -> Value {
         .unwrap_or_else(|e| panic!("output must be valid JSON ({e}), got:\n{stdout}"))
 }
 
+/// Runs a command with `HF_HOME` pointed at a fresh, empty temp directory,
+/// isolating it from the shared global cache other tests read.
+///
+/// Returns the `TempDir` guard alongside the usual `run()` output — callers
+/// must keep the guard alive (and pass its path to `HF_HOME` on any further
+/// commands sharing the same isolated cache) for the duration of the test;
+/// dropping it deletes the directory.
+fn run_isolated(cmd: &mut Command) -> (tempfile::TempDir, String, String, bool) {
+    let dir = tempfile::tempdir().expect("failed to create temp HF_HOME");
+    cmd.env("HF_HOME", dir.path());
+    let (stdout, stderr, success) = run(cmd);
+    (dir, stdout, stderr, success)
+}
+
 // -----------------------------------------------------------------------
 // Help text (offline — no network needed)
 // -----------------------------------------------------------------------
@@ -468,8 +482,19 @@ fn dry_run_shows_repo_and_revision() {
 
 #[test]
 fn dry_run_cached_repo_shows_zero_download() {
-    // julien-c/dummy-unknown should already be cached from other tests.
-    let (stdout, stderr, success) = run(hf_fm().args(["julien-c/dummy-unknown", "--dry-run"]));
+    // Self-sufficient: downloads julien-c/dummy-unknown into an isolated
+    // HF_HOME first, rather than assuming some other test already
+    // populated the shared global cache (the old assumption raced under
+    // parallel test execution — see CHANGELOG.md [0.11.3] "Known issue").
+    let dir = tempfile::tempdir().expect("failed to create temp HF_HOME");
+    let (_, download_stderr, download_success) = run(hf_fm()
+        .args(["julien-c/dummy-unknown"])
+        .env("HF_HOME", dir.path()));
+    assert!(download_success, "setup download failed: {download_stderr}");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .args(["julien-c/dummy-unknown", "--dry-run"])
+        .env("HF_HOME", dir.path()));
     assert!(success, "--dry-run failed: {stderr}");
     assert!(
         stdout.contains("0 to download"),
@@ -546,16 +571,52 @@ fn cache_delete_help_shows_flags() {
 
 #[test]
 fn cache_delete_nonexistent_repo() {
-    let (_, stderr, success) = run(hf_fm().args([
+    // Self-sufficient: `run_cache_delete` early-returns success ("No
+    // HuggingFace cache found") when the whole hub directory is absent
+    // (src/bin/main.rs `run_cache_delete`), so this test must pre-create
+    // an (empty) hub dir itself to actually reach the per-repo "not
+    // cached" branch it asserts on — relying on some other test having
+    // already created the shared global cache raced under parallel test
+    // execution and, worse, could pass without exercising this path at
+    // all (see CHANGELOG.md [0.11.3] "Known issue").
+    let dir = tempfile::tempdir().expect("failed to create temp HF_HOME");
+    std::fs::create_dir_all(dir.path().join("hub")).expect("failed to create hub dir");
+
+    let (_, stderr, success) = run(hf_fm()
+        .args([
+            "cache",
+            "delete",
+            "nonexistent-org/nonexistent-model-xyz",
+            "--yes",
+        ])
+        .env("HF_HOME", dir.path()));
+    assert!(!success, "cache delete of missing repo should fail");
+    assert!(
+        stderr.contains("not cached"),
+        "cache delete should report not cached, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn cache_delete_no_cache_at_all_reports_and_succeeds() {
+    // Locks in `run_cache_delete`'s early-return branch explicitly: a
+    // fresh HF_HOME with no `hub` directory at all (never downloaded
+    // anything) is a distinct case from "hub exists but this repo isn't
+    // in it" (cache_delete_nonexistent_repo, above) and must still exit
+    // successfully rather than error.
+    let (_dir, stdout, stderr, success) = run_isolated(hf_fm().args([
         "cache",
         "delete",
         "nonexistent-org/nonexistent-model-xyz",
         "--yes",
     ]));
-    assert!(!success, "cache delete of missing repo should fail");
     assert!(
-        stderr.contains("not cached"),
-        "cache delete should report not cached, got:\n{stderr}"
+        success,
+        "cache delete with no cache at all should succeed: {stderr}"
+    );
+    assert!(
+        stdout.contains("No HuggingFace cache found"),
+        "should report no cache found, got:\n{stdout}"
     );
 }
 

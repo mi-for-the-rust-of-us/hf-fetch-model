@@ -105,6 +105,10 @@ hypomnesis = { version = "0.2.9", default-features = false, features = [
 # lockfile) lets CLI tests parse `--json` output and assert its schema and
 # invariants rather than substring-matching the rendered text.
 serde_json = "1"
+# Already transitively present (pulled in by several runtime deps); promoted
+# to a direct dev-dependency so `tests/cli.rs` can isolate tests that would
+# otherwise race on the shared global HF cache via a per-test `HF_HOME`.
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

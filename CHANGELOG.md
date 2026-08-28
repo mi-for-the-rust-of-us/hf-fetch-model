@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two order-dependent `tests/cli.rs` tests now have self-sufficient, isolated cache setup, and `cargo test --all-features` is restored to the MSRV CI lane.** `dry_run_cached_repo_shows_zero_download` and `cache_delete_nonexistent_repo` previously read the real shared global HF cache and assumed some other test had already populated it — a race under parallel test execution, and the reason the MSRV lane ([0.11.3] below) was restricted to lints only. Both tests now set `HF_HOME` to a fresh, per-test temp directory and populate exactly the state they need before asserting on it. A second, distinct latent bug was found along the way: `cache_delete_nonexistent_repo` could silently pass without ever exercising its own assertion path, because `run_cache_delete` early-returns success ("No HuggingFace cache found") whenever the whole hub directory is absent — which the shared-cache version of the test could hit by accident depending on scheduling. A new regression test, `cache_delete_no_cache_at_all_reports_and_succeeds`, locks in that early-return branch explicitly. `tempfile` (already transitively present) is promoted to a direct dev-dependency for the isolation helper.
+
 ## [0.11.5] — `hf-fm peek`
 
 ### Added
