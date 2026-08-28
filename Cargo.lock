@@ -25,9 +25,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "anamnesis"
-version = "0.7.5"
+version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "424515234d1732a78fcbb36c7287dda008ad5b1b6f87f2d113497f6f7567fe26"
+checksum = "b881e7a2773c69d87fa60a6dffea6e9d2e83eba2f00c20b11d76b8b1d1a003af"
 dependencies = [
  "flate2",
  "float8",
@@ -1127,9 +1127,9 @@ dependencies = [
 
 [[package]]
 name = "hypomnesis"
-version = "0.2.9"
+version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f012995ba7cd03c7510317aacb55fc77ac7d8410394bc1c3ae62037ee6f33fc"
+checksum = "572dfa9a7e24ad5b8f9ed7fa9f5f789718f0f634819c2b658d5a6d0084221a1b"
 dependencies = [
  "libloading",
  "objc2",
