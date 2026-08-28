@@ -346,18 +346,32 @@ See also: hf-fm list-families, hf-fm discover")]
         #[arg(long)]
         filter: Option<String>,
         /// Show only the summary line (counts per category).
-        #[arg(long, conflicts_with = "dtypes")]
+        #[arg(long, conflicts_with_all = ["dtypes", "collapse"])]
         summary: bool,
         /// Show per-dtype histograms side-by-side instead of the per-tensor body.
         ///
         /// Aggregates tensors by dtype on both sides; prints two columns
         /// (A: Tensors, A: Size; B: Tensors, B: Size) plus a Δ Size column.
         /// Composes with --filter (histograms aggregate over filtered tensors
-        /// only). Conflicts with --summary (incoherent intents: one-line total
-        /// vs per-dtype table).
-        #[arg(long, conflicts_with = "summary")]
+        /// only). Conflicts with --summary and --collapse (incoherent intents:
+        /// one-line total vs per-dtype table vs per-pattern table).
+        #[arg(long, conflicts_with_all = ["summary", "collapse"])]
         dtypes: bool,
+        /// Collapse numeric-segment name patterns within each section into
+        /// grouped rows (pattern, count, bytes) instead of the per-tensor body.
+        ///
+        /// Replaces every run of digits in a tensor name with `{N}` (e.g.
+        /// `model.layers.3.mlp.gate_proj.weight` becomes
+        /// `model.layers.{N}.mlp.gate_proj.weight`) and groups only-A / only-B
+        /// / differ independently by the resulting pattern — the tool-side
+        /// counterpart to the `jq` recipe in docs/FAQ.md. Composes with
+        /// --filter (grouping runs over filtered tensors only). Conflicts
+        /// with --summary and --dtypes.
+        #[arg(long, conflicts_with_all = ["summary", "dtypes"])]
+        collapse: bool,
         /// Show only the first N tensors per section (only-A / only-B / differ), applied after `--filter`.
+        ///
+        /// Under `--collapse`, caps grouped rows per section instead of raw tensors.
         #[arg(long)]
         limit: Option<usize>,
         /// Output the full diff as JSON.
@@ -934,6 +948,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             filter,
             summary,
             dtypes,
+            collapse,
             limit,
             json,
         }) => run_diff(
@@ -946,6 +961,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             filter.as_deref(),
             summary,
             dtypes,
+            collapse,
             limit,
             json,
         ),
@@ -4223,6 +4239,7 @@ fn run_diff(
     filter: Option<&str>,
     summary: bool,
     dtypes: bool,
+    collapse: bool,
     limit: Option<usize>,
     json: bool,
 ) -> Result<(), FetchError> {
@@ -4294,7 +4311,7 @@ fn run_diff(
     if json {
         return print_diff_json(
             repo_a, repo_b, &tensors_a, &tensors_b, &only_a, &only_b, &differ, &matching, filter,
-            dtypes, limit,
+            dtypes, collapse, limit,
         );
     }
 
@@ -4302,6 +4319,15 @@ fn run_diff(
     // side-by-side per-dtype histogram (header, table, own footer).
     if dtypes {
         print_diff_dtypes(repo_a, repo_b, &tensors_a, &tensors_b, filter);
+        return Ok(());
+    }
+
+    // --collapse mode replaces the per-tensor body + standard summary with
+    // three pattern-grouped tables (header, tables, own footer).
+    if collapse {
+        print_diff_collapse(
+            repo_a, repo_b, &tensors_a, &tensors_b, &only_a, &only_b, &differ, filter, limit,
+        );
         return Ok(());
     }
 
@@ -4471,6 +4497,20 @@ struct DtypeHistograms {
     b: Vec<DiffDtypeGroup>,
 }
 
+/// Pattern-grouped rows per section, emitted under `--collapse --json`.
+///
+/// Independently grouped, matching the shipped `jq` recipe's scope — no
+/// cross-referencing between sides.
+#[derive(serde::Serialize)]
+struct DiffCollapsed {
+    /// Only-in-A rows, sorted by `bytes` descending.
+    only_a: Vec<DiffCollapseGroup>,
+    /// Only-in-B rows, sorted by `bytes` descending.
+    only_b: Vec<DiffCollapseGroup>,
+    /// Dtype/shape-differences rows, sorted by `bytes` descending.
+    differ: Vec<DiffCollapseGroup>,
+}
+
 /// Per-section truncation metadata for `diff --json`, emitted only when
 /// `--limit` capped at least one section.
 ///
@@ -4508,6 +4548,12 @@ struct DiffResult {
     /// Per-side dtype histograms when `--dtypes` is set; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     dtype_histograms: Option<DtypeHistograms>,
+    /// Pattern-grouped rows when `--collapse` is set; absent otherwise. Purely
+    /// additive — the flat `only_a` / `only_b` / `differ` arrays above stay
+    /// populated exactly as without `--collapse`, so existing `jq` recipes
+    /// against them are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collapsed: Option<DiffCollapsed>,
     /// Per-section truncation when `--limit` capped output; absent when complete.
     #[serde(skip_serializing_if = "Option::is_none")]
     truncated: Option<DiffTruncation>,
@@ -4526,6 +4572,7 @@ fn print_diff_json(
     matching: &[&str],
     filter: Option<&str>,
     dtypes: bool,
+    collapse: bool,
     limit: Option<usize>,
 ) -> Result<(), FetchError> {
     let make_entry = |name: &str,
@@ -4555,6 +4602,19 @@ fn print_diff_json(
         Some(DtypeHistograms {
             a: rows_a,
             b: rows_b,
+        })
+    } else {
+        None
+    };
+
+    // EXPLICIT: --collapse populates `collapsed`; otherwise the field is
+    // omitted via skip_serializing_if. Like dtype_histograms, always complete
+    // — `--limit` bounds only the flat entries below, not the aggregation.
+    let collapsed = if collapse {
+        Some(DiffCollapsed {
+            only_a: aggregate_diff_collapse(only_a, tensors_a, tensors_b, DiffCollapseSide::OnlyA),
+            only_b: aggregate_diff_collapse(only_b, tensors_a, tensors_b, DiffCollapseSide::OnlyB),
+            differ: aggregate_diff_collapse(differ, tensors_a, tensors_b, DiffCollapseSide::Differ),
         })
     } else {
         None
@@ -4601,6 +4661,7 @@ fn print_diff_json(
         matching_count: matching.len(),
         filter: filter.map(str::to_owned),
         dtype_histograms,
+        collapsed,
         truncated,
     };
 
@@ -4881,6 +4942,319 @@ fn print_diff_dtypes(
         println!("{footer_core} (filter: {p:?})");
     } else {
         println!("{footer_core}");
+    }
+}
+
+/// Replaces every maximal run of ASCII digits in `name` with `"{N}"`,
+/// mirroring the `gsub("[0-9]+"; "{N}")` step in the `jq` recipe shipped in
+/// docs/FAQ.md. Pure, allocation-only — no `regex` dependency needed for a
+/// single fixed substitution.
+fn collapse_numeric_segments(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            out.push_str("{N}");
+            while chars.next_if(char::is_ascii_digit).is_some() {}
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Which side(s) of a diff section a [`DiffCollapseGroup`]'s byte totals
+/// summarize. `OnlyA` and `OnlyB` populate `bytes` from the one side that has
+/// the tensor; `Differ` populates both `bytes` (side A) and `bytes_b` (side B).
+#[derive(Clone, Copy)]
+#[allow(clippy::exhaustive_enums)] // EXHAUSTIVE: crate-private dispatch enum; matched exhaustively in aggregate_diff_collapse
+enum DiffCollapseSide {
+    /// Rows drawn from the only-in-A section; `bytes` sums side A.
+    OnlyA,
+    /// Rows drawn from the only-in-B section; `bytes` sums side B.
+    OnlyB,
+    /// Rows drawn from the dtype/shape-differences section; `bytes` sums side
+    /// A and `bytes_b` sums side B.
+    Differ,
+}
+
+/// One pattern-grouped row under `diff --collapse`.
+#[derive(serde::Serialize)]
+struct DiffCollapseGroup {
+    /// Numeric-collapsed name pattern (e.g. `model.layers.{N}.self_attn.q_proj.weight`).
+    pattern: String,
+    /// Number of tensors matching this pattern in this section.
+    tensors: usize,
+    /// Byte total for the populated side: side A for only-A rows, side B for
+    /// only-B rows, side A for differ rows.
+    bytes: u64,
+    /// Side-B byte total; only present for differ rows (only-A/only-B rows
+    /// have only one side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_b: Option<u64>,
+}
+
+/// Groups a diff section's tensor names by numeric-collapsed pattern, summing
+/// byte counts per group. Sorted by `bytes` descending, pattern ascending as a
+/// tiebreak (pattern collisions are common — unlike dtype names, which are few
+/// and distinct, so [`aggregate_diff_dtypes`] never needed one). Pure — no I/O.
+fn aggregate_diff_collapse(
+    names: &[&str],
+    tensors_a: &HashMap<String, inspect::TensorInfo>,
+    tensors_b: &HashMap<String, inspect::TensorInfo>,
+    side: DiffCollapseSide,
+) -> Vec<DiffCollapseGroup> {
+    let mut by_pattern: HashMap<String, Vec<&str>> = HashMap::new();
+    for name in names {
+        by_pattern
+            .entry(collapse_numeric_segments(name))
+            .or_default()
+            .push(name);
+    }
+
+    let mut rows: Vec<DiffCollapseGroup> = by_pattern
+        .into_iter()
+        .map(|(pattern, members)| {
+            let tensors = members.len();
+            let (bytes, bytes_b) = match side {
+                DiffCollapseSide::OnlyA => (
+                    members
+                        .iter()
+                        .filter_map(|n| tensors_a.get(*n))
+                        .map(inspect::TensorInfo::byte_len)
+                        .sum(),
+                    None,
+                ),
+                DiffCollapseSide::OnlyB => (
+                    members
+                        .iter()
+                        .filter_map(|n| tensors_b.get(*n))
+                        .map(inspect::TensorInfo::byte_len)
+                        .sum(),
+                    None,
+                ),
+                DiffCollapseSide::Differ => (
+                    members
+                        .iter()
+                        .filter_map(|n| tensors_a.get(*n))
+                        .map(inspect::TensorInfo::byte_len)
+                        .sum(),
+                    Some(
+                        members
+                            .iter()
+                            .filter_map(|n| tensors_b.get(*n))
+                            .map(inspect::TensorInfo::byte_len)
+                            .sum(),
+                    ),
+                ),
+            };
+            DiffCollapseGroup {
+                pattern,
+                tensors,
+                bytes,
+                bytes_b,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| a.pattern.cmp(&b.pattern))
+    });
+    rows
+}
+
+/// Column widths for a `diff --collapse` only-A / only-B pattern table.
+struct DiffCollapseColumnWidths {
+    /// Width of the pattern column.
+    pattern: usize,
+    /// Width of the tensor-count column.
+    tensors: usize,
+    /// Width of the byte-size column.
+    bytes: usize,
+}
+
+/// Computes dynamic column widths for a `diff --collapse` only-A / only-B table.
+fn diff_collapse_column_widths(rows: &[DiffCollapseGroup]) -> DiffCollapseColumnWidths {
+    let mut pattern_w = "Pattern".chars().count();
+    let mut tensors_w = "Tensors".chars().count();
+    let mut bytes_w = "Bytes".chars().count();
+    for r in rows {
+        pattern_w = pattern_w.max(r.pattern.chars().count());
+        tensors_w = tensors_w.max(r.tensors.to_string().chars().count());
+        bytes_w = bytes_w.max(format_size(r.bytes).chars().count());
+    }
+    DiffCollapseColumnWidths {
+        pattern: pattern_w,
+        tensors: tensors_w,
+        bytes: bytes_w,
+    }
+}
+
+/// Renders one only-A / only-B pattern-grouped table under `diff --collapse`.
+fn print_diff_collapse_section(
+    label: &str,
+    rows: &[DiffCollapseGroup],
+    cap: usize,
+    total_tensors: usize,
+) {
+    println!(
+        "  {label} ({total_tensors} {}, {} {}):",
+        pluralize(total_tensors, "tensor", "tensors"),
+        rows.len(),
+        pluralize(rows.len(), "pattern", "patterns"),
+    );
+    let w = diff_collapse_column_widths(rows);
+    println!(
+        "  {:<pw$}  {:>tw$}  {:>bw$}",
+        "Pattern",
+        "Tensors",
+        "Bytes",
+        pw = w.pattern,
+        tw = w.tensors,
+        bw = w.bytes,
+    );
+    for r in rows.iter().take(cap) {
+        println!(
+            "  {:<pw$}  {:>tw$}  {:>bw$}",
+            r.pattern,
+            r.tensors,
+            format_size(r.bytes),
+            pw = w.pattern,
+            tw = w.tensors,
+            bw = w.bytes,
+        );
+    }
+    if rows.len() > cap {
+        println!("    \u{2026} showing {cap} of {} (limit {cap})", rows.len());
+    }
+    println!();
+}
+
+/// Renders the dtype/shape-differences pattern-grouped table under `diff --collapse`.
+fn print_diff_collapse_differ(rows: &[DiffCollapseGroup], cap: usize, total_tensors: usize) {
+    println!(
+        "  Dtype/shape differences ({total_tensors} {}, {} {}):",
+        pluralize(total_tensors, "tensor", "tensors"),
+        rows.len(),
+        pluralize(rows.len(), "pattern", "patterns"),
+    );
+    let mut pattern_w = "Pattern".chars().count();
+    let mut tensors_w = "Tensors".chars().count();
+    let mut a_bytes_w = "A Bytes".chars().count();
+    let mut b_bytes_w = "B Bytes".chars().count();
+    let mut delta_w = "\u{0394} Bytes".chars().count();
+    // Delta computation is u64 → i64 via `try_from`/`unwrap_or`, not `as`;
+    // clipping to i64::MAX is safe — tensor byte counts never approach 9.2 EiB.
+    let deltas: Vec<i64> = rows
+        .iter()
+        .map(|r| {
+            let a = i64::try_from(r.bytes).unwrap_or(i64::MAX);
+            let b = i64::try_from(r.bytes_b.unwrap_or(0)).unwrap_or(i64::MAX);
+            b.saturating_sub(a)
+        })
+        .collect();
+    for (r, delta) in rows.iter().zip(&deltas) {
+        pattern_w = pattern_w.max(r.pattern.chars().count());
+        tensors_w = tensors_w.max(r.tensors.to_string().chars().count());
+        a_bytes_w = a_bytes_w.max(format_size(r.bytes).chars().count());
+        b_bytes_w = b_bytes_w.max(format_size(r.bytes_b.unwrap_or(0)).chars().count());
+        delta_w = delta_w.max(format_size_delta(*delta).chars().count());
+    }
+    println!(
+        "  {:<pw$}  {:>tw$}  {:>aw$}  {:>bw$}  {:>dw$}",
+        "Pattern",
+        "Tensors",
+        "A Bytes",
+        "B Bytes",
+        "\u{0394} Bytes",
+        pw = pattern_w,
+        tw = tensors_w,
+        aw = a_bytes_w,
+        bw = b_bytes_w,
+        dw = delta_w,
+    );
+    for (r, delta) in rows.iter().zip(&deltas).take(cap) {
+        println!(
+            "  {:<pw$}  {:>tw$}  {:>aw$}  {:>bw$}  {:>dw$}",
+            r.pattern,
+            r.tensors,
+            format_size(r.bytes),
+            format_size(r.bytes_b.unwrap_or(0)),
+            format_size_delta(*delta),
+            pw = pattern_w,
+            tw = tensors_w,
+            aw = a_bytes_w,
+            bw = b_bytes_w,
+            dw = delta_w,
+        );
+    }
+    if rows.len() > cap {
+        println!("    \u{2026} showing {cap} of {} (limit {cap})", rows.len());
+    }
+    println!();
+}
+
+/// Renders `diff --collapse`'s three pattern-grouped tables (only-A, only-B,
+/// dtype/shape differences) in place of the per-tensor body.
+///
+/// Mirrors [`print_diff_dtypes`]'s shape (own header, own footer) but keeps
+/// the three sections independently grouped — matching the shipped `jq`
+/// recipe's scope (`docs/FAQ.md`) rather than cross-referencing patterns
+/// between sides, which neither of the two real validation pairs
+/// (FP8-vs-AWQ, gpt-oss 20b-vs-120b) needed.
+#[allow(clippy::too_many_arguments)]
+fn print_diff_collapse(
+    repo_a: &str,
+    repo_b: &str,
+    tensors_a: &HashMap<String, inspect::TensorInfo>,
+    tensors_b: &HashMap<String, inspect::TensorInfo>,
+    only_a: &[&str],
+    only_b: &[&str],
+    differ: &[&str],
+    filter: Option<&str>,
+    limit: Option<usize>,
+) {
+    println!("  A: {repo_a}");
+    println!("  B: {repo_b}");
+    println!();
+
+    let cap = limit.unwrap_or(usize::MAX);
+
+    let rows_a = aggregate_diff_collapse(only_a, tensors_a, tensors_b, DiffCollapseSide::OnlyA);
+    if !rows_a.is_empty() {
+        print_diff_collapse_section("Only in A", &rows_a, cap, only_a.len());
+    }
+    let rows_b = aggregate_diff_collapse(only_b, tensors_a, tensors_b, DiffCollapseSide::OnlyB);
+    if !rows_b.is_empty() {
+        print_diff_collapse_section("Only in B", &rows_b, cap, only_b.len());
+    }
+    let rows_differ =
+        aggregate_diff_collapse(differ, tensors_a, tensors_b, DiffCollapseSide::Differ);
+    if !rows_differ.is_empty() {
+        print_diff_collapse_differ(&rows_differ, cap, differ.len());
+    }
+
+    println!("  {}", "\u{2500}".repeat(70));
+    print!(
+        "  only-A: {} {} ({} {}) | only-B: {} {} ({} {}) | differ: {} {} ({} {})",
+        only_a.len(),
+        pluralize(only_a.len(), "tensor", "tensors"),
+        rows_a.len(),
+        pluralize(rows_a.len(), "pattern", "patterns"),
+        only_b.len(),
+        pluralize(only_b.len(), "tensor", "tensors"),
+        rows_b.len(),
+        pluralize(rows_b.len(), "pattern", "patterns"),
+        differ.len(),
+        pluralize(differ.len(), "tensor", "tensors"),
+        rows_differ.len(),
+        pluralize(rows_differ.len(), "pattern", "patterns"),
+    );
+    if let Some(pattern) = filter {
+        println!(" (filter: {pattern:?})");
+    } else {
+        println!();
     }
 }
 
@@ -9318,6 +9692,185 @@ mod tests {
         assert_eq!(rows_a[0].bytes, 200);
         assert_eq!(rows_b[0].tensors, 1);
         assert_eq!(rows_b[0].bytes, 100);
+    }
+
+    // ---------- diff --collapse ----------
+
+    #[test]
+    fn collapse_numeric_segments_empty_string() {
+        assert_eq!(collapse_numeric_segments(""), "");
+    }
+
+    #[test]
+    fn collapse_numeric_segments_no_digits() {
+        assert_eq!(
+            collapse_numeric_segments("model.embed_tokens.weight"),
+            "model.embed_tokens.weight"
+        );
+    }
+
+    #[test]
+    fn collapse_numeric_segments_single_digit() {
+        assert_eq!(
+            collapse_numeric_segments("model.layers.3.mlp.weight"),
+            "model.layers.{N}.mlp.weight"
+        );
+    }
+
+    #[test]
+    fn collapse_numeric_segments_multi_digit_run() {
+        assert_eq!(
+            collapse_numeric_segments("model.layers.123.mlp.weight"),
+            "model.layers.{N}.mlp.weight"
+        );
+    }
+
+    #[test]
+    fn collapse_numeric_segments_multiple_runs() {
+        assert_eq!(
+            collapse_numeric_segments("block.24.attn.qkv.weight.blocks.7"),
+            "block.{N}.attn.qkv.weight.blocks.{N}"
+        );
+    }
+
+    #[test]
+    fn aggregate_diff_collapse_only_a_groups_and_sums_by_pattern() {
+        // The scaled-sibling shape: many layer-indexed tensors sharing a
+        // pattern once digits are collapsed, plus one unrelated tensor.
+        let tensors_a: HashMap<String, inspect::TensorInfo> = [
+            (
+                "model.layers.0.mlp.gate_proj.weight_scale".to_owned(),
+                make_tensor_info(
+                    "model.layers.0.mlp.gate_proj.weight_scale",
+                    "F32",
+                    vec![1],
+                    4,
+                ),
+            ),
+            (
+                "model.layers.1.mlp.gate_proj.weight_scale".to_owned(),
+                make_tensor_info(
+                    "model.layers.1.mlp.gate_proj.weight_scale",
+                    "F32",
+                    vec![1],
+                    4,
+                ),
+            ),
+            (
+                "lm_head.weight".to_owned(),
+                make_tensor_info("lm_head.weight", "BF16", vec![100, 100], 20_000),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let tensors_b: HashMap<String, inspect::TensorInfo> = HashMap::new();
+        let names: Vec<&str> = vec![
+            "model.layers.0.mlp.gate_proj.weight_scale",
+            "model.layers.1.mlp.gate_proj.weight_scale",
+            "lm_head.weight",
+        ];
+
+        let rows = aggregate_diff_collapse(&names, &tensors_a, &tensors_b, DiffCollapseSide::OnlyA);
+        assert_eq!(rows.len(), 2, "two distinct patterns");
+        let layer_row = rows
+            .iter()
+            .find(|r| r.pattern == "model.layers.{N}.mlp.gate_proj.weight_scale")
+            .expect("layer pattern present");
+        assert_eq!(layer_row.tensors, 2);
+        assert_eq!(layer_row.bytes, 8);
+        assert!(layer_row.bytes_b.is_none(), "only-A rows carry no B total");
+        let head_row = rows
+            .iter()
+            .find(|r| r.pattern == "lm_head.weight")
+            .expect("lm_head pattern present, unchanged by digit collapse");
+        assert_eq!(head_row.tensors, 1);
+        assert_eq!(head_row.bytes, 20_000);
+    }
+
+    #[test]
+    fn aggregate_diff_collapse_only_b_sums_from_b_side() {
+        let tensors_a: HashMap<String, inspect::TensorInfo> = HashMap::new();
+        let tensors_b: HashMap<String, inspect::TensorInfo> = [
+            (
+                "model.layers.0.mlp.down_proj.qweight".to_owned(),
+                make_tensor_info("model.layers.0.mlp.down_proj.qweight", "I32", vec![10], 40),
+            ),
+            (
+                "model.layers.1.mlp.down_proj.qweight".to_owned(),
+                make_tensor_info("model.layers.1.mlp.down_proj.qweight", "I32", vec![10], 40),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<&str> = vec![
+            "model.layers.0.mlp.down_proj.qweight",
+            "model.layers.1.mlp.down_proj.qweight",
+        ];
+
+        let rows = aggregate_diff_collapse(&names, &tensors_a, &tensors_b, DiffCollapseSide::OnlyB);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pattern, "model.layers.{N}.mlp.down_proj.qweight");
+        assert_eq!(rows[0].tensors, 2);
+        assert_eq!(rows[0].bytes, 80);
+        assert!(rows[0].bytes_b.is_none());
+    }
+
+    #[test]
+    fn aggregate_diff_collapse_differ_populates_both_sides_and_sorts_by_bytes_desc() {
+        let tensors_a: HashMap<String, inspect::TensorInfo> = [
+            (
+                "model.layers.0.input_layernorm.weight".to_owned(),
+                make_tensor_info(
+                    "model.layers.0.input_layernorm.weight",
+                    "F16",
+                    vec![100],
+                    200,
+                ),
+            ),
+            (
+                "model.embed_tokens.weight".to_owned(),
+                make_tensor_info("model.embed_tokens.weight", "F16", vec![1000, 100], 200_000),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let tensors_b: HashMap<String, inspect::TensorInfo> = [
+            (
+                "model.layers.0.input_layernorm.weight".to_owned(),
+                make_tensor_info(
+                    "model.layers.0.input_layernorm.weight",
+                    "BF16",
+                    vec![100],
+                    200,
+                ),
+            ),
+            (
+                "model.embed_tokens.weight".to_owned(),
+                make_tensor_info(
+                    "model.embed_tokens.weight",
+                    "BF16",
+                    vec![1000, 100],
+                    200_000,
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<&str> = vec![
+            "model.layers.0.input_layernorm.weight",
+            "model.embed_tokens.weight",
+        ];
+
+        let rows =
+            aggregate_diff_collapse(&names, &tensors_a, &tensors_b, DiffCollapseSide::Differ);
+        assert_eq!(rows.len(), 2);
+        // Sorted by bytes descending — the larger embed_tokens row comes first.
+        assert_eq!(rows[0].pattern, "model.embed_tokens.weight");
+        assert_eq!(rows[0].bytes, 200_000);
+        assert_eq!(rows[0].bytes_b, Some(200_000));
+        assert_eq!(rows[1].pattern, "model.layers.{N}.input_layernorm.weight");
+        assert_eq!(rows[1].bytes, 200);
+        assert_eq!(rows[1].bytes_b, Some(200));
     }
 
     #[test]

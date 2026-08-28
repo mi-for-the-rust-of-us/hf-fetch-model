@@ -2680,6 +2680,22 @@ fn peek_bytes_without_head_or_tail_is_rejected() {
     );
 }
 
+#[test]
+fn diff_collapse_and_dtypes_conflict() {
+    let (_stdout, stderr, success) =
+        run(hf_fm().args(["diff", "a/b", "c/d", "--collapse", "--dtypes"]));
+    assert!(!success, "--collapse and --dtypes must conflict");
+    assert!(stderr.contains("cannot be used with"), "got:\n{stderr}");
+}
+
+#[test]
+fn diff_collapse_and_summary_conflict() {
+    let (_stdout, stderr, success) =
+        run(hf_fm().args(["diff", "a/b", "c/d", "--collapse", "--summary"]));
+    assert!(!success, "--collapse and --summary must conflict");
+    assert!(stderr.contains("cannot be used with"), "got:\n{stderr}");
+}
+
 // -----------------------------------------------------------------------
 // diff subcommand (cache-only tests — no network)
 // -----------------------------------------------------------------------
@@ -2822,6 +2838,89 @@ fn diff_cached_dtypes_json_has_histograms() {
     assert!(
         hist.contains_key("a") && hist.contains_key("b"),
         "dtype_histograms must carry a and b sides, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn diff_cached_collapse_json_is_additive() {
+    // Find two different cached repos with safetensors — a self-diff has
+    // nothing in only_a/only_b/differ, which wouldn't exercise grouping.
+    let repos = find_all_cached_safetensors_repos();
+    // INDEX: length checked before access
+    let (Some(repo_a), Some(repo_b)) = (repos.first(), repos.get(1)) else {
+        eprintln!("SKIP: need at least 2 cached safetensors repos for diff --collapse test");
+        return;
+    };
+
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff",
+        repo_a.as_str(),
+        repo_b.as_str(),
+        "--cached",
+        "--collapse",
+        "--json",
+    ]));
+    assert!(success, "diff --collapse --json should succeed: {stderr}");
+
+    // REAL validation: `collapsed` is additive — the flat only_a/only_b/differ
+    // arrays stay populated exactly as without --collapse, so existing `jq`
+    // recipes against them keep working.
+    let v = parse_json(&stdout);
+    let flat_only_a = v
+        .get("only_a")
+        .and_then(Value::as_array)
+        .expect("flat only_a array must still be present under --collapse");
+    let collapsed = v
+        .get("collapsed")
+        .and_then(Value::as_object)
+        .expect("--collapse --json must add a collapsed object");
+    for section in ["only_a", "only_b", "differ"] {
+        assert!(
+            collapsed.contains_key(section),
+            "collapsed must carry {section}, got:\n{stdout}"
+        );
+    }
+    let collapsed_only_a = collapsed
+        .get("only_a")
+        .and_then(Value::as_array)
+        .expect("collapsed.only_a must be an array");
+    // Grouping cannot produce more rows than raw tensors — each group has >= 1 member.
+    assert!(
+        collapsed_only_a.len() <= flat_only_a.len(),
+        "collapsed.only_a ({}) must not exceed flat only_a ({}), got:\n{stdout}",
+        collapsed_only_a.len(),
+        flat_only_a.len()
+    );
+    // Every group row carries the expected shape.
+    for row in collapsed_only_a {
+        assert!(row.get("pattern").and_then(Value::as_str).is_some());
+        assert!(row.get("tensors").and_then(Value::as_u64).is_some());
+        assert!(row.get("bytes").and_then(Value::as_u64).is_some());
+    }
+}
+
+#[test]
+fn diff_cached_collapse_human_output_shows_patterns() {
+    let repos = find_all_cached_safetensors_repos();
+    // INDEX: length checked before access
+    let (Some(repo_a), Some(repo_b)) = (repos.first(), repos.get(1)) else {
+        eprintln!("SKIP: need at least 2 cached safetensors repos for diff --collapse test");
+        return;
+    };
+
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff",
+        repo_a.as_str(),
+        repo_b.as_str(),
+        "--cached",
+        "--collapse",
+    ]));
+    assert!(success, "diff --collapse should succeed: {stderr}");
+    // The footer line always names pattern counts per section, even when a
+    // section is empty (e.g. "only-A: 0 tensors (0 patterns)").
+    assert!(
+        stdout.contains("patterns"),
+        "collapse output should mention pattern grouping, got:\n{stdout}"
     );
 }
 
