@@ -39,6 +39,11 @@ fn parse_json(stdout: &str) -> Value {
         .unwrap_or_else(|e| panic!("output must be valid JSON ({e}), got:\n{stdout}"))
 }
 
+/// Creates a fresh, empty temp directory to use as an isolated `HF_HOME`.
+fn temp_hf_home() -> tempfile::TempDir {
+    tempfile::tempdir().expect("failed to create temp HF_HOME")
+}
+
 /// Runs a command with `HF_HOME` pointed at a fresh, empty temp directory,
 /// isolating it from the shared global cache other tests read.
 ///
@@ -47,7 +52,7 @@ fn parse_json(stdout: &str) -> Value {
 /// commands sharing the same isolated cache) for the duration of the test;
 /// dropping it deletes the directory.
 fn run_isolated(cmd: &mut Command) -> (tempfile::TempDir, String, String, bool) {
-    let dir = tempfile::tempdir().expect("failed to create temp HF_HOME");
+    let dir = temp_hf_home();
     cmd.env("HF_HOME", dir.path());
     let (stdout, stderr, success) = run(cmd);
     (dir, stdout, stderr, success)
@@ -587,7 +592,7 @@ fn cache_delete_nonexistent_repo() {
     // already created the shared global cache raced under parallel test
     // execution and, worse, could pass without exercising this path at
     // all (see CHANGELOG.md [0.11.3] "Known issue").
-    let dir = tempfile::tempdir().expect("failed to create temp HF_HOME");
+    let dir = temp_hf_home();
     std::fs::create_dir_all(dir.path().join("hub")).expect("failed to create hub dir");
 
     let (_, stderr, success) = run(hf_fm()
@@ -2719,6 +2724,44 @@ fn help_shows_diff_subcommand() {
 }
 
 #[test]
+fn diff_json_on_repo_with_no_safetensors_is_valid_json() {
+    // REAL validation: a repo with no .safetensors files under --json must
+    // still emit valid, parseable JSON (not the plain-text hint), or a
+    // script piping through `| jq` breaks despite the process exiting 0.
+    // bluelightai/clt-qwen3-1.7b-base-20k has no .safetensors of its own.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff",
+        "bluelightai/clt-qwen3-1.7b-base-20k",
+        "openai/gpt-oss-20b",
+        "--json",
+    ]));
+    assert!(success, "diff --json should still exit 0: {stderr}");
+    let v = parse_json(&stdout);
+    assert!(
+        v.get("only_a").and_then(Value::as_array).is_some(),
+        "only_a must be a valid array, not a plain-text hint, got:\n{stdout}"
+    );
+    assert!(
+        v.get("only_b").and_then(Value::as_array).is_some(),
+        "only_b must be a valid array, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn diff_both_sides_empty_reports_both() {
+    // REAL validation: when both repos have no .safetensors files, both
+    // must be named -- not just the first.
+    let (stdout, stderr, success) =
+        run(hf_fm().args(["diff", "julien-c/dummy-unknown", "julien-c/dummy-unknown"]));
+    assert!(success, "should still exit 0: {stderr}");
+    let occurrences = stdout.matches("No .safetensors files found").count();
+    assert_eq!(
+        occurrences, 2,
+        "should report the missing files message once per side, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn diff_cached_identical_model() {
     let Some((repo_id, _filename)) = find_cached_safetensors_repo() else {
         eprintln!("SKIP: no cached safetensors repo found");
@@ -3194,6 +3237,66 @@ fn diff_config_missing_config_json_reports_hint() {
     assert!(
         stdout.contains("No config.json found"),
         "should report the missing config.json, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn diff_config_json_on_missing_config_is_valid_json() {
+    // REAL validation: a missing config.json under --json must still emit
+    // valid, parseable JSON (not the plain-text hint), or a script piping
+    // through `| jq` breaks despite the process exiting 0.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff-config",
+        "bluelightai/clt-qwen3-1.7b-base-20k",
+        "openai/gpt-oss-20b",
+        "--json",
+    ]));
+    assert!(
+        success,
+        "diff-config --json on a repo with no config.json should still exit 0: {stderr}"
+    );
+    let v = parse_json(&stdout);
+    let missing = v
+        .get("missing")
+        .and_then(Value::as_array)
+        .expect("missing must be a JSON array");
+    assert_eq!(
+        missing,
+        &vec![Value::String(
+            "bluelightai/clt-qwen3-1.7b-base-20k".to_owned()
+        )],
+        "missing should name exactly the repo with no config.json, got:\n{stdout}"
+    );
+    assert_eq!(
+        v.get("fields").and_then(Value::as_array).map(Vec::len),
+        Some(0),
+        "fields must be empty when a side is missing, got:\n{stdout}"
+    );
+    assert_eq!(
+        v.get("differing_count").and_then(Value::as_u64),
+        Some(0),
+        "differing_count must be 0 when a side is missing, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn diff_config_both_sides_missing_reports_both() {
+    // REAL validation: when both repos lack config.json, both must be
+    // named -- not just the first, which would leave the user fixing A
+    // only to hit the identical message for B on the next run.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff-config",
+        "bluelightai/clt-qwen3-1.7b-base-20k",
+        "bluelightai/clt-qwen3-0.6b-base-20k",
+    ]));
+    assert!(success, "should still exit 0: {stderr}");
+    assert!(
+        stdout.contains("bluelightai/clt-qwen3-1.7b-base-20k"),
+        "should name the first missing repo, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("bluelightai/clt-qwen3-0.6b-base-20k"),
+        "should also name the second missing repo, got:\n{stdout}"
     );
 }
 

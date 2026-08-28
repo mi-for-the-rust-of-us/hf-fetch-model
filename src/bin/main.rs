@@ -4302,15 +4302,24 @@ fn run_diff(
     let tensors_b = collect_repo_tensors(repo_b, revision_b, token, cached)
         .map_err(|e| enrich_gated_content_error(e, repo_b, token))?;
 
-    if tensors_a.is_empty() {
-        println!("No .safetensors files found in {repo_a}.");
-        println!("Hint: use `hf-fm list-files {repo_a}` to see available file types");
-        return Ok(());
-    }
-    if tensors_b.is_empty() {
-        println!("No .safetensors files found in {repo_b}.");
-        println!("Hint: use `hf-fm list-files {repo_b}` to see available file types");
-        return Ok(());
+    // Text mode only: report every empty repo up front with a friendly hint
+    // — checking both sides, not just A, so fixing repo A doesn't just
+    // reveal the same message for repo B on the next run. `--json` skips
+    // this: an empty repo still flows through the normal classification
+    // below into a valid (if unremarkable) DiffResult, rather than the
+    // plain-text hint breaking a script's `--json | jq` pipeline.
+    if !json {
+        let empty: Vec<&str> = [(repo_a, &tensors_a), (repo_b, &tensors_b)]
+            .into_iter()
+            .filter_map(|(repo, tensors)| tensors.is_empty().then_some(repo))
+            .collect();
+        if !empty.is_empty() {
+            for repo in empty {
+                println!("No .safetensors files found in {repo}.");
+                println!("Hint: use `hf-fm list-files {repo}` to see available file types");
+            }
+            return Ok(());
+        }
     }
 
     // Collect all tensor names from both repos (BTreeSet deduplicates and sorts).
@@ -4657,9 +4666,9 @@ fn print_diff_json(
     // — `--limit` bounds only the flat entries below, not the aggregation.
     let collapsed = if collapse {
         Some(DiffCollapsed {
-            only_a: aggregate_diff_collapse(only_a, tensors_a, tensors_b, DiffCollapseSide::OnlyA),
-            only_b: aggregate_diff_collapse(only_b, tensors_a, tensors_b, DiffCollapseSide::OnlyB),
-            differ: aggregate_diff_collapse(differ, tensors_a, tensors_b, DiffCollapseSide::Differ),
+            only_a: aggregate_diff_collapse(only_a, tensors_a, None),
+            only_b: aggregate_diff_collapse(only_b, tensors_b, None),
+            differ: aggregate_diff_collapse(differ, tensors_a, Some(tensors_b)),
         })
     } else {
         None
@@ -4788,9 +4797,14 @@ fn format_count_delta(delta: i64) -> String {
 }
 
 /// Computes a column's display width: the header's width, widened to fit
-/// every already-formatted cell in that column. Shared by the diff-family
-/// text tables (`diff --collapse`, `diff-config`) so each doesn't reimplement
-/// the same "start at header width, `.max()` over every cell" loop.
+/// every already-formatted cell in that column. Shared by `diff --collapse`'s
+/// and `diff-config`'s text tables so each doesn't reimplement the same
+/// "start at header width, `.max()` over every cell" loop. `diff --dtypes`'s
+/// own `diff_dtypes_column_widths` predates this helper and is deliberately
+/// left as-is — it's shipped, has its own regression test tied to its exact
+/// struct shape, and its width scan runs in a different (`BTreeSet`) order
+/// than its print loop's bytes-sorted order, making a safe migration more
+/// involved than the payoff justifies.
 fn column_width<'a>(header: &str, cells: impl IntoIterator<Item = &'a str>) -> usize {
     cells.into_iter().fold(header.chars().count(), |w, cell| {
         w.max(cell.chars().count())
@@ -5035,21 +5049,6 @@ fn collapse_numeric_segments(name: &str) -> String {
     out
 }
 
-/// Which side(s) of a diff section a [`DiffCollapseGroup`]'s byte totals
-/// summarize. `OnlyA` and `OnlyB` populate `bytes` from the one side that has
-/// the tensor; `Differ` populates both `bytes` (side A) and `bytes_b` (side B).
-#[derive(Clone, Copy)]
-#[allow(clippy::exhaustive_enums)] // EXHAUSTIVE: crate-private dispatch enum; matched exhaustively in aggregate_diff_collapse
-enum DiffCollapseSide {
-    /// Rows drawn from the only-in-A section; `bytes` sums side A.
-    OnlyA,
-    /// Rows drawn from the only-in-B section; `bytes` sums side B.
-    OnlyB,
-    /// Rows drawn from the dtype/shape-differences section; `bytes` sums side
-    /// A and `bytes_b` sums side B.
-    Differ,
-}
-
 /// One pattern-grouped row under `diff --collapse`.
 #[derive(serde::Serialize)]
 struct DiffCollapseGroup {
@@ -5076,14 +5075,15 @@ fn sum_named_tensor_bytes(members: &[&str], tensors: &HashMap<String, inspect::T
 }
 
 /// Groups a diff section's tensor names by numeric-collapsed pattern, summing
-/// byte counts per group. Sorted by `bytes` descending, pattern ascending as a
-/// tiebreak (pattern collisions are common — unlike dtype names, which are few
-/// and distinct, so [`aggregate_diff_dtypes`] never needed one). Pure — no I/O.
+/// byte counts per group. `bytes` always sums `primary`; when `secondary` is
+/// `Some` (the `differ` section — the only one with two sides), `bytes_b`
+/// sums it too. Sorted by `bytes` descending, pattern ascending as a tiebreak
+/// (pattern collisions are common — unlike dtype names, which are few and
+/// distinct, so [`aggregate_diff_dtypes`] never needed one). Pure — no I/O.
 fn aggregate_diff_collapse(
     names: &[&str],
-    tensors_a: &HashMap<String, inspect::TensorInfo>,
-    tensors_b: &HashMap<String, inspect::TensorInfo>,
-    side: DiffCollapseSide,
+    primary: &HashMap<String, inspect::TensorInfo>,
+    secondary: Option<&HashMap<String, inspect::TensorInfo>>,
 ) -> Vec<DiffCollapseGroup> {
     let mut by_pattern: HashMap<String, Vec<&str>> = HashMap::new();
     for name in names {
@@ -5092,15 +5092,6 @@ fn aggregate_diff_collapse(
             .or_default()
             .push(name);
     }
-
-    // `bytes` always sums the primary side; `secondary` (Differ only) also
-    // sums the other side into `bytes_b`. Collapses the three near-identical
-    // OnlyA/OnlyB/Differ branches into one primary/secondary selection.
-    let (primary, secondary): (&HashMap<String, inspect::TensorInfo>, Option<_>) = match side {
-        DiffCollapseSide::OnlyA => (tensors_a, None),
-        DiffCollapseSide::OnlyB => (tensors_b, None),
-        DiffCollapseSide::Differ => (tensors_a, Some(tensors_b)),
-    };
 
     let mut rows: Vec<DiffCollapseGroup> = by_pattern
         .into_iter()
@@ -5226,16 +5217,15 @@ fn print_diff_collapse(
 
     let cap = limit.unwrap_or(usize::MAX);
 
-    let rows_a = aggregate_diff_collapse(only_a, tensors_a, tensors_b, DiffCollapseSide::OnlyA);
+    let rows_a = aggregate_diff_collapse(only_a, tensors_a, None);
     if !rows_a.is_empty() {
         print_diff_collapse_section("Only in A", &rows_a, cap, only_a.len());
     }
-    let rows_b = aggregate_diff_collapse(only_b, tensors_a, tensors_b, DiffCollapseSide::OnlyB);
+    let rows_b = aggregate_diff_collapse(only_b, tensors_b, None);
     if !rows_b.is_empty() {
         print_diff_collapse_section("Only in B", &rows_b, cap, only_b.len());
     }
-    let rows_differ =
-        aggregate_diff_collapse(differ, tensors_a, tensors_b, DiffCollapseSide::Differ);
+    let rows_differ = aggregate_diff_collapse(differ, tensors_a, Some(tensors_b));
     if !rows_differ.is_empty() {
         print_diff_collapse_differ(&rows_differ, cap, differ.len());
     }
@@ -5456,9 +5446,16 @@ struct DiffConfigResult {
     repo_a: String,
     /// Model B repository identifier.
     repo_b: String,
-    /// One row per `ModelConfig` field.
+    /// Repo IDs (a subset of `repo_a`/`repo_b`) with no `config.json` — under
+    /// `--cached`, this also covers a cache miss (the file exists on the Hub
+    /// but isn't downloaded locally). `fields` is empty and `differing_count`
+    /// is `0` whenever this is non-empty, since a field-by-field diff needs
+    /// both sides present.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing: Vec<String>,
+    /// One row per `ModelConfig` field. Empty when either side is `missing`.
     fields: Vec<ConfigFieldDiff>,
-    /// Number of fields where `a != b`.
+    /// Number of fields where `a != b`. `0` when either side is `missing`.
     differing_count: usize,
 }
 
@@ -5488,8 +5485,8 @@ fn missing_config_hint(cached: bool) -> &'static str {
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the network request fails (non-`--cached`).
-/// Returns [`FetchError::Io`] if a cached `config.json` cannot be read, or the
-/// async runtime cannot be created (non-`--cached`).
+/// Returns [`FetchError::Io`] if a cached `config.json` cannot be read.
+/// Returns [`FetchError::Io`] if the async runtime cannot be created (non-`--cached`).
 /// Returns [`FetchError::SafetensorsHeader`] if a fetched `config.json` is malformed.
 #[allow(clippy::too_many_arguments)] // diff-family orchestration function; mirrors run_diff's shape
 fn run_diff_config(
@@ -5532,17 +5529,36 @@ fn run_diff_config(
         )
     };
 
-    let print_missing = |repo: &str| {
-        println!("No config.json found in {repo}.");
-        println!("{}", missing_config_hint(cached));
-    };
-    let Some(config_a) = config_a else {
-        print_missing(repo_a);
+    // Collect every side that's missing (not just the first) so both --json
+    // and text mode report the full picture in one run, rather than the user
+    // fixing repo A only to hit the same message for repo B on the next try.
+    let missing: Vec<&str> = [(repo_a, &config_a), (repo_b, &config_b)]
+        .into_iter()
+        .filter_map(|(repo, config)| config.is_none().then_some(repo))
+        .collect();
+
+    if !missing.is_empty() {
+        if json {
+            let result = DiffConfigResult {
+                // BORROW: explicit .to_owned() for &str → owned String
+                repo_a: repo_a.to_owned(),
+                // BORROW: explicit .to_owned() for &str → owned String
+                repo_b: repo_b.to_owned(),
+                missing: missing.into_iter().map(str::to_owned).collect(),
+                fields: Vec::new(),
+                differing_count: 0,
+            };
+            return emit_json(&result);
+        }
+        for repo in missing {
+            println!("No config.json found in {repo}.");
+            println!("{}", missing_config_hint(cached));
+        }
         return Ok(());
-    };
-    let Some(config_b) = config_b else {
-        print_missing(repo_b);
-        return Ok(());
+    }
+    // EXPLICIT: missing is empty, so both fetches produced Some(...) above.
+    let (Some(config_a), Some(config_b)) = (config_a, config_b) else {
+        unreachable!("missing.is_empty() guarantees both configs are Some")
     };
 
     let fields = build_config_diff_rows(&config_a, &config_b);
@@ -5554,6 +5570,7 @@ fn run_diff_config(
             repo_a: repo_a.to_owned(),
             // BORROW: explicit .to_owned() for &str → owned String
             repo_b: repo_b.to_owned(),
+            missing: Vec::new(),
             fields,
             differing_count,
         };
@@ -6446,96 +6463,95 @@ fn try_collapse_range(branch: &BranchNode) -> Option<TreeNode> {
 
     let n = indexed.len();
     // Candidates in order of preference (most-collapsed first): ascending total
-    // skip (`skip_front + skip_back`), preferring to skip from the front first at
-    // equal totals. This exactly reproduces the `v0.11.4` four-case order
-    // `(0,0), (1,0), (0,1), (1,1)` when `MAX_EDGE_OUTLIERS == 1`. `n` is a
-    // tensor-name nesting width — never near `usize::MAX` — so `skip_front +
-    // skip_back` cannot overflow.
-    for total in 0..=MAX_EDGE_OUTLIERS.saturating_mul(2) {
-        let skip_front_min = total.saturating_sub(MAX_EDGE_OUTLIERS);
-        let skip_front_max = total.min(MAX_EDGE_OUTLIERS);
-        for skip_front in (skip_front_min..=skip_front_max).rev() {
-            // EXPLICIT: skip_front <= total by construction (skip_front_max <=
-            // total), so this subtraction cannot underflow.
-            let skip_back = total - skip_front;
-            if skip_front + skip_back >= n {
-                continue;
-            }
-            // INDEX: `skip_front + skip_back < n` just checked, so this range is valid.
-            #[allow(clippy::indexing_slicing)]
-            let inner = &indexed[skip_front..n - skip_back];
-            // A single collapsed instance isn't a range; need at least 2 to group.
-            if inner.len() < 2 {
-                continue;
-            }
-            // INDEX: inner.len() >= 2 just checked, so inner[0] and inner[1..] are valid.
-            #[allow(clippy::indexing_slicing)]
-            let (start_idx, template_branch) = inner[0];
-            #[allow(clippy::indexing_slicing)]
-            let uniform = inner[1..]
-                .iter()
-                .all(|(_, other)| branches_structurally_equal(template_branch, other));
-            if !uniform {
-                continue;
-            }
+    // skip (`skip_front + skip_back`), preferring to skip from the front first
+    // at equal totals — i.e. ascending `skip_back` as the tiebreak. This
+    // exactly reproduces the `v0.11.4` four-case order `(0,0), (1,0), (0,1),
+    // (1,1)` when `MAX_EDGE_OUTLIERS == 1`.
+    let mut candidates: Vec<(usize, usize)> = (0..=MAX_EDGE_OUTLIERS)
+        .flat_map(|skip_front| {
+            (0..=MAX_EDGE_OUTLIERS).map(move |skip_back| (skip_front, skip_back))
+        })
+        .collect();
+    candidates.sort_by_key(|&(skip_front, skip_back)| (skip_front + skip_back, skip_back));
 
-            let count = inner.len();
-            // CAST: usize → u64, count is bounded by tensor-name nesting width, never
-            // near u64::MAX
-            #[allow(clippy::as_conversions)]
-            let count_u64 = count as u64;
-            let ranged = RangedNode {
-                // A partial collapse keeps the parent as a real `Branch` header above
-                // it (see below), so the range prints as bare `[1..11]`, no repeated
-                // segment. A full collapse has no wrapping `Branch` — the `Ranged`
-                // node IS the branch's replacement — so it carries the original
-                // segment, unchanged from `v0.9.6`'s `blocks.[0..11]` rendering.
-                segment: if skip_front == 0 && skip_back == 0 {
-                    branch.segment.clone()
-                } else {
-                    String::new()
-                },
-                range_start: start_idx,
-                range_end: start_idx.saturating_add(count).saturating_sub(1),
-                template: template_branch.children.clone(),
-                // Structurally-equal siblings have identical per-instance totals (same
-                // shapes and dtypes imply identical byte_len/params), so multiplying
-                // the template's own totals by the instance count is exact, not an
-                // approximation.
-                total_tensors: template_branch.total_tensors.saturating_mul(count),
-                total_params: template_branch.total_params.saturating_mul(count_u64),
-                total_bytes: template_branch.total_bytes.saturating_mul(count_u64),
-            };
-
-            if skip_front == 0 && skip_back == 0 {
-                return Some(TreeNode::Ranged(ranged));
-            }
-
-            // Partial collapse: keep the outlier(s) as individual branches, in
-            // position, alongside the one collapsed range.
-            let mut children =
-                Vec::with_capacity(skip_front.saturating_add(1).saturating_add(skip_back));
-            // INDEX: `skip_front < n` (checked via `skip_front + skip_back < n` above)
-            #[allow(clippy::indexing_slicing)]
-            for (_, b) in &indexed[..skip_front] {
-                children.push(TreeNode::Branch((*b).clone()));
-            }
-            children.push(TreeNode::Ranged(ranged));
-            // INDEX: `n - skip_back <= n` by construction
-            #[allow(clippy::indexing_slicing)]
-            for (_, b) in &indexed[n - skip_back..] {
-                children.push(TreeNode::Branch((*b).clone()));
-            }
-            return Some(TreeNode::Branch(BranchNode {
-                segment: branch.segment.clone(),
-                children,
-                // Unchanged: regrouping the same children into outliers + one Ranged
-                // node doesn't change which tensors exist under this branch.
-                total_tensors: branch.total_tensors,
-                total_params: branch.total_params,
-                total_bytes: branch.total_bytes,
-            }));
+    for (skip_front, skip_back) in candidates {
+        if skip_front + skip_back >= n {
+            continue;
         }
+        // INDEX: `skip_front + skip_back < n` just checked, so this range is valid.
+        #[allow(clippy::indexing_slicing)]
+        let inner = &indexed[skip_front..n - skip_back];
+        // A single collapsed instance isn't a range; need at least 2 to group.
+        if inner.len() < 2 {
+            continue;
+        }
+        // INDEX: inner.len() >= 2 just checked, so inner[0] and inner[1..] are valid.
+        #[allow(clippy::indexing_slicing)]
+        let (start_idx, template_branch) = inner[0];
+        #[allow(clippy::indexing_slicing)]
+        let uniform = inner[1..]
+            .iter()
+            .all(|(_, other)| branches_structurally_equal(template_branch, other));
+        if !uniform {
+            continue;
+        }
+
+        let count = inner.len();
+        // CAST: usize → u64, count is bounded by tensor-name nesting width, never
+        // near u64::MAX
+        #[allow(clippy::as_conversions)]
+        let count_u64 = count as u64;
+        let ranged = RangedNode {
+            // A partial collapse keeps the parent as a real `Branch` header above
+            // it (see below), so the range prints as bare `[1..11]`, no repeated
+            // segment. A full collapse has no wrapping `Branch` — the `Ranged`
+            // node IS the branch's replacement — so it carries the original
+            // segment, unchanged from `v0.9.6`'s `blocks.[0..11]` rendering.
+            segment: if skip_front == 0 && skip_back == 0 {
+                branch.segment.clone()
+            } else {
+                String::new()
+            },
+            range_start: start_idx,
+            range_end: start_idx.saturating_add(count).saturating_sub(1),
+            template: template_branch.children.clone(),
+            // Structurally-equal siblings have identical per-instance totals (same
+            // shapes and dtypes imply identical byte_len/params), so multiplying
+            // the template's own totals by the instance count is exact, not an
+            // approximation.
+            total_tensors: template_branch.total_tensors.saturating_mul(count),
+            total_params: template_branch.total_params.saturating_mul(count_u64),
+            total_bytes: template_branch.total_bytes.saturating_mul(count_u64),
+        };
+
+        if skip_front == 0 && skip_back == 0 {
+            return Some(TreeNode::Ranged(ranged));
+        }
+
+        // Partial collapse: keep the outlier(s) as individual branches, in
+        // position, alongside the one collapsed range.
+        let mut children =
+            Vec::with_capacity(skip_front.saturating_add(1).saturating_add(skip_back));
+        // INDEX: `skip_front < n` (checked via `skip_front + skip_back < n` above)
+        #[allow(clippy::indexing_slicing)]
+        for (_, b) in &indexed[..skip_front] {
+            children.push(TreeNode::Branch((*b).clone()));
+        }
+        children.push(TreeNode::Ranged(ranged));
+        // INDEX: `n - skip_back <= n` by construction
+        #[allow(clippy::indexing_slicing)]
+        for (_, b) in &indexed[n - skip_back..] {
+            children.push(TreeNode::Branch((*b).clone()));
+        }
+        return Some(TreeNode::Branch(BranchNode {
+            segment: branch.segment.clone(),
+            children,
+            // Unchanged: regrouping the same children into outliers + one Ranged
+            // node doesn't change which tensors exist under this branch.
+            total_tensors: branch.total_tensors,
+            total_params: branch.total_params,
+            total_bytes: branch.total_bytes,
+        }));
     }
 
     None
@@ -10097,14 +10113,13 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let tensors_b: HashMap<String, inspect::TensorInfo> = HashMap::new();
         let names: Vec<&str> = vec![
             "model.layers.0.mlp.gate_proj.weight_scale",
             "model.layers.1.mlp.gate_proj.weight_scale",
             "lm_head.weight",
         ];
 
-        let rows = aggregate_diff_collapse(&names, &tensors_a, &tensors_b, DiffCollapseSide::OnlyA);
+        let rows = aggregate_diff_collapse(&names, &tensors_a, None);
         assert_eq!(rows.len(), 2, "two distinct patterns");
         let layer_row = rows
             .iter()
@@ -10123,7 +10138,6 @@ mod tests {
 
     #[test]
     fn aggregate_diff_collapse_only_b_sums_from_b_side() {
-        let tensors_a: HashMap<String, inspect::TensorInfo> = HashMap::new();
         let tensors_b: HashMap<String, inspect::TensorInfo> = [
             (
                 "model.layers.0.mlp.down_proj.qweight".to_owned(),
@@ -10141,7 +10155,7 @@ mod tests {
             "model.layers.1.mlp.down_proj.qweight",
         ];
 
-        let rows = aggregate_diff_collapse(&names, &tensors_a, &tensors_b, DiffCollapseSide::OnlyB);
+        let rows = aggregate_diff_collapse(&names, &tensors_b, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pattern, "model.layers.{N}.mlp.down_proj.qweight");
         assert_eq!(rows[0].tensors, 2);
@@ -10195,8 +10209,7 @@ mod tests {
             "model.embed_tokens.weight",
         ];
 
-        let rows =
-            aggregate_diff_collapse(&names, &tensors_a, &tensors_b, DiffCollapseSide::Differ);
+        let rows = aggregate_diff_collapse(&names, &tensors_a, Some(&tensors_b));
         assert_eq!(rows.len(), 2);
         // Sorted by bytes descending — the larger embed_tokens row comes first.
         assert_eq!(rows[0].pattern, "model.embed_tokens.weight");
