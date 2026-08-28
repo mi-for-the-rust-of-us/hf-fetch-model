@@ -2843,20 +2843,16 @@ fn diff_cached_dtypes_json_has_histograms() {
 
 #[test]
 fn diff_cached_collapse_json_is_additive() {
-    // Find two different cached repos with safetensors — a self-diff has
-    // nothing in only_a/only_b/differ, which wouldn't exercise grouping.
-    let repos = find_all_cached_safetensors_repos();
-    // INDEX: length checked before access
-    let (Some(repo_a), Some(repo_b)) = (repos.first(), repos.get(1)) else {
-        eprintln!("SKIP: need at least 2 cached safetensors repos for diff --collapse test");
-        return;
-    };
-
+    // gpt-oss 20b/120b: the real scaled-sibling pair used for --collapse's
+    // own live validation during implementation and documented in
+    // README.md/docs/FAQ.md — deterministic across machines (network, not
+    // --cached) unlike an arbitrary pair of whatever happens to be cached.
+    // The exact counts below are live-verified against the real Hub state;
+    // if the upstream repos ever change shape, this test is the tripwire.
     let (stdout, stderr, success) = run(hf_fm().args([
         "diff",
-        repo_a.as_str(),
-        repo_b.as_str(),
-        "--cached",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
         "--collapse",
         "--json",
     ]));
@@ -2866,10 +2862,15 @@ fn diff_cached_collapse_json_is_additive() {
     // arrays stay populated exactly as without --collapse, so existing `jq`
     // recipes against them keep working.
     let v = parse_json(&stdout);
-    let flat_only_a = v
-        .get("only_a")
+    let flat_only_b = v
+        .get("only_b")
         .and_then(Value::as_array)
-        .expect("flat only_a array must still be present under --collapse");
+        .expect("flat only_b array must still be present under --collapse");
+    assert_eq!(
+        flat_only_b.len(),
+        408,
+        "known only-B tensor count for this pair, got:\n{stdout}"
+    );
     let collapsed = v
         .get("collapsed")
         .and_then(Value::as_object)
@@ -2880,19 +2881,17 @@ fn diff_cached_collapse_json_is_additive() {
             "collapsed must carry {section}, got:\n{stdout}"
         );
     }
-    let collapsed_only_a = collapsed
-        .get("only_a")
+    let collapsed_only_b = collapsed
+        .get("only_b")
         .and_then(Value::as_array)
-        .expect("collapsed.only_a must be an array");
-    // Grouping cannot produce more rows than raw tensors — each group has >= 1 member.
-    assert!(
-        collapsed_only_a.len() <= flat_only_a.len(),
-        "collapsed.only_a ({}) must not exceed flat only_a ({}), got:\n{stdout}",
-        collapsed_only_a.len(),
-        flat_only_a.len()
+        .expect("collapsed.only_b must be an array");
+    assert_eq!(
+        collapsed_only_b.len(),
+        31,
+        "known only-B pattern count for this pair, got:\n{stdout}"
     );
     // Every group row carries the expected shape.
-    for row in collapsed_only_a {
+    for row in collapsed_only_b {
         assert!(row.get("pattern").and_then(Value::as_str).is_some());
         assert!(row.get("tensors").and_then(Value::as_u64).is_some());
         assert!(row.get("bytes").and_then(Value::as_u64).is_some());
@@ -2901,18 +2900,10 @@ fn diff_cached_collapse_json_is_additive() {
 
 #[test]
 fn diff_cached_collapse_human_output_shows_patterns() {
-    let repos = find_all_cached_safetensors_repos();
-    // INDEX: length checked before access
-    let (Some(repo_a), Some(repo_b)) = (repos.first(), repos.get(1)) else {
-        eprintln!("SKIP: need at least 2 cached safetensors repos for diff --collapse test");
-        return;
-    };
-
     let (stdout, stderr, success) = run(hf_fm().args([
         "diff",
-        repo_a.as_str(),
-        repo_b.as_str(),
-        "--cached",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
         "--collapse",
     ]));
     assert!(success, "diff --collapse should succeed: {stderr}");
@@ -2921,6 +2912,12 @@ fn diff_cached_collapse_human_output_shows_patterns() {
     assert!(
         stdout.contains("patterns"),
         "collapse output should mention pattern grouping, got:\n{stdout}"
+    );
+    // Known collapsed pattern for this pair (a MoE expert-weight tensor
+    // family), live-verified during implementation.
+    assert!(
+        stdout.contains("model.layers.{N}.mlp.experts"),
+        "collapse output should show the known expert-weight pattern, got:\n{stdout}"
     );
 }
 
