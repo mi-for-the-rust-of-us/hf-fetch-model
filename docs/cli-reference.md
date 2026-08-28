@@ -342,6 +342,24 @@ hf-fm diff openai/gpt-oss-20b openai/gpt-oss-120b --cached --limit 5
 hf-fm diff RedHatAI/Llama-3.2-1B-Instruct-FP8 casperhansen/llama-3.2-1b-instruct-awq --cached --json
 ```
 
+## Diff-config examples
+
+Field-by-field comparison of `config.json`'s architecture fields — complements `diff`'s tensor-level view.
+
+```sh
+# Compare architecture fields between two model variants (differences only)
+hf-fm diff-config openai/gpt-oss-20b openai/gpt-oss-120b
+
+# Show every field, including ones that match on both sides
+hf-fm diff-config openai/gpt-oss-20b openai/gpt-oss-120b --all
+
+# Cache-only (no network)
+hf-fm diff-config openai/gpt-oss-20b openai/gpt-oss-120b --cached
+
+# JSON output — always carries every field (with a differs flag), regardless of --all
+hf-fm diff-config openai/gpt-oss-20b openai/gpt-oss-120b --json
+```
+
 ## Disk usage examples
 
 ```sh
@@ -531,6 +549,17 @@ Exit code is non-zero only when at least one file mismatched; `skipped` and `mis
 | `--revision-a` | Git revision for model A | main |
 | `--revision-b` | Git revision for model B | main |
 | `--summary` | Show only the summary line (counts per category; conflicts with `--dtypes` and `--collapse`) | off |
+| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+
+## Diff-config flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--all` | Also show fields that match on both sides; the default is differences only. Text-mode only — `--json` always carries every field regardless of `--all` | off |
+| `--cached` | Cache-only mode: fail if `config.json` is not cached locally | off |
+| `--json` | Output the full diff as JSON — every `ModelConfig` field, each with a `differs` flag, regardless of `--all` | off |
+| `--revision-a` | Git revision for model A | main |
+| `--revision-b` | Git revision for model B | main |
 | `--token` | Auth token (or set `HF_TOKEN` env var) | — |
 
 ## Download flags

@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-08-28, hf-fm v0.12.0 (diff --collapse) -->
+<!-- Last updated: 2026-08-28, hf-fm v0.12.0 (diff --collapse, diff-config) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -52,6 +52,7 @@ A living list of the questions we and our early users have actually run into. If
   - [How do I read a small config or README file from a repo without downloading it?](#how-do-i-read-a-small-config-or-readme-file-from-a-repo-without-downloading-it)
   - [How do I see a model's tensor names without downloading it?](#how-do-i-see-a-models-tensor-names-without-downloading-it)
   - [How do I compare two HuggingFace models structurally?](#how-do-i-compare-two-huggingface-models-structurally)
+  - [How do I compare two models' architecture, not just their tensors?](#how-do-i-compare-two-models-architecture-not-just-their-tensors)
   - [How do I know if a model fits on my GPU?](#how-do-i-know-if-a-model-fits-on-my-gpu)
   - [How do I list only the weight files in a repo, not the tokenizer and README?](#how-do-i-list-only-the-weight-files-in-a-repo-not-the-tokenizer-and-readme)
   - [How do I see what is already cached locally?](#how-do-i-see-what-is-already-cached-locally)
@@ -257,6 +258,25 @@ hf-fm diff org/model-A org/model-B --json \
 For a scaled-sibling pair this collapses `model.layers.0.self_attn.q_proj.weight`, `model.layers.1.self_attn.q_proj.weight`, … into a single `model.layers.{N}.self_attn.q_proj.weight` line with a count and a summed-byte total. The same recipe with `.only_a` swapped in does the symmetric job.
 
 That numeric-segment heuristic is now also a built-in flag: `--collapse` groups only-A / only-B / dtype-shape-differences into `Pattern / Tensors / Bytes` tables directly, no `jq` needed — reach for it first. The `jq` recipe above is still worth keeping around for cases `--collapse` doesn't cover: it only groups by digit-run substitution, independently per section (no cross-referencing between only-A and only-B, no expert-routing-aware grouping), so a different heuristic on your own pair is still a `jq` filter away.
+
+### How do I compare two models' architecture, not just their tensors?
+
+`hf-fm diff` and `--dtypes`/`--collapse` above answer *what changed in the tensors*; `hf-fm diff-config <REPO_A> <REPO_B>` answers *why* — a field-by-field diff of `config.json`'s architecture fields (layer count, hidden size, GQA/sliding-window/hybrid-layout fields, and more):
+
+```
+$ hf-fm diff-config openai/gpt-oss-20b openai/gpt-oss-120b
+
+  A: openai/gpt-oss-20b
+  B: openai/gpt-oss-120b
+
+  Field              A                                                              B
+  num_hidden_layers  24                                                             36
+  layer_types        sliding_attention, full_attention, sliding_attention, full_a…  sliding_attention, full_attention, sliding_attention, full_a…
+
+  2 of 23 fields differ
+```
+
+Reach for this when `diff --dtypes` shows a size jump and you want the architectural cause without eyeballing two raw `config.json` files side by side. Add `--all` to see matching fields too (default is differences-only); `--json` always carries every field with a `differs` flag, regardless of `--all`.
 
 ### How do I know if a model fits on my GPU?
 
