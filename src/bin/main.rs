@@ -4386,8 +4386,7 @@ fn run_diff(
     }
 
     // Print header.
-    println!("  A: {repo_a}");
-    println!("  B: {repo_b}");
+    print_diff_repo_header(repo_a, repo_b);
 
     if !summary {
         // Compute name width across only-A and only-B sections for consistent columns.
@@ -4401,14 +4400,6 @@ fn run_diff(
         // Per-section cap from `--limit` (applied after `--filter`); the full
         // vecs are left intact so the summary line keeps true counts.
         let cap = limit.unwrap_or(usize::MAX);
-        // Prints a truncation note when `--limit` cut a section short.
-        let print_limit_note = |total: usize| {
-            if let Some(n) = limit
-                && total > n
-            {
-                println!("    \u{2026} showing {n} of {total} (limit {n})");
-            }
-        };
 
         println!();
 
@@ -4426,7 +4417,7 @@ fn run_diff(
                     println!("    {name:<nw$} {:<8} {shape_str}", t.dtype);
                 }
             }
-            print_limit_note(only_a.len());
+            print_truncation_note(cap, only_a.len());
             println!();
         }
 
@@ -4444,7 +4435,7 @@ fn run_diff(
                     println!("    {name:<nw$} {:<8} {shape_str}", t.dtype);
                 }
             }
-            print_limit_note(only_b.len());
+            print_truncation_note(cap, only_b.len());
             println!();
         }
 
@@ -4465,7 +4456,7 @@ fn run_diff(
                     println!("      B: {:<8} {shape_b}", b.dtype);
                 }
             }
-            print_limit_note(differ.len());
+            print_truncation_note(cap, differ.len());
             println!();
         }
 
@@ -4796,6 +4787,34 @@ fn format_count_delta(delta: i64) -> String {
     }
 }
 
+/// Computes a column's display width: the header's width, widened to fit
+/// every already-formatted cell in that column. Shared by the diff-family
+/// text tables (`diff --collapse`, `diff-config`) so each doesn't reimplement
+/// the same "start at header width, `.max()` over every cell" loop.
+fn column_width<'a>(header: &str, cells: impl IntoIterator<Item = &'a str>) -> usize {
+    cells.into_iter().fold(header.chars().count(), |w, cell| {
+        w.max(cell.chars().count())
+    })
+}
+
+/// Prints the "… showing N of M (limit N)" truncation note when `total`
+/// exceeds `cap`; a no-op otherwise (in particular when `cap` is
+/// `usize::MAX`, i.e. no `--limit` was passed). Shared by every diff-family
+/// renderer that caps per-section rows under `--limit`.
+fn print_truncation_note(cap: usize, total: usize) {
+    if total > cap {
+        println!("    \u{2026} showing {cap} of {total} (limit {cap})");
+    }
+}
+
+/// Prints the `"A: {repo_a}"` / `"B: {repo_b}"` header shared by every
+/// `diff` / `diff-config` text renderer. Callers add their own blank line
+/// or further header content after, since that varies by renderer.
+fn print_diff_repo_header(repo_a: &str, repo_b: &str) {
+    println!("  A: {repo_a}");
+    println!("  B: {repo_b}");
+}
+
 /// Aggregates per-dtype histograms for both repos, optionally filtered by name.
 ///
 /// Returns `(rows_a, rows_b)` where each `Vec<DiffDtypeGroup>` is sorted by
@@ -4918,8 +4937,7 @@ fn print_diff_dtypes(
     let bsw = w.b_size;
     let dlw = w.delta;
 
-    println!("  A: {repo_a}");
-    println!("  B: {repo_b}");
+    print_diff_repo_header(repo_a, repo_b);
     println!();
 
     println!(
@@ -5048,6 +5066,15 @@ struct DiffCollapseGroup {
     bytes_b: Option<u64>,
 }
 
+/// Sums the on-disk byte length of every name in `members` present in `tensors`.
+fn sum_named_tensor_bytes(members: &[&str], tensors: &HashMap<String, inspect::TensorInfo>) -> u64 {
+    members
+        .iter()
+        .filter_map(|n| tensors.get(*n))
+        .map(inspect::TensorInfo::byte_len)
+        .sum()
+}
+
 /// Groups a diff section's tensor names by numeric-collapsed pattern, summing
 /// byte counts per group. Sorted by `bytes` descending, pattern ascending as a
 /// tiebreak (pattern collisions are common — unlike dtype names, which are few
@@ -5066,42 +5093,21 @@ fn aggregate_diff_collapse(
             .push(name);
     }
 
+    // `bytes` always sums the primary side; `secondary` (Differ only) also
+    // sums the other side into `bytes_b`. Collapses the three near-identical
+    // OnlyA/OnlyB/Differ branches into one primary/secondary selection.
+    let (primary, secondary): (&HashMap<String, inspect::TensorInfo>, Option<_>) = match side {
+        DiffCollapseSide::OnlyA => (tensors_a, None),
+        DiffCollapseSide::OnlyB => (tensors_b, None),
+        DiffCollapseSide::Differ => (tensors_a, Some(tensors_b)),
+    };
+
     let mut rows: Vec<DiffCollapseGroup> = by_pattern
         .into_iter()
         .map(|(pattern, members)| {
             let tensors = members.len();
-            let (bytes, bytes_b) = match side {
-                DiffCollapseSide::OnlyA => (
-                    members
-                        .iter()
-                        .filter_map(|n| tensors_a.get(*n))
-                        .map(inspect::TensorInfo::byte_len)
-                        .sum(),
-                    None,
-                ),
-                DiffCollapseSide::OnlyB => (
-                    members
-                        .iter()
-                        .filter_map(|n| tensors_b.get(*n))
-                        .map(inspect::TensorInfo::byte_len)
-                        .sum(),
-                    None,
-                ),
-                DiffCollapseSide::Differ => (
-                    members
-                        .iter()
-                        .filter_map(|n| tensors_a.get(*n))
-                        .map(inspect::TensorInfo::byte_len)
-                        .sum(),
-                    Some(
-                        members
-                            .iter()
-                            .filter_map(|n| tensors_b.get(*n))
-                            .map(inspect::TensorInfo::byte_len)
-                            .sum(),
-                    ),
-                ),
-            };
+            let bytes = sum_named_tensor_bytes(&members, primary);
+            let bytes_b = secondary.map(|s| sum_named_tensor_bytes(&members, s));
             DiffCollapseGroup {
                 pattern,
                 tensors,
@@ -5118,34 +5124,11 @@ fn aggregate_diff_collapse(
     rows
 }
 
-/// Column widths for a `diff --collapse` only-A / only-B pattern table.
-struct DiffCollapseColumnWidths {
-    /// Width of the pattern column.
-    pattern: usize,
-    /// Width of the tensor-count column.
-    tensors: usize,
-    /// Width of the byte-size column.
-    bytes: usize,
-}
-
-/// Computes dynamic column widths for a `diff --collapse` only-A / only-B table.
-fn diff_collapse_column_widths(rows: &[DiffCollapseGroup]) -> DiffCollapseColumnWidths {
-    let mut pattern_w = "Pattern".chars().count();
-    let mut tensors_w = "Tensors".chars().count();
-    let mut bytes_w = "Bytes".chars().count();
-    for r in rows {
-        pattern_w = pattern_w.max(r.pattern.chars().count());
-        tensors_w = tensors_w.max(r.tensors.to_string().chars().count());
-        bytes_w = bytes_w.max(format_size(r.bytes).chars().count());
-    }
-    DiffCollapseColumnWidths {
-        pattern: pattern_w,
-        tensors: tensors_w,
-        bytes: bytes_w,
-    }
-}
-
 /// Renders one only-A / only-B pattern-grouped table under `diff --collapse`.
+///
+/// Formats each row's cells once into `cells`, reused for both the
+/// [`column_width`] scan and the print loop below (rather than formatting
+/// every cell twice, once to measure and once to print).
 fn print_diff_collapse_section(
     label: &str,
     rows: &[DiffCollapseGroup],
@@ -5158,34 +5141,25 @@ fn print_diff_collapse_section(
         rows.len(),
         pluralize(rows.len(), "pattern", "patterns"),
     );
-    let w = diff_collapse_column_widths(rows);
-    println!(
-        "  {:<pw$}  {:>tw$}  {:>bw$}",
-        "Pattern",
-        "Tensors",
-        "Bytes",
-        pw = w.pattern,
-        tw = w.tensors,
-        bw = w.bytes,
-    );
-    for r in rows.iter().take(cap) {
-        println!(
-            "  {:<pw$}  {:>tw$}  {:>bw$}",
-            r.pattern,
-            r.tensors,
-            format_size(r.bytes),
-            pw = w.pattern,
-            tw = w.tensors,
-            bw = w.bytes,
-        );
+    let cells: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (r.tensors.to_string(), format_size(r.bytes)))
+        .collect();
+    let pw = column_width("Pattern", rows.iter().map(|r| r.pattern.as_str()));
+    let tw = column_width("Tensors", cells.iter().map(|(t, _)| t.as_str()));
+    let bw = column_width("Bytes", cells.iter().map(|(_, b)| b.as_str()));
+    println!("  {:<pw$}  {:>tw$}  {:>bw$}", "Pattern", "Tensors", "Bytes");
+    for (r, (tensors, bytes)) in rows.iter().zip(&cells).take(cap) {
+        println!("  {:<pw$}  {tensors:>tw$}  {bytes:>bw$}", r.pattern);
     }
-    if rows.len() > cap {
-        println!("    \u{2026} showing {cap} of {} (limit {cap})", rows.len());
-    }
+    print_truncation_note(cap, rows.len());
     println!();
 }
 
 /// Renders the dtype/shape-differences pattern-grouped table under `diff --collapse`.
+///
+/// Formats each row's cells (including the byte delta) once into `cells`,
+/// reused for both the [`column_width`] scan and the print loop below.
 fn print_diff_collapse_differ(rows: &[DiffCollapseGroup], cap: usize, total_tensors: usize) {
     println!(
         "  Dtype/shape differences ({total_tensors} {}, {} {}):",
@@ -5193,59 +5167,37 @@ fn print_diff_collapse_differ(rows: &[DiffCollapseGroup], cap: usize, total_tens
         rows.len(),
         pluralize(rows.len(), "pattern", "patterns"),
     );
-    let mut pattern_w = "Pattern".chars().count();
-    let mut tensors_w = "Tensors".chars().count();
-    let mut a_bytes_w = "A Bytes".chars().count();
-    let mut b_bytes_w = "B Bytes".chars().count();
-    let mut delta_w = "\u{0394} Bytes".chars().count();
-    // Delta computation is u64 → i64 via `try_from`/`unwrap_or`, not `as`;
-    // clipping to i64::MAX is safe — tensor byte counts never approach 9.2 EiB.
-    let deltas: Vec<i64> = rows
+    let cells: Vec<(String, String, String, String)> = rows
         .iter()
         .map(|r| {
+            // Delta computation is u64 → i64 via `try_from`/`unwrap_or`, not `as`;
+            // clipping to i64::MAX is safe — tensor byte counts never approach 9.2 EiB.
             let a = i64::try_from(r.bytes).unwrap_or(i64::MAX);
             let b = i64::try_from(r.bytes_b.unwrap_or(0)).unwrap_or(i64::MAX);
-            b.saturating_sub(a)
+            (
+                r.tensors.to_string(),
+                format_size(r.bytes),
+                format_size(r.bytes_b.unwrap_or(0)),
+                format_size_delta(b.saturating_sub(a)),
+            )
         })
         .collect();
-    for (r, delta) in rows.iter().zip(&deltas) {
-        pattern_w = pattern_w.max(r.pattern.chars().count());
-        tensors_w = tensors_w.max(r.tensors.to_string().chars().count());
-        a_bytes_w = a_bytes_w.max(format_size(r.bytes).chars().count());
-        b_bytes_w = b_bytes_w.max(format_size(r.bytes_b.unwrap_or(0)).chars().count());
-        delta_w = delta_w.max(format_size_delta(*delta).chars().count());
-    }
+    let pw = column_width("Pattern", rows.iter().map(|r| r.pattern.as_str()));
+    let tw = column_width("Tensors", cells.iter().map(|(t, ..)| t.as_str()));
+    let aw = column_width("A Bytes", cells.iter().map(|(_, a, ..)| a.as_str()));
+    let bw = column_width("B Bytes", cells.iter().map(|(_, _, b, _)| b.as_str()));
+    let dw = column_width("\u{0394} Bytes", cells.iter().map(|(.., d)| d.as_str()));
     println!(
         "  {:<pw$}  {:>tw$}  {:>aw$}  {:>bw$}  {:>dw$}",
-        "Pattern",
-        "Tensors",
-        "A Bytes",
-        "B Bytes",
-        "\u{0394} Bytes",
-        pw = pattern_w,
-        tw = tensors_w,
-        aw = a_bytes_w,
-        bw = b_bytes_w,
-        dw = delta_w,
+        "Pattern", "Tensors", "A Bytes", "B Bytes", "\u{0394} Bytes",
     );
-    for (r, delta) in rows.iter().zip(&deltas).take(cap) {
+    for (r, (tensors, a_bytes, b_bytes, delta)) in rows.iter().zip(&cells).take(cap) {
         println!(
-            "  {:<pw$}  {:>tw$}  {:>aw$}  {:>bw$}  {:>dw$}",
-            r.pattern,
-            r.tensors,
-            format_size(r.bytes),
-            format_size(r.bytes_b.unwrap_or(0)),
-            format_size_delta(*delta),
-            pw = pattern_w,
-            tw = tensors_w,
-            aw = a_bytes_w,
-            bw = b_bytes_w,
-            dw = delta_w,
+            "  {:<pw$}  {tensors:>tw$}  {a_bytes:>aw$}  {b_bytes:>bw$}  {delta:>dw$}",
+            r.pattern
         );
     }
-    if rows.len() > cap {
-        println!("    \u{2026} showing {cap} of {} (limit {cap})", rows.len());
-    }
+    print_truncation_note(cap, rows.len());
     println!();
 }
 
@@ -5269,8 +5221,7 @@ fn print_diff_collapse(
     filter: Option<&str>,
     limit: Option<usize>,
 ) {
-    println!("  A: {repo_a}");
-    println!("  B: {repo_b}");
+    print_diff_repo_header(repo_a, repo_b);
     println!();
 
     let cap = limit.unwrap_or(usize::MAX);
@@ -5511,35 +5462,6 @@ struct DiffConfigResult {
     differing_count: usize,
 }
 
-/// Column widths for the `diff-config` field table.
-struct DiffConfigColumnWidths {
-    /// Width of the field-name column.
-    field: usize,
-    /// Width of the A-value column.
-    a: usize,
-    /// Width of the B-value column.
-    b: usize,
-}
-
-/// Computes dynamic column widths for the `diff-config` field table.
-fn diff_config_column_widths(rows: &[&ConfigFieldDiff]) -> DiffConfigColumnWidths {
-    let mut field_w = "Field".chars().count();
-    let mut a_w = "A".chars().count();
-    let mut b_w = "B".chars().count();
-    for r in rows {
-        field_w = field_w.max(r.field.chars().count());
-        let a_cell = truncate_for_display(r.a.as_deref().unwrap_or("\u{2014}"));
-        let b_cell = truncate_for_display(r.b.as_deref().unwrap_or("\u{2014}"));
-        a_w = a_w.max(a_cell.chars().count());
-        b_w = b_w.max(b_cell.chars().count());
-    }
-    DiffConfigColumnWidths {
-        field: field_w,
-        a: a_w,
-        b: b_w,
-    }
-}
-
 /// Hint line printed under [`run_diff_config`] when a repo has no
 /// `config.json`. Under `--cached` the absence is ambiguous — the repo may
 /// genuinely have no config, or its `config.json` may simply not have been
@@ -5638,8 +5560,7 @@ fn run_diff_config(
         return emit_json(&result);
     }
 
-    println!("  A: {repo_a}");
-    println!("  B: {repo_b}");
+    print_diff_repo_header(repo_a, repo_b);
     println!();
 
     let shown: Vec<&ConfigFieldDiff> = if all {
@@ -5647,26 +5568,23 @@ fn run_diff_config(
     } else {
         fields.iter().filter(|r| r.differs).collect()
     };
-    let w = diff_config_column_widths(&shown);
-    println!(
-        "  {:<fw$}  {:<aw$}  {:<bw$}",
-        "Field",
-        "A",
-        "B",
-        fw = w.field,
-        aw = w.a,
-        bw = w.b,
-    );
-    for r in &shown {
-        println!(
-            "  {:<fw$}  {:<aw$}  {:<bw$}",
-            r.field,
-            truncate_for_display(r.a.as_deref().unwrap_or("\u{2014}")),
-            truncate_for_display(r.b.as_deref().unwrap_or("\u{2014}")),
-            fw = w.field,
-            aw = w.a,
-            bw = w.b,
-        );
+    // Cells formatted (and truncated for display) once, reused for both the
+    // column_width scan and the print loop below.
+    let cells: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = shown
+        .iter()
+        .map(|r| {
+            (
+                truncate_for_display(r.a.as_deref().unwrap_or("\u{2014}")),
+                truncate_for_display(r.b.as_deref().unwrap_or("\u{2014}")),
+            )
+        })
+        .collect();
+    let fw = column_width("Field", shown.iter().map(|r| r.field));
+    let aw = column_width("A", cells.iter().map(|(a, _)| a.as_ref()));
+    let bw = column_width("B", cells.iter().map(|(_, b)| b.as_ref()));
+    println!("  {:<fw$}  {:<aw$}  {:<bw$}", "Field", "A", "B");
+    for (r, (a, b)) in shown.iter().zip(&cells) {
+        println!("  {:<fw$}  {a:<aw$}  {b:<bw$}", r.field);
     }
     println!();
     println!("  {differing_count} of {} fields differ", fields.len());
