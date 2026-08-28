@@ -378,6 +378,37 @@ See also: hf-fm list-families, hf-fm discover")]
         #[arg(long)]
         json: bool,
     },
+    /// Compare `config.json` architecture fields between two model repos.
+    ///
+    /// Field-by-field diff over the known architecture fields (`model_type`,
+    /// `num_hidden_layers`, `hidden_size`, GQA / sliding-window / hybrid-layout
+    /// fields, ...) — the config-level counterpart to `diff --dtypes`'s
+    /// tensor-level view. Repos without a `config.json` (non-model repos)
+    /// report a clear message instead of a diff.
+    DiffConfig {
+        /// First model repository (labeled A).
+        repo_a: String,
+        /// Second model repository (labeled B).
+        repo_b: String,
+        /// Git revision for model A.
+        #[arg(long)]
+        revision_a: Option<String>,
+        /// Git revision for model B.
+        #[arg(long)]
+        revision_b: Option<String>,
+        /// Authentication token (or set `HF_TOKEN` env var).
+        #[arg(long)]
+        token: Option<String>,
+        /// Cache-only mode: fail if `config.json` is not cached locally.
+        #[arg(long)]
+        cached: bool,
+        /// Also show fields that match on both sides (default: differences only).
+        #[arg(long)]
+        all: bool,
+        /// Output the full diff as JSON (always includes every field, regardless of `--all`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show disk usage for cached models.
     Du {
         /// Repository identifier or numeric index (omit to show all cached repos).
@@ -783,6 +814,7 @@ fn main() -> ExitCode {
             | Commands::Info { .. }
             | Commands::Status { .. }
             | Commands::Diff { .. }
+            | Commands::DiffConfig { .. }
             | Commands::Du { .. }
             | Commands::Inspect { .. }
             | Commands::Peek { .. }
@@ -963,6 +995,26 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             dtypes,
             collapse,
             limit,
+            json,
+        ),
+        // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
+        Some(Commands::DiffConfig {
+            repo_a,
+            repo_b,
+            revision_a,
+            revision_b,
+            token,
+            cached,
+            all,
+            json,
+        }) => run_diff_config(
+            repo_a.as_str(),
+            repo_b.as_str(),
+            revision_a.as_deref(),
+            revision_b.as_deref(),
+            token.as_deref(),
+            cached,
+            all,
             json,
         ),
         // BORROW: explicit .as_str() for String → &str conversion
@@ -5256,6 +5308,311 @@ fn print_diff_collapse(
     } else {
         println!();
     }
+}
+
+/// One field's A/B comparison row for `diff-config`.
+#[derive(serde::Serialize)]
+struct ConfigFieldDiff {
+    /// Field name, matching [`inspect::ModelConfig`]'s field name.
+    field: &'static str,
+    /// Display value from repo A's config; `None` when the field is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    a: Option<String>,
+    /// Display value from repo B's config; `None` when the field is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    b: Option<String>,
+    /// `true` when `a != b` (including one-side-absent cases).
+    differs: bool,
+}
+
+/// Renders a scalar `Option<T>` field as a display string for [`ConfigFieldDiff`].
+fn opt_to_string<T: std::fmt::Display>(v: Option<&T>) -> Option<String> {
+    v.map(std::string::ToString::to_string)
+}
+
+/// Renders an `Option<Vec<T>>` field as a comma-joined display string. Full
+/// fidelity — no truncation — so `--json` and `--all`'s equality checks both
+/// see the complete value; the `diff-config` text table truncates long cells
+/// for column width separately, via [`truncate_for_display`].
+fn opt_vec_to_string<T: std::fmt::Display>(v: Option<&[T]>) -> Option<String> {
+    v.map(|items| {
+        items
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+/// Maximum characters shown per cell in the `diff-config` text table before
+/// truncating with an ellipsis. Per-layer fields like `layer_types` scale
+/// with model depth (24, 36, 128+ entries) and would otherwise blow out the
+/// table to one unreadable wide row. Display-only — `--json` always carries
+/// the full, untruncated value from [`ConfigFieldDiff`].
+const CONFIG_CELL_DISPLAY_CAP: usize = 60;
+
+/// Truncates a `diff-config` table cell to [`CONFIG_CELL_DISPLAY_CAP`]
+/// characters with a trailing ellipsis, or returns it unchanged when it
+/// already fits.
+fn truncate_for_display(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().count() <= CONFIG_CELL_DISPLAY_CAP {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        let head: String = s.chars().take(CONFIG_CELL_DISPLAY_CAP).collect();
+        std::borrow::Cow::Owned(format!("{head}\u{2026}"))
+    }
+}
+
+/// Builds one [`ConfigFieldDiff`] row per [`inspect::ModelConfig`] field,
+/// comparing repo A's config against repo B's. Pure — no I/O.
+fn build_config_diff_rows(
+    a: &inspect::ModelConfig,
+    b: &inspect::ModelConfig,
+) -> Vec<ConfigFieldDiff> {
+    // HashMap grouping idiom doesn't apply here — this is a fixed field list,
+    // not a batched-by-key operation. One explicit row per ModelConfig field,
+    // matching the crate's "explicit struct, explicit match arms" style.
+    let row = |field: &'static str, a_val: Option<String>, b_val: Option<String>| {
+        let differs = a_val != b_val;
+        ConfigFieldDiff {
+            field,
+            a: a_val,
+            b: b_val,
+            differs,
+        }
+    };
+    vec![
+        row("model_type", a.model_type.clone(), b.model_type.clone()),
+        row(
+            "num_hidden_layers",
+            opt_to_string(a.num_hidden_layers.as_ref()),
+            opt_to_string(b.num_hidden_layers.as_ref()),
+        ),
+        row(
+            "num_attention_heads",
+            opt_to_string(a.num_attention_heads.as_ref()),
+            opt_to_string(b.num_attention_heads.as_ref()),
+        ),
+        row(
+            "num_key_value_heads",
+            opt_to_string(a.num_key_value_heads.as_ref()),
+            opt_to_string(b.num_key_value_heads.as_ref()),
+        ),
+        row(
+            "head_dim",
+            opt_to_string(a.head_dim.as_ref()),
+            opt_to_string(b.head_dim.as_ref()),
+        ),
+        row(
+            "hidden_size",
+            opt_to_string(a.hidden_size.as_ref()),
+            opt_to_string(b.hidden_size.as_ref()),
+        ),
+        row("torch_dtype", a.torch_dtype.clone(), b.torch_dtype.clone()),
+        row(
+            "sliding_window",
+            opt_to_string(a.sliding_window.as_ref()),
+            opt_to_string(b.sliding_window.as_ref()),
+        ),
+        row(
+            "sliding_window_pattern",
+            opt_to_string(a.sliding_window_pattern.as_ref()),
+            opt_to_string(b.sliding_window_pattern.as_ref()),
+        ),
+        row(
+            "use_sliding_window",
+            opt_to_string(a.use_sliding_window.as_ref()),
+            opt_to_string(b.use_sliding_window.as_ref()),
+        ),
+        row(
+            "kv_lora_rank",
+            opt_to_string(a.kv_lora_rank.as_ref()),
+            opt_to_string(b.kv_lora_rank.as_ref()),
+        ),
+        row(
+            "qk_rope_head_dim",
+            opt_to_string(a.qk_rope_head_dim.as_ref()),
+            opt_to_string(b.qk_rope_head_dim.as_ref()),
+        ),
+        row(
+            "layer_types",
+            opt_vec_to_string(a.layer_types.as_deref()),
+            opt_vec_to_string(b.layer_types.as_deref()),
+        ),
+        row(
+            "hybrid_override_pattern",
+            a.hybrid_override_pattern.clone(),
+            b.hybrid_override_pattern.clone(),
+        ),
+        row(
+            "attn_layer_indices",
+            opt_vec_to_string(a.attn_layer_indices.as_deref()),
+            opt_vec_to_string(b.attn_layer_indices.as_deref()),
+        ),
+        row(
+            "full_attention_interval",
+            opt_to_string(a.full_attention_interval.as_ref()),
+            opt_to_string(b.full_attention_interval.as_ref()),
+        ),
+        row(
+            "attn_layer_offset",
+            opt_to_string(a.attn_layer_offset.as_ref()),
+            opt_to_string(b.attn_layer_offset.as_ref()),
+        ),
+        row(
+            "attn_layer_period",
+            opt_to_string(a.attn_layer_period.as_ref()),
+            opt_to_string(b.attn_layer_period.as_ref()),
+        ),
+        row(
+            "mamba_n_heads",
+            opt_to_string(a.mamba_n_heads.as_ref()),
+            opt_to_string(b.mamba_n_heads.as_ref()),
+        ),
+        row(
+            "mamba_d_head",
+            opt_to_string(a.mamba_d_head.as_ref()),
+            opt_to_string(b.mamba_d_head.as_ref()),
+        ),
+        row(
+            "mamba_d_state",
+            opt_to_string(a.mamba_d_state.as_ref()),
+            opt_to_string(b.mamba_d_state.as_ref()),
+        ),
+        row(
+            "mamba_d_conv",
+            opt_to_string(a.mamba_d_conv.as_ref()),
+            opt_to_string(b.mamba_d_conv.as_ref()),
+        ),
+        row(
+            "mamba_n_groups",
+            opt_to_string(a.mamba_n_groups.as_ref()),
+            opt_to_string(b.mamba_n_groups.as_ref()),
+        ),
+    ]
+}
+
+/// Serializable `diff-config` result for `--json` output.
+///
+/// Always carries every field regardless of `--all` — `--json` is the
+/// complete data, `--all` only controls text-mode presentation, matching how
+/// `diff --json`'s flat arrays stay complete regardless of its rendering flags.
+#[derive(serde::Serialize)]
+struct DiffConfigResult {
+    /// Model A repository identifier.
+    repo_a: String,
+    /// Model B repository identifier.
+    repo_b: String,
+    /// One row per `ModelConfig` field.
+    fields: Vec<ConfigFieldDiff>,
+    /// Number of fields where `a != b`.
+    differing_count: usize,
+}
+
+/// Column widths for the `diff-config` field table.
+struct DiffConfigColumnWidths {
+    /// Width of the field-name column.
+    field: usize,
+    /// Width of the A-value column.
+    a: usize,
+    /// Width of the B-value column.
+    b: usize,
+}
+
+/// Computes dynamic column widths for the `diff-config` field table.
+fn diff_config_column_widths(rows: &[&ConfigFieldDiff]) -> DiffConfigColumnWidths {
+    let mut field_w = "Field".chars().count();
+    let mut a_w = "A".chars().count();
+    let mut b_w = "B".chars().count();
+    for r in rows {
+        field_w = field_w.max(r.field.chars().count());
+        let a_cell = truncate_for_display(r.a.as_deref().unwrap_or("\u{2014}"));
+        let b_cell = truncate_for_display(r.b.as_deref().unwrap_or("\u{2014}"));
+        a_w = a_w.max(a_cell.chars().count());
+        b_w = b_w.max(b_cell.chars().count());
+    }
+    DiffConfigColumnWidths {
+        field: field_w,
+        a: a_w,
+        b: b_w,
+    }
+}
+
+/// Compares two model repos' `config.json` architecture fields.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the network request fails (non-`--cached`).
+/// Returns [`FetchError::Io`] if a cached `config.json` cannot be read.
+#[allow(clippy::too_many_arguments)] // diff-family orchestration function; mirrors run_diff's shape
+fn run_diff_config(
+    repo_a: &str,
+    repo_b: &str,
+    revision_a: Option<&str>,
+    revision_b: Option<&str>,
+    token: Option<&str>,
+    cached: bool,
+    all: bool,
+    json: bool,
+) -> Result<(), FetchError> {
+    let Some(config_a) = fetch_model_config_for_inspect(repo_a, revision_a, token, cached) else {
+        println!("No config.json found in {repo_a}.");
+        println!("Hint: not every repo ships a config.json (e.g. non-model repos).");
+        return Ok(());
+    };
+    let Some(config_b) = fetch_model_config_for_inspect(repo_b, revision_b, token, cached) else {
+        println!("No config.json found in {repo_b}.");
+        println!("Hint: not every repo ships a config.json (e.g. non-model repos).");
+        return Ok(());
+    };
+
+    let fields = build_config_diff_rows(&config_a, &config_b);
+    let differing_count = fields.iter().filter(|r| r.differs).count();
+
+    if json {
+        let result = DiffConfigResult {
+            repo_a: repo_a.to_owned(),
+            repo_b: repo_b.to_owned(),
+            fields,
+            differing_count,
+        };
+        return emit_json(&result);
+    }
+
+    println!("  A: {repo_a}");
+    println!("  B: {repo_b}");
+    println!();
+
+    let shown: Vec<&ConfigFieldDiff> = if all {
+        fields.iter().collect()
+    } else {
+        fields.iter().filter(|r| r.differs).collect()
+    };
+    let w = diff_config_column_widths(&shown);
+    println!(
+        "  {:<fw$}  {:<aw$}  {:<bw$}",
+        "Field",
+        "A",
+        "B",
+        fw = w.field,
+        aw = w.a,
+        bw = w.b,
+    );
+    for r in &shown {
+        println!(
+            "  {:<fw$}  {:<aw$}  {:<bw$}",
+            r.field,
+            truncate_for_display(r.a.as_deref().unwrap_or("\u{2014}")),
+            truncate_for_display(r.b.as_deref().unwrap_or("\u{2014}")),
+            fw = w.field,
+            aw = w.a,
+            bw = w.b,
+        );
+    }
+    println!();
+    println!("  {differing_count} of {} fields differ", fields.len());
+
+    Ok(())
 }
 
 /// Inspects tensor file headers (`.safetensors` / `.gguf` / `.npz` / `.pth`)
@@ -9871,6 +10228,98 @@ mod tests {
         assert_eq!(rows[1].pattern, "model.layers.{N}.input_layernorm.weight");
         assert_eq!(rows[1].bytes, 200);
         assert_eq!(rows[1].bytes_b, Some(200));
+    }
+
+    // ---------- diff-config ----------
+
+    /// Builds a minimal `ModelConfig` for `diff-config` tests. `ModelConfig`
+    /// is `#[non_exhaustive]` (it lives in the library crate), so
+    /// struct-literal construction is unavailable here — fields are set on a
+    /// `default()` instance instead, mirroring `gpu_check::tests::model`.
+    #[allow(clippy::field_reassign_with_default)] // EXPLICIT: non_exhaustive struct, literal unavailable
+    fn base_model_config() -> inspect::ModelConfig {
+        let mut c = inspect::ModelConfig::default();
+        c.model_type = Some("llama".to_owned());
+        c.num_hidden_layers = Some(16);
+        c.hidden_size = Some(2048);
+        c
+    }
+
+    #[test]
+    fn build_config_diff_rows_identical_configs_report_no_differences() {
+        let a = base_model_config();
+        let b = base_model_config();
+        let rows = build_config_diff_rows(&a, &b);
+        assert_eq!(rows.len(), 23, "one row per ModelConfig field");
+        assert_eq!(rows.iter().filter(|r| r.differs).count(), 0);
+    }
+
+    #[test]
+    fn build_config_diff_rows_detects_differing_numeric_field() {
+        let a = base_model_config();
+        let mut b = base_model_config();
+        b.num_hidden_layers = Some(32);
+        let rows = build_config_diff_rows(&a, &b);
+        let differing: Vec<&ConfigFieldDiff> = rows.iter().filter(|r| r.differs).collect();
+        assert_eq!(differing.len(), 1, "only num_hidden_layers should differ");
+        assert_eq!(differing[0].field, "num_hidden_layers");
+        assert_eq!(differing[0].a.as_deref(), Some("16"));
+        assert_eq!(differing[0].b.as_deref(), Some("32"));
+    }
+
+    #[test]
+    fn build_config_diff_rows_field_present_on_one_side_counts_as_differing() {
+        let a = base_model_config();
+        let mut b = base_model_config();
+        b.sliding_window = Some(4096);
+        let rows = build_config_diff_rows(&a, &b);
+        let row = rows
+            .iter()
+            .find(|r| r.field == "sliding_window")
+            .expect("sliding_window row present");
+        assert!(row.differs, "None vs Some(4096) must count as differing");
+        assert!(row.a.is_none());
+        assert_eq!(row.b.as_deref(), Some("4096"));
+    }
+
+    #[test]
+    fn build_config_diff_rows_vec_field_detects_a_late_difference() {
+        // A difference past the text table's CONFIG_CELL_DISPLAY_CAP-worth of
+        // characters must still be detected — differs is computed from the
+        // full untruncated value, never from a display-truncated string.
+        let mut a = base_model_config();
+        a.layer_types = Some(vec!["attention".to_owned(); 20]);
+        let mut b = base_model_config();
+        let mut layer_types_b = vec!["attention".to_owned(); 20];
+        // INDEX: literal 19 < len 20 by construction above
+        #[allow(clippy::indexing_slicing)]
+        {
+            layer_types_b[19] = "mamba".to_owned();
+        }
+        b.layer_types = Some(layer_types_b);
+
+        let rows = build_config_diff_rows(&a, &b);
+        let row = rows
+            .iter()
+            .find(|r| r.field == "layer_types")
+            .expect("layer_types row present");
+        assert!(
+            row.differs,
+            "a difference in the 20th element must still be detected"
+        );
+    }
+
+    #[test]
+    fn truncate_for_display_short_string_unchanged() {
+        assert_eq!(truncate_for_display("llama"), "llama");
+    }
+
+    #[test]
+    fn truncate_for_display_long_string_truncates_with_ellipsis() {
+        let long = "a".repeat(CONFIG_CELL_DISPLAY_CAP + 10);
+        let shown = truncate_for_display(&long);
+        assert_eq!(shown.chars().count(), CONFIG_CELL_DISPLAY_CAP + 1); // + 1 for the ellipsis
+        assert!(shown.ends_with('\u{2026}'));
     }
 
     #[test]

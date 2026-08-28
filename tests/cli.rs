@@ -3060,6 +3060,138 @@ fn diff_limit_human_shows_note() {
     );
 }
 
+// -----------------------------------------------------------------------
+// diff-config subcommand
+// -----------------------------------------------------------------------
+
+#[test]
+fn help_shows_diff_config_subcommand() {
+    let (stdout, _stderr, success) = run(hf_fm().arg("--help"));
+    assert!(success, "help should succeed");
+    assert!(
+        stdout.contains("diff-config"),
+        "help should mention diff-config subcommand, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn diff_config_json_shape_and_differing_count() {
+    // The gpt-oss 20b/120b scaled-sibling pair (also used by diff --dtypes'
+    // own tests): both are real model repos with a config.json, and their
+    // differing layer counts (24 vs 36) give a reliable, known-differing field.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff-config",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "--json",
+    ]));
+    assert!(success, "diff-config --json should succeed: {stderr}");
+    let v = parse_json(&stdout);
+    assert_eq!(
+        v.get("repo_a").and_then(Value::as_str),
+        Some("openai/gpt-oss-20b"),
+        "repo_a must echo the input, got:\n{stdout}"
+    );
+    assert_eq!(
+        v.get("repo_b").and_then(Value::as_str),
+        Some("openai/gpt-oss-120b"),
+        "repo_b must echo the input, got:\n{stdout}"
+    );
+    let fields = v
+        .get("fields")
+        .and_then(Value::as_array)
+        .expect("fields must be an array");
+    // Every ModelConfig field gets a row, --json is always complete regardless of --all.
+    assert!(
+        fields.len() >= 20,
+        "fields should cover every ModelConfig field, got {} in:\n{stdout}",
+        fields.len()
+    );
+    let differing_count = v
+        .get("differing_count")
+        .and_then(Value::as_u64)
+        .expect("differing_count must be a u64");
+    assert!(
+        differing_count > 0,
+        "gpt-oss-20b vs gpt-oss-120b must differ in at least num_hidden_layers, got:\n{stdout}"
+    );
+    // REAL validation: differing_count must match the actual number of
+    // differs:true rows, not just be a plausible positive number.
+    let actual_differing = fields
+        .iter()
+        .filter(|f| f.get("differs").and_then(Value::as_bool) == Some(true))
+        .count();
+    assert_eq!(
+        differing_count,
+        u64::try_from(actual_differing).expect("field count fits in u64"),
+        "differing_count must match the number of differs:true rows, got:\n{stdout}"
+    );
+    // num_hidden_layers is a known-differing field for this pair (24 vs 36).
+    let layers_row = fields
+        .iter()
+        .find(|f| f.get("field").and_then(Value::as_str) == Some("num_hidden_layers"))
+        .expect("num_hidden_layers row present");
+    assert_eq!(
+        layers_row.get("differs").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn diff_config_human_output_shows_differing_count() {
+    let (stdout, stderr, success) =
+        run(hf_fm().args(["diff-config", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]));
+    assert!(success, "diff-config should succeed: {stderr}");
+    assert!(
+        stdout.contains("fields differ"),
+        "human output should report a differing-field count, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn diff_config_all_shows_matching_fields_too() {
+    let (default_out, _e1, ok1) =
+        run(hf_fm().args(["diff-config", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]));
+    assert!(ok1, "diff-config should succeed");
+    let (all_out, _e2, ok2) = run(hf_fm().args([
+        "diff-config",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "--all",
+    ]));
+    assert!(ok2, "diff-config --all should succeed");
+    // --all shows every field, so its table has at least as many lines as
+    // the default differences-only view — and the matching-only field
+    // model_type (present on both, "gpt_oss") should appear under --all but
+    // not necessarily under the default view.
+    assert!(
+        all_out.len() >= default_out.len(),
+        "diff-config --all output should be at least as long as the default view"
+    );
+    assert!(
+        all_out.contains("model_type"),
+        "diff-config --all should list matching fields like model_type, got:\n{all_out}"
+    );
+}
+
+#[test]
+fn diff_config_missing_config_json_reports_hint() {
+    // A real repo with no config.json (a features/sidecar repo, not a model).
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "diff-config",
+        "bluelightai/clt-qwen3-1.7b-base-20k",
+        "openai/gpt-oss-20b",
+    ]));
+    assert!(
+        success,
+        "diff-config on a repo with no config.json should still exit 0: {stderr}"
+    );
+    assert!(
+        stdout.contains("No config.json found"),
+        "should report the missing config.json, got:\n{stdout}"
+    );
+}
+
 #[test]
 fn info_json_output() {
     let (stdout, stderr, success) = run(hf_fm().args(["info", "julien-c/dummy-unknown", "--json"]));
