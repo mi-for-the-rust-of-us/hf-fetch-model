@@ -601,8 +601,9 @@ fn print_kv_line(kv: &KvComputed) {
     );
 }
 
-/// Renders the verdict block to stdout — five to eight lines depending on
-/// whether the GPU probe succeeded.
+/// Renders the verdict block to stdout. Line count varies with whether
+/// `--context` was passed (adds `KV cache @ ctx=N` / `Total` lines) and
+/// whether the GPU probe succeeded (adds `Fit:` and the closing note).
 ///
 /// Output shape on success:
 ///
@@ -618,13 +619,29 @@ fn print_kv_line(kv: &KvComputed) {
 /// ```
 ///
 /// On failure the `GPU N:` line carries the friendly error from [`query_gpu`]
-/// and the `Fit:` / `Spilling:` / note lines are omitted.
+/// and the `Fit:` / note lines are omitted — `Spilling:` is not, since it's a
+/// platform-capability check independent of whether the device probe itself
+/// succeeded.
 ///
 /// With `kv` set (`--check-gpu --context N`), a `KV cache @ ctx=N` line and a
 /// `Total: weights + KV` line are added, and the `Fit:` verdict is measured
 /// against the total rather than the weights alone; the weights-only note is
 /// dropped. When the KV estimate is skipped or unavailable, the caveat line is
 /// printed but the verdict falls back to weights-only.
+/// Prints the `Spilling:` line — a platform-capability check, independent of
+/// whether the device probe succeeded, so [`print_gpu_check`] calls this on
+/// both its success and failure paths.
+fn print_spilling_line(spill_measurable: bool) {
+    println!(
+        "  Spilling:       {}",
+        if spill_measurable {
+            "not sampled (platform supports detection)"
+        } else {
+            "not supported on this platform"
+        }
+    );
+}
+
 pub fn print_gpu_check(
     result: &GpuCheckResult,
     weight_bytes: u64,
@@ -678,6 +695,10 @@ pub fn print_gpu_check(
             "  GPU {}:          unavailable — {msg}",
             result.device_index
         );
+        // Platform-capability check, independent of whether the device probe
+        // succeeded — printed on the failure path too, unlike `Fit:` and the
+        // closing note, which need an actual device reading to say anything.
+        print_spilling_line(result.spill_measurable);
         return;
     };
 
@@ -721,14 +742,7 @@ pub fn print_gpu_check(
         }
     }
 
-    println!(
-        "  Spilling:       {}",
-        if result.spill_measurable {
-            "not sampled (platform supports detection)"
-        } else {
-            "not supported on this platform"
-        }
-    );
+    print_spilling_line(result.spill_measurable);
 
     println!();
     if fit_basis.is_some() {
@@ -835,13 +849,13 @@ fn kv_cache_json(kv: &KvComputed) -> serde_json::Value {
 /// ```jsonc
 /// {
 ///   "device_index": 0,                                                  // always present
+///   "spill_measurable": true,                                           // always present
 ///   "device": {                                                         // success only
 ///     "name": "NVIDIA GeForce RTX 5060 Ti",                             // when the backend reports a name
 ///     "total_bytes": 17179869184,                                       // always (inside `device`)
 ///     "free_bytes": 15246684160,
 ///     "used_bytes": 1933185024
 ///   },
-///   "spill_measurable": true,                                           // success only
 ///   "error": "no NVIDIA device detected (NVML / DXGI not usable)",      // failure only
 ///   "model": {                                                          // always present
 ///     "weight_bytes": 10240671744,
@@ -867,16 +881,17 @@ fn kv_cache_json(kv: &KvComputed) -> serde_json::Value {
 /// }
 /// ```
 ///
-/// `device` / `spill_measurable` / `fits` / `headroom_bytes` / `short_bytes`
-/// are present only when the probe succeeded ([`GpuCheckResult::device`] is
-/// `Some`); `error` is present only when the probe failed. `headroom_bytes`
-/// and `short_bytes` are mutually exclusive. With a computable KV estimate,
-/// `fits` / headroom / short are measured against `model.total_bytes`
-/// (weights + KV); otherwise against `weight_bytes` alone. `spill_measurable`
-/// is a platform-capability flag ([`hypomnesis::is_spill_measurable`]), not a
-/// live spilling observation — `hf-fm` does not sample over time. Without
-/// `--context`, `kv_cache` and `total_bytes` are absent and the schema is
-/// otherwise identical to prior releases.
+/// `device` / `fits` / `headroom_bytes` / `short_bytes` are present only when
+/// the probe succeeded ([`GpuCheckResult::device`] is `Some`); `error` is
+/// present only when the probe failed. `headroom_bytes` and `short_bytes`
+/// are mutually exclusive. With a computable KV estimate, `fits` / headroom /
+/// short are measured against `model.total_bytes` (weights + KV); otherwise
+/// against `weight_bytes` alone. `spill_measurable` is always present — a
+/// platform-capability flag ([`hypomnesis::is_spill_measurable`]), not a live
+/// spilling observation (`hf-fm` does not sample over time), independent of
+/// whether the device probe itself succeeded. Without `--context`, `kv_cache`
+/// and `total_bytes` are absent and the schema is otherwise identical to
+/// prior releases.
 #[must_use]
 pub fn gpu_check_json(
     result: &GpuCheckResult,
@@ -889,6 +904,13 @@ pub fn gpu_check_json(
     out.insert(
         "device_index".to_owned(),
         serde_json::Value::Number(result.device_index.into()),
+    );
+    // Platform-capability check, independent of whether the device probe
+    // below succeeds — always present, unlike `device`/`fits`/headroom-or-
+    // short, which need an actual device reading to mean anything.
+    out.insert(
+        "spill_measurable".to_owned(),
+        serde_json::Value::Bool(result.spill_measurable),
     );
 
     // The footprint the fit verdict is measured against: weights + KV when a
@@ -914,10 +936,6 @@ pub fn gpu_check_json(
             serde_json::Value::Number(dev.used_bytes.into()),
         );
         out.insert("device".to_owned(), serde_json::Value::Object(dev_obj));
-        out.insert(
-            "spill_measurable".to_owned(),
-            serde_json::Value::Bool(result.spill_measurable),
-        );
 
         let fits = dev.free_bytes >= total_bytes;
         out.insert("fits".to_owned(), serde_json::Value::Bool(fits));
@@ -1501,9 +1519,10 @@ mod tests {
         );
         assert!(v.get("device").is_none());
         assert!(v.get("fits").is_none());
-        assert!(
-            v.get("spill_measurable").is_none(),
-            "spill_measurable is success-only, must be absent on the failure path"
+        assert_eq!(
+            v.get("spill_measurable"),
+            Some(&serde_json::json!(true)),
+            "spill_measurable is a platform-capability flag, present even on the failure path"
         );
         let model = v.get("model").expect("model object present");
         assert_eq!(model.get("weight_bytes"), Some(&serde_json::json!(1024)));
