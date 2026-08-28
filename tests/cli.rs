@@ -327,10 +327,20 @@ fn list_files_show_cached_adds_column() {
 
 #[test]
 fn list_files_show_cached_marks_complete_files() {
-    // julien-c/dummy-unknown should be fully cached from other tests.
+    // Self-sufficient: downloads julien-c/dummy-unknown into an isolated
+    // HF_HOME first, rather than assuming some other test already cached it
+    // in the shared default cache -- the same order-dependent race the
+    // dry_run_cached_repo_shows_zero_download / cache_delete_nonexistent_repo
+    // fix addressed for two other tests (see CHANGELOG.md [0.11.3] "Known
+    // issue"), missed here originally.
+    let (dir, _, download_stderr, download_success) =
+        run_isolated(hf_fm().args(["julien-c/dummy-unknown"]));
+    assert!(download_success, "setup download failed: {download_stderr}");
+
     // Complete files must show ✓, never "partial".
-    let (stdout, stderr, success) =
-        run(hf_fm().args(["list-files", "julien-c/dummy-unknown", "--show-cached"]));
+    let (stdout, stderr, success) = run(hf_fm()
+        .args(["list-files", "julien-c/dummy-unknown", "--show-cached"])
+        .env("HF_HOME", dir.path()));
     assert!(success, "list-files --show-cached failed: {stderr}");
     assert!(
         stdout.contains('\u{2713}'),
@@ -486,10 +496,8 @@ fn dry_run_cached_repo_shows_zero_download() {
     // HF_HOME first, rather than assuming some other test already
     // populated the shared global cache (the old assumption raced under
     // parallel test execution — see CHANGELOG.md [0.11.3] "Known issue").
-    let dir = tempfile::tempdir().expect("failed to create temp HF_HOME");
-    let (_, download_stderr, download_success) = run(hf_fm()
-        .args(["julien-c/dummy-unknown"])
-        .env("HF_HOME", dir.path()));
+    let (dir, _, download_stderr, download_success) =
+        run_isolated(hf_fm().args(["julien-c/dummy-unknown"]));
     assert!(download_success, "setup download failed: {download_stderr}");
 
     let (stdout, stderr, success) = run(hf_fm()
