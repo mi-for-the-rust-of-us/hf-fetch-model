@@ -43,10 +43,10 @@ hf-hub = "1.0"
 # would be silently overridden. hf-fm calls only `device_info` (for
 # `inspect --check-gpu`), so it selects the GPU source features it reads
 # and nothing else. `pdh` is kept despite `gpu_processes()` being unused
-# until v0.12.0's `--check-gpu --processes`: it is Windows-only and
+# until v0.13.0's `--check-gpu --processes`: it is Windows-only and
 # shares the `windows` crate that `dxgi` already pulls, so it costs
 # nothing here.
-hypomnesis = { version = "0.2.9", default-features = false, features = [
+hypomnesis = { version = "0.2.10", default-features = false, features = [
     "nvml",
     "nvidia-smi-fallback",
     "dxgi",
@@ -93,7 +93,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 # `test-helpers`): dev-dependencies unify with normal ones in the test build,
 # so a bare entry here would re-introduce the `cli` union this crate just
 # opted out of.
-hypomnesis = { version = "0.2.9", default-features = false, features = [
+hypomnesis = { version = "0.2.10", default-features = false, features = [
     "nvml",
     "nvidia-smi-fallback",
     "dxgi",

@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`inspect --check-gpu` reports whether this platform can detect VRAM spilling at all.** A new `Spilling:` line (text) / `spill_measurable` key (`--json`, success-only) reads hypomnesis's `is_spill_measurable()` capability flag — `true` on Windows with the `pdh` feature and a registered `GPU Adapter Memory` counter set, `false` elsewhere. This is a platform-capability check, not a live spilling observation: hypomnesis's `SpillTracker` needs a sampling window over time to say anything about *actual* spilling, which a single-shot `--check-gpu` probe doesn't have — wiring in real-time detection is deliberately out of scope here to avoid adding latency or new flags to what has always been an instant verdict. Closes the gap named in the v0.11.0 changelog ("spilling detection; verdict-side adoption deferred") — hypomnesis's spill API has been available, unused by `--check-gpu`, since 0.2.5.
+
 ### Changed
+
+- **`hypomnesis` bumped `0.2.9` → `0.2.10`.** Audit/bugfix release upstream (NVML process-cap, DXGI enumeration abort, macOS clippy fixes) — confirmed API-identical to `0.2.9` for everything `hf-fm` reads.
 
 - **`inspect --tree`'s numeric-sibling collapse now tolerates up to 3 structurally-different siblings per edge (`MAX_EDGE_OUTLIERS`), up from exactly 1 (`v0.11.4`).** Motivated by DeepSeek-V3's `first_k_dense_replace=3` — three dense layers before the MoE layers begin, one more edge outlier than the previous tolerance allowed, so a `first_k_dense_replace=3` checkpoint fell back to full expansion with no benefit from the `v0.11.4` fix at all. `try_collapse_range`'s literal 4-case candidate list is now a generated sequence over `0..=MAX_EDGE_OUTLIERS` per edge (verified to reproduce the exact `v0.11.4` preference order at `K=1`); no rendering changes were needed, since outliers already render as ordinary standalone nodes beside the collapsed range regardless of how many there are. Live verification against a real DeepSeek-V3-class checkpoint remains impractical (670B+ params, 160+ shards) — same unverified-but-bounded posture the `v0.11.4` tolerance had before its own live check; see [`docs/dogfooding-feedbacks/numeric-sibling-collapse-edge-outlier-validation.md`](docs/dogfooding-feedbacks/numeric-sibling-collapse-edge-outlier-validation.md).
 

@@ -247,6 +247,7 @@ hf-fm inspect zed-industries/zeta-2 \
   GPU 0:          NVIDIA GeForce RTX 5060 Ti — 15.93 GiB VRAM
                   free: 13.60 GiB, used: 2.33 GiB
   Fit:            ✗ short by 1.77 GiB for the weights alone
+  Spilling:       not sampled (platform supports detection)
 
   Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
   weight size for KV cache and activations.
@@ -336,6 +337,7 @@ hf-fm inspect bartowski/zed-industries_zeta-2-GGUF zed-industries_zeta-2-Q4_K_M.
   GPU 0:          NVIDIA GeForce RTX 5060 Ti — 15.93 GiB VRAM
                   free: 13.79 GiB, used: 2.14 GiB
   Fit:            ✓ 8.93 GiB headroom for weights + KV cache + runtime
+  Spilling:       not sampled (platform supports detection)
 
   Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
   weight size for KV cache and activations.

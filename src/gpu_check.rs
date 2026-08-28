@@ -33,6 +33,15 @@ pub struct GpuCheckResult {
     pub device: Option<GpuDeviceInfo>,
     /// One-line human-readable message on probe failure. `None` on success.
     pub error: Option<String>,
+    /// Whether this platform can measure `WDDM` VRAM spilling at all
+    /// ([`hypomnesis::is_spill_measurable`]), independent of whether the
+    /// device probe above succeeded. `true` only on Windows with the `pdh`
+    /// feature and a registered `GPU Adapter Memory` counter set; `false`
+    /// on Linux, macOS, and Windows without that counter set. This is a
+    /// capability check, not a live spilling observation — `hf-fm` does not
+    /// run `hypomnesis`'s `SpillTracker`, which needs a sampling window a
+    /// single-shot `--check-gpu` probe does not have.
+    pub spill_measurable: bool,
 }
 
 /// Probes the requested device via [`hypomnesis::device_info`] and converts
@@ -44,16 +53,19 @@ pub struct GpuCheckResult {
 /// GPU, no NVML / DXGI, or with the index past the device count.
 #[must_use]
 pub fn query_gpu(index: u32) -> GpuCheckResult {
+    let spill_measurable = hypomnesis::is_spill_measurable();
     match hypomnesis::device_info(index) {
         Ok(device) => GpuCheckResult {
             device_index: index,
             device: Some(device),
             error: None,
+            spill_measurable,
         },
         Err(e) => GpuCheckResult {
             device_index: index,
             device: None,
             error: Some(friendly_error(&e)),
+            spill_measurable,
         },
     }
 }
@@ -589,7 +601,7 @@ fn print_kv_line(kv: &KvComputed) {
     );
 }
 
-/// Renders the verdict block to stdout — four to seven lines depending on
+/// Renders the verdict block to stdout — five to eight lines depending on
 /// whether the GPU probe succeeded.
 ///
 /// Output shape on success:
@@ -599,13 +611,14 @@ fn print_kv_line(kv: &KvComputed) {
 ///   GPU 0:          NVIDIA GeForce RTX 5060 Ti — 16.0 GiB VRAM
 ///                   free: 14.2 GiB, used: 1.8 GiB
 ///   Fit:            ✓ 4.66 GiB headroom for weights + KV cache + runtime
+///   Spilling:       not sampled (platform supports detection)
 ///
 ///   Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
 ///   weight size for KV cache and activations.
 /// ```
 ///
 /// On failure the `GPU N:` line carries the friendly error from [`query_gpu`]
-/// and the `Fit:` / note lines are omitted.
+/// and the `Fit:` / `Spilling:` / note lines are omitted.
 ///
 /// With `kv` set (`--check-gpu --context N`), a `KV cache @ ctx=N` line and a
 /// `Total: weights + KV` line are added, and the `Fit:` verdict is measured
@@ -707,6 +720,15 @@ pub fn print_gpu_check(
             );
         }
     }
+
+    println!(
+        "  Spilling:       {}",
+        if result.spill_measurable {
+            "not sampled (platform supports detection)"
+        } else {
+            "not supported on this platform"
+        }
+    );
 
     println!();
     if fit_basis.is_some() {
@@ -819,6 +841,7 @@ fn kv_cache_json(kv: &KvComputed) -> serde_json::Value {
 ///     "free_bytes": 15246684160,
 ///     "used_bytes": 1933185024
 ///   },
+///   "spill_measurable": true,                                           // success only
 ///   "error": "no NVIDIA device detected (NVML / DXGI not usable)",      // failure only
 ///   "model": {                                                          // always present
 ///     "weight_bytes": 10240671744,
@@ -844,13 +867,16 @@ fn kv_cache_json(kv: &KvComputed) -> serde_json::Value {
 /// }
 /// ```
 ///
-/// `device` / `fits` / `headroom_bytes` / `short_bytes` are present only when
-/// the probe succeeded ([`GpuCheckResult::device`] is `Some`); `error` is
-/// present only when the probe failed. `headroom_bytes` and `short_bytes`
-/// are mutually exclusive. With a computable KV estimate, `fits` / headroom /
-/// short are measured against `model.total_bytes` (weights + KV); otherwise
-/// against `weight_bytes` alone. Without `--context`, `kv_cache` and
-/// `total_bytes` are absent and the schema is identical to prior releases.
+/// `device` / `spill_measurable` / `fits` / `headroom_bytes` / `short_bytes`
+/// are present only when the probe succeeded ([`GpuCheckResult::device`] is
+/// `Some`); `error` is present only when the probe failed. `headroom_bytes`
+/// and `short_bytes` are mutually exclusive. With a computable KV estimate,
+/// `fits` / headroom / short are measured against `model.total_bytes`
+/// (weights + KV); otherwise against `weight_bytes` alone. `spill_measurable`
+/// is a platform-capability flag ([`hypomnesis::is_spill_measurable`]), not a
+/// live spilling observation — `hf-fm` does not sample over time. Without
+/// `--context`, `kv_cache` and `total_bytes` are absent and the schema is
+/// otherwise identical to prior releases.
 #[must_use]
 pub fn gpu_check_json(
     result: &GpuCheckResult,
@@ -888,6 +914,10 @@ pub fn gpu_check_json(
             serde_json::Value::Number(dev.used_bytes.into()),
         );
         out.insert("device".to_owned(), serde_json::Value::Object(dev_obj));
+        out.insert(
+            "spill_measurable".to_owned(),
+            serde_json::Value::Bool(result.spill_measurable),
+        );
 
         let fits = dev.free_bytes >= total_bytes;
         out.insert("fits".to_owned(), serde_json::Value::Bool(fits));
@@ -1461,6 +1491,7 @@ mod tests {
             device_index: 3,
             device: None,
             error: Some("index 3 out of range (have 1 device)".to_owned()),
+            spill_measurable: true,
         };
         let v = gpu_check_json(&result, 1024, "BF16", 100, None);
         assert_eq!(v.get("device_index"), Some(&serde_json::json!(3)));
@@ -1470,6 +1501,10 @@ mod tests {
         );
         assert!(v.get("device").is_none());
         assert!(v.get("fits").is_none());
+        assert!(
+            v.get("spill_measurable").is_none(),
+            "spill_measurable is success-only, must be absent on the failure path"
+        );
         let model = v.get("model").expect("model object present");
         assert_eq!(model.get("weight_bytes"), Some(&serde_json::json!(1024)));
         assert_eq!(model.get("dtype_label"), Some(&serde_json::json!("BF16")));
@@ -1490,6 +1525,7 @@ mod tests {
             device_index: 0,
             device: Some(device),
             error: None,
+            spill_measurable: true,
         };
         let weight_bytes: u64 = 10 * 1024 * 1024 * 1024;
         let v = gpu_check_json(&result, weight_bytes, "BF16", 5_120_000_000, None);
@@ -1502,6 +1538,11 @@ mod tests {
             Some(&serde_json::json!(4u64 * 1024 * 1024 * 1024))
         );
         assert!(v.get("short_bytes").is_none());
+        assert_eq!(
+            v.get("spill_measurable"),
+            Some(&serde_json::json!(true)),
+            "spill_measurable must reflect the platform capability flag on success"
+        );
 
         let device_obj = v.get("device").expect("device object present");
         assert_eq!(
@@ -1538,6 +1579,7 @@ mod tests {
             device_index: 0,
             device: Some(device),
             error: None,
+            spill_measurable: false,
         };
         let weight_bytes: u64 = 25 * 1024 * 1024 * 1024;
         let v = gpu_check_json(&result, weight_bytes, "U8 + others", 23_910_000_000, None);
@@ -1550,6 +1592,11 @@ mod tests {
             Some(&serde_json::json!(
                 11_u64 * 1024 * 1024 * 1024 + 512 * 1024 * 1024
             ))
+        );
+        assert_eq!(
+            v.get("spill_measurable"),
+            Some(&serde_json::json!(false)),
+            "spill_measurable must reflect the platform capability flag even when it's false"
         );
 
         let device_obj = v.get("device").expect("device object present");
@@ -1575,6 +1622,7 @@ mod tests {
             device_index: 0,
             device: Some(device),
             error: None,
+            spill_measurable: false,
         };
         let weight_bytes: u64 = 10 * 1024 * 1024 * 1024;
         let kv = KvComputed {
@@ -1620,6 +1668,7 @@ mod tests {
             device_index: 0,
             device: Some(device),
             error: None,
+            spill_measurable: false,
         };
         let v = gpu_check_json(
             &result,
