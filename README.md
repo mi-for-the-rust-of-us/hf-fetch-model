@@ -191,6 +191,27 @@ $ hf-fm diff openai/gpt-oss-20b openai/gpt-oss-120b --dtypes
   ──────────────────────────────────────────────────────────────
   A: 822 tensors, 25.63 GiB | B: 1230 tensors, 121.54 GiB | Δ: +408 tensors, +95.90 GiB
 
+$ hf-fm diff openai/gpt-oss-20b openai/gpt-oss-120b --collapse --limit 3
+  A: openai/gpt-oss-20b
+  B: openai/gpt-oss-120b
+
+  Only in B (408 tensors, 31 patterns):
+  Pattern                                           Tensors       Bytes
+  block.{N}.mlp.mlp{N}_weight.blocks                     24   17.80 GiB
+  model.layers.{N}.mlp.experts.gate_up_proj_blocks       12   11.87 GiB
+  model.layers.{N}.mlp.experts.down_proj_blocks          12    5.93 GiB
+    … showing 3 of 31 (limit 3)
+
+  Dtype/shape differences (384 tensors, 13 patterns):
+  Pattern                                           Tensors     A Bytes     B Bytes      Δ Bytes
+  block.{N}.mlp.mlp{N}_weight.blocks                     48    8.90 GiB   35.60 GiB   +26.70 GiB
+  model.layers.{N}.mlp.experts.gate_up_proj_blocks       24    5.93 GiB   23.73 GiB   +17.80 GiB
+  model.layers.{N}.mlp.experts.down_proj_blocks          24    2.97 GiB   11.87 GiB    +8.90 GiB
+    … showing 3 of 13 (limit 3)
+
+  ──────────────────────────────────────────────────────────────────────
+  only-A: 0 tensors (0 patterns) | only-B: 408 tensors (31 patterns) | differ: 384 tensors (13 patterns)
+
 $ hf-fm inspect meta-llama/Llama-3.2-3B --cached --check-gpu --context 32768
   ...existing tensor table...
 
@@ -203,7 +224,7 @@ $ hf-fm inspect meta-llama/Llama-3.2-3B --cached --check-gpu --context 32768
   Spilling:       not sampled (platform supports detection)
 ```
 
-Inspect reads tensor metadata via HTTP Range requests — no weight data downloaded: 2 requests per `.safetensors` file, a handful (reported live on the `Source:` line, e.g. `remote (6 range requests, 136.0 KiB fetched)`) per NumPy `.npz` archive (remote NPZ since v0.11.0), a similar handful per `.gguf` file (remote GGUF since v0.11.2, e.g. `remote (30 range requests, 1.75 MiB fetched)` on an 84 MiB quantized model, `--tree`/`--dtypes` included), and likewise per `.pth` checkpoint (remote PTH since v0.11.4, e.g. `remote (12 range requests, 113.7 KiB fetched)` on a 364 MiB PyTorch `state_dict` — only the ZIP-archived `data.pkl` pickle stream is read, never the tensor-data files). When a repo has many tensor files, `--list` prints a numbered table (pass the `#` back as the `FILE` argument) and `--pick` chooses interactively, narrowing first by a case-insensitive substring — both cover every format inspect reads (`.safetensors` / `.gguf` / `.npz` / `.pth`). The `--tree` flag shows the hierarchical namespace with numeric sibling groups auto-collapsed to `[0..N]` for structural discovery. The `--check-gpu` flag adds a one-line GPU-fit verdict using [`hypomnesis`](https://crates.io/crates/hypomnesis) (NVML on Linux/Windows, DXGI on Windows); composes with `--json`. Add `--context N` to fold in the KV cache at a context length and get a real `weights + KV` verdict — the difference between "fits" and "OOM at token 8000" on a consumer card. The estimate is parameter-driven from the model's `config.json` (`GQA`, sliding-window, and hybrid Mamba/attention all handled; `MLA` is detected and skipped); see the [FAQ entry on GPU fit](docs/FAQ.md#how-do-i-know-if-a-model-fits-on-my-gpu) for the formula and its limitations. Diff compares tensor names, dtypes, and shapes between any two models (remote or cached); `--dtypes` swaps the per-tensor body for a side-by-side per-dtype histogram with a signed Δ Size column — the high-leverage view for scaled-sibling pairs. See the [FAQ entry on comparing two models](docs/FAQ.md#how-do-i-compare-two-huggingface-models-structurally) for a `jq` recipe that uses the new `byte_count` field in `--json` output to collapse layer-indexed tensors by pattern.
+Inspect reads tensor metadata via HTTP Range requests — no weight data downloaded: 2 requests per `.safetensors` file, a handful (reported live on the `Source:` line, e.g. `remote (6 range requests, 136.0 KiB fetched)`) per NumPy `.npz` archive (remote NPZ since v0.11.0), a similar handful per `.gguf` file (remote GGUF since v0.11.2, e.g. `remote (30 range requests, 1.75 MiB fetched)` on an 84 MiB quantized model, `--tree`/`--dtypes` included), and likewise per `.pth` checkpoint (remote PTH since v0.11.4, e.g. `remote (12 range requests, 113.7 KiB fetched)` on a 364 MiB PyTorch `state_dict` — only the ZIP-archived `data.pkl` pickle stream is read, never the tensor-data files). When a repo has many tensor files, `--list` prints a numbered table (pass the `#` back as the `FILE` argument) and `--pick` chooses interactively, narrowing first by a case-insensitive substring — both cover every format inspect reads (`.safetensors` / `.gguf` / `.npz` / `.pth`). The `--tree` flag shows the hierarchical namespace with numeric sibling groups auto-collapsed to `[0..N]` for structural discovery. The `--check-gpu` flag adds a one-line GPU-fit verdict using [`hypomnesis`](https://crates.io/crates/hypomnesis) (NVML on Linux/Windows, DXGI on Windows); composes with `--json`. Add `--context N` to fold in the KV cache at a context length and get a real `weights + KV` verdict — the difference between "fits" and "OOM at token 8000" on a consumer card. The estimate is parameter-driven from the model's `config.json` (`GQA`, sliding-window, and hybrid Mamba/attention all handled; `MLA` is detected and skipped); see the [FAQ entry on GPU fit](docs/FAQ.md#how-do-i-know-if-a-model-fits-on-my-gpu) for the formula and its limitations. Diff compares tensor names, dtypes, and shapes between any two models (remote or cached); `--dtypes` swaps the per-tensor body for a side-by-side per-dtype histogram with a signed Δ Size column — the high-leverage view for scaled-sibling pairs. `--collapse` groups only-A / only-B / dtype-shape-differences by numeric-segment pattern (`model.layers.{N}.mlp.gate_proj.weight`) into a `Pattern / Tensors / Bytes` table, the built-in counterpart to the `jq` recipe below. See the [FAQ entry on comparing two models](docs/FAQ.md#how-do-i-compare-two-huggingface-models-structurally) for that `jq` recipe, which uses the `byte_count` field in `--json` output for cases `--collapse`'s digit-run heuristic doesn't cover.
 
 ## Disk usage
 

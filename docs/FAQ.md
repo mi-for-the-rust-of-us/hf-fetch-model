@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-08-18, hf-fm v0.11.4 (remote PTH inspect) -->
+<!-- Last updated: 2026-08-28, hf-fm v0.12.0 (diff --collapse) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -254,7 +254,9 @@ hf-fm diff org/model-A org/model-B --json \
     '
 ```
 
-For a scaled-sibling pair this collapses `model.layers.0.self_attn.q_proj.weight`, `model.layers.1.self_attn.q_proj.weight`, … into a single `model.layers.{N}.self_attn.q_proj.weight` line with a count and a summed-byte total. The JSON-first approach lets you iterate on the collapse heuristic (regex, segment, expert-routing-aware) against your own pair before any of it becomes a built-in flag. The same recipe with `.only_a` swapped in does the symmetric job.
+For a scaled-sibling pair this collapses `model.layers.0.self_attn.q_proj.weight`, `model.layers.1.self_attn.q_proj.weight`, … into a single `model.layers.{N}.self_attn.q_proj.weight` line with a count and a summed-byte total. The same recipe with `.only_a` swapped in does the symmetric job.
+
+That numeric-segment heuristic is now also a built-in flag: `--collapse` groups only-A / only-B / dtype-shape-differences into `Pattern / Tensors / Bytes` tables directly, no `jq` needed — reach for it first. The `jq` recipe above is still worth keeping around for cases `--collapse` doesn't cover: it only groups by digit-run substitution, independently per section (no cross-referencing between only-A and only-B, no expert-routing-aware grouping), so a different heuristic on your own pair is still a `jq` filter away.
 
 ### How do I know if a model fits on my GPU?
 
