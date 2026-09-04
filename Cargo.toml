@@ -117,7 +117,7 @@ tempfile = "3"
 # became `#[non_exhaustive]` in anamnesis 0.7.6, so hand-constructing them via
 # struct literals — the previous approach — no longer compiles). `STORED`
 # (uncompressed) entries only, so no compression-backend feature is needed.
-zip = { version = "2", default-features = false }
+zip = { version = "8", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
