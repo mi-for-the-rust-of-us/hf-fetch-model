@@ -54,6 +54,7 @@ A living list of the questions we and our early users have actually run into. If
   - [How do I compare two HuggingFace models structurally?](#how-do-i-compare-two-huggingface-models-structurally)
   - [How do I compare two models' architecture, not just their tensors?](#how-do-i-compare-two-models-architecture-not-just-their-tensors)
   - [How do I know if a model fits on my GPU?](#how-do-i-know-if-a-model-fits-on-my-gpu)
+  - [What fraction of a GGUF file is the MoE expert weights?](#what-fraction-of-a-gguf-file-is-the-moe-expert-weights)
   - [How do I list only the weight files in a repo, not the tokenizer and README?](#how-do-i-list-only-the-weight-files-in-a-repo-not-the-tokenizer-and-readme)
   - [How do I see what is already cached locally?](#how-do-i-see-what-is-already-cached-locally)
 - [Cache location and management](#cache-location-and-management)
@@ -313,6 +314,16 @@ The estimate is **parameter-driven, not a per-model lookup table** — it applie
 - **Mixed sliding-window is approximate** (within a few percent): the Gemma blend models the *count* of local vs global layers, not their exact positions in the stack.
 - **KV dtype is assumed equal to the activation dtype.** The KV element size comes from the config's `torch_dtype` (bf16 / fp16 = 2 bytes), independent of weight quantization. If you run an FP8 / Q4 KV cache to fit more context, the real figure is smaller — so treat the reported number as a safe upper bound.
 - **Non-Mamba2 recurrent state is excluded.** For Qwen3-Next (Gated DeltaNet) and Jamba (Mamba1) the *attention* KV is correct, but the recurrent state is labeled `excluded (small, constant)` rather than computed — it is tens of MiB and constant in context, so it never flips a consumer-GPU verdict.
+
+### What fraction of a GGUF file is the MoE expert weights?
+
+Pass `--group-by` with a glob matching the expert tensor names:
+
+```
+hf-fm inspect poolside/Laguna-XS-2.1-GGUF Q4_K_M.gguf --group-by 'blk.*.ffn_*_exps.weight'
+```
+
+This buckets every tensor into MATCHED / OTHER by name and prints byte totals, percentages, and — when the matched names carry a single, unambiguous numeric layer index — a `per-MoE-layer expert cost` line. That per-layer figure is exactly what CPU-expert-offload planning (`llama.cpp`'s `--n-cpu-moe`) needs: a large MoE checkpoint that looks too big for your VRAM at first glance can still fit once you know only a fraction of it is expert weight that can live in system RAM. This surfaced from a real [dogfooding session](dogfooding-feedbacks/hf-fm-dogfooding-vram-fit-laguna-session.md) sizing quant candidates by hand with `awk`.
 
 ### How do I list only the weight files in a repo, not the tokenizer and README?
 

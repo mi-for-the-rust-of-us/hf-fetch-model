@@ -449,6 +449,7 @@ See also: hf-fm list-families, hf-fm discover")]
         hf-fm inspect <repo> --pick                             # pick the file interactively\n  \
         hf-fm inspect <repo> fluxV13 --pick --dtypes            # substring narrows, then pick\n  \
         hf-fm inspect <repo> model.safetensors --tree           # hierarchical view of one file\n  \
+        hf-fm inspect <repo> model.gguf --group-by 'blk.*.ffn_*_exps'  # MoE expert-byte rollup\n  \
         hf-fm inspect <repo> --check-gpu                        # GPU-fit verdict for the whole repo\n  \
         hf-fm inspect <repo> model.gguf                         # remote GGUF, no download (v0.11.2+)\n  \
         hf-fm inspect <repo> layer_9/width_16k/.../params.npz   # remote NPZ, no download (v0.11.0+)\n  \
@@ -483,7 +484,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// table; the `#` column can be used as the `filename` argument on a
         /// follow-up run (e.g. `hf-fm inspect <repo> 3`). Indices are
         /// alphabetical, so shard ordering is natural. No headers are read.
-        #[arg(long, conflicts_with_all = ["filename", "no_metadata", "json", "filter", "dtypes", "limit", "tree"])]
+        #[arg(long, conflicts_with_all = ["filename", "no_metadata", "json", "filter", "dtypes", "limit", "tree", "group_by"])]
         list: bool,
         /// Pick the file to inspect interactively from a numbered list.
         ///
@@ -512,6 +513,19 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Show a per-dtype summary instead of individual tensors.
         #[arg(long)]
         dtypes: bool,
+        /// Roll up tensors by name-pattern match instead of per-dtype or per-tensor.
+        ///
+        /// Buckets tensors into MATCHED (name matches the glob) / OTHER,
+        /// printing byte totals and percentages plus a per-MoE-layer average
+        /// when exactly one numeric name segment varies among matched tensors
+        /// (e.g. `blk.*.ffn_*_exps` on a GGUF `MoE` model). Uses `globset` glob
+        /// syntax (`*`, `?`, `[...]`, `{...}`). Composes with `--filter` and
+        /// `--limit` the same way `--dtypes` does — both are applied to the
+        /// tensor list before the rollup is computed, so `--limit` narrows
+        /// the population the rollup summarizes. Conflicts with `--dtypes`
+        /// (both replace the per-tensor body with a different summary shape).
+        #[arg(long, value_name = "PATTERN", conflicts_with = "dtypes")]
+        group_by: Option<String>,
         /// Show only the first N tensors (applied after `--filter`).
         #[arg(long)]
         limit: Option<usize>,
@@ -519,7 +533,7 @@ See also: hf-fm list-families, hf-fm discover")]
         ///
         /// Numeric sibling groups with identical structure are collapsed to
         /// `[0..N]` with a `×K` marker. Composes with `--filter` and `--json`.
-        #[arg(long, conflicts_with_all = ["dtypes", "limit"])]
+        #[arg(long, conflicts_with_all = ["dtypes", "limit", "group_by"])]
         tree: bool,
         /// Show a GPU-fit verdict for the model weights against device `N` (default 0).
         ///
@@ -1055,6 +1069,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             json,
             filter,
             dtypes,
+            group_by,
             limit,
             tree,
             check_gpu,
@@ -1071,6 +1086,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             json,
             filter.as_deref(),
             dtypes,
+            group_by.as_deref(),
             limit,
             tree,
             check_gpu,
@@ -5625,6 +5641,7 @@ fn run_inspect(
     json: bool,
     filter: Option<&str>,
     dtypes: bool,
+    group_by: Option<&str>,
     limit: Option<usize>,
     tree: bool,
     check_gpu: Option<u32>,
@@ -5646,6 +5663,7 @@ fn run_inspect(
             json,
             filter,
             dtypes,
+            group_by,
             limit,
             tree,
             check_gpu,
@@ -5667,6 +5685,7 @@ fn run_inspect(
                 json,
                 filter,
                 dtypes,
+                group_by,
                 limit,
                 tree,
                 check_gpu,
@@ -5675,7 +5694,8 @@ fn run_inspect(
             .map_err(|e| enrich_gated_content_error(e, repo_id, token))
         }
         None => run_inspect_repo(
-            repo_id, revision, token, cached, json, filter, dtypes, limit, tree, check_gpu, context,
+            repo_id, revision, token, cached, json, filter, dtypes, group_by, limit, tree,
+            check_gpu, context,
         )
         .map_err(|e| enrich_gated_content_error(e, repo_id, token)),
     }
@@ -6873,6 +6893,7 @@ fn run_inspect_single(
     json: bool,
     filter: Option<&str>,
     dtypes: bool,
+    group_by: Option<&str>,
     limit: Option<usize>,
     tree: bool,
     check_gpu: Option<u32>,
@@ -7022,6 +7043,15 @@ fn run_inspect_single(
         );
     }
 
+    // `--group-by --json`: MATCHED/OTHER rollup as JSON (distinct schema from plain --json).
+    if let Some(pattern) = group_by
+        && json
+    {
+        let matcher = compile_group_by_pattern(pattern)?;
+        let rollup = compute_group_by_rollup(&info.tensors, &matcher);
+        return print_group_by_summary_json(pattern, &rollup, gpu_check_value);
+    }
+
     if json {
         // `truncated` is `None` when the list is complete, which `skip_serializing_if`
         // suppresses — so non-truncated output is schema-identical to v0.9.5.
@@ -7095,6 +7125,15 @@ fn run_inspect_single(
     // Per-dtype summary mode.
     if dtypes {
         print_dtype_summary(&info.tensors, filter, total_tensor_count, total_params);
+        maybe_print_gpu_check(gpu_inputs.as_ref(), gpu_result.as_ref());
+        return Ok(());
+    }
+
+    // Name-pattern rollup mode.
+    if let Some(pattern) = group_by {
+        let matcher = compile_group_by_pattern(pattern)?;
+        let rollup = compute_group_by_rollup(&info.tensors, &matcher);
+        print_group_by_summary(pattern, &rollup);
         maybe_print_gpu_check(gpu_inputs.as_ref(), gpu_result.as_ref());
         return Ok(());
     }
@@ -7326,6 +7365,7 @@ fn run_inspect_repo(
     json: bool,
     filter: Option<&str>,
     dtypes: bool,
+    group_by: Option<&str>,
     limit: Option<usize>,
     tree: bool,
     check_gpu: Option<u32>,
@@ -7335,7 +7375,8 @@ fn run_inspect_repo(
     // must be read; the shard-index file alone has no dtype or shape data.
     // `--check-gpu` also needs per-tensor data to sum weight bytes precisely
     // across shards, so it forces the aggregation path too.
-    let needs_aggregation = dtypes || tree || limit.is_some() || check_gpu.is_some();
+    let needs_aggregation =
+        dtypes || group_by.is_some() || tree || limit.is_some() || check_gpu.is_some();
 
     // The shard-index fast path renders a per-file rollup straight from
     // `model.safetensors.index.json` with no header reads, but it is
@@ -7375,6 +7416,7 @@ fn run_inspect_repo(
                 json,
                 filter,
                 dtypes,
+                group_by,
                 limit,
                 tree,
                 check_gpu,
@@ -7452,6 +7494,7 @@ fn run_inspect_repo(
             json,
             filter,
             dtypes,
+            group_by,
             limit,
             tree,
             check_gpu,
@@ -7482,8 +7525,8 @@ fn run_inspect_repo(
 /// pre-filter, pre-limit totals so footers can show
 /// `shown/total` ratios consistent with the single-file inspect.
 // EXPLICIT: branches mirror `run_inspect_single`'s mode matrix
-// (`tree+json`, `dtypes+json`, plain `--json`, `tree`, `dtypes`,
-// per-tensor table). Splitting would obscure the parity.
+// (`tree+json`, `dtypes+json`, `group-by+json`, plain `--json`, `tree`,
+// `dtypes`, `group-by`, per-tensor table). Splitting would obscure the parity.
 #[allow(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
@@ -7495,6 +7538,7 @@ fn run_inspect_repo_aggregated(
     json: bool,
     filter: Option<&str>,
     dtypes: bool,
+    group_by: Option<&str>,
     limit: Option<usize>,
     tree: bool,
     check_gpu: Option<u32>,
@@ -7590,6 +7634,15 @@ fn run_inspect_repo_aggregated(
         );
     }
 
+    // `--group-by --json`: MATCHED/OTHER rollup, aggregated across shards.
+    if let Some(pattern) = group_by
+        && json
+    {
+        let matcher = compile_group_by_pattern(pattern)?;
+        let rollup = compute_group_by_rollup(&tensors_owned, &matcher);
+        return print_group_by_summary_json(pattern, &rollup, gpu_check_value);
+    }
+
     // Plain `--json` at the repo level on the aggregation path (forced by
     // `--check-gpu` when neither `--tree` nor `--dtypes` is set). Emits a
     // wrapped object so the verdict can ride along — distinct from the
@@ -7613,7 +7666,7 @@ fn run_inspect_repo_aggregated(
     // the non-aggregation bare/`--filter`-only path's `print_multi_file_summary`
     // call ([`run_inspect_repo`]) — `--check-gpu`'s presence no longer changes
     // which rollup shape the rest of the flags produce.
-    if !tree && !dtypes && limit.is_none() {
+    if !tree && !dtypes && group_by.is_none() && limit.is_none() {
         let n_shards = results.len();
         let shard_label = if n_shards == 1 { "shard" } else { "shards" };
         print_multi_file_summary(
@@ -7642,6 +7695,15 @@ fn run_inspect_repo_aggregated(
     // `--dtypes`: per-dtype histogram, aggregated across shards.
     if dtypes {
         print_dtype_summary(&tensors_owned, filter, total_tensor_count, total_params);
+        maybe_print_gpu_check(gpu_inputs.as_ref(), gpu_result.as_ref());
+        return Ok(());
+    }
+
+    // `--group-by`: MATCHED/OTHER rollup, aggregated across shards.
+    if let Some(pattern) = group_by {
+        let matcher = compile_group_by_pattern(pattern)?;
+        let rollup = compute_group_by_rollup(&tensors_owned, &matcher);
+        print_group_by_summary(pattern, &rollup);
         maybe_print_gpu_check(gpu_inputs.as_ref(), gpu_result.as_ref());
         return Ok(());
     }
@@ -7942,6 +8004,243 @@ fn print_dtype_summary(
             inspect::format_params(filtered_params),
         );
     }
+}
+
+/// Compiles a single `--group-by` glob pattern into a matcher.
+///
+/// Uses `globset` directly (rather than `config::compile_glob_patterns`,
+/// which is shaped for a list of download-filter patterns) since `--group-by`
+/// always has exactly one pattern.
+fn compile_group_by_pattern(pattern: &str) -> Result<globset::GlobMatcher, FetchError> {
+    globset::Glob::new(pattern)
+        .map(|g| g.compile_matcher())
+        .map_err(|e| FetchError::InvalidPattern {
+            pattern: pattern.to_owned(),
+            reason: e.to_string(),
+        })
+}
+
+/// Distinct integer values found at the single tensor-name segment position
+/// that varies across `names` (e.g. the layer index `3` in
+/// `blk.3.ffn_gate_exps.weight`).
+///
+/// Splits each name on `.` and looks for exactly one segment position whose
+/// parsed integer varies across `names`; every other position must be either
+/// non-numeric or constant. Returns `None` when zero or more than one varying
+/// numeric position is found — ambiguous (could be a layer index, an expert
+/// index, or something else) — so callers never guess at a layer count.
+fn distinct_layer_indices(names: &[&str]) -> Option<Vec<usize>> {
+    let segment_count = names.first()?.split('.').count();
+    let split: Vec<Vec<&str>> = names.iter().map(|n| n.split('.').collect()).collect();
+    if split.iter().any(|s| s.len() != segment_count) {
+        return None;
+    }
+
+    let mut varying: Option<Vec<usize>> = None;
+    // EXPLICIT: imperative loop instead of an iterator chain — must bail out
+    // early (return None) as soon as a second varying position is found,
+    // which a `.find_map()`/`.fold()` chain would obscure.
+    for pos in 0..segment_count {
+        let parsed: Option<Vec<usize>> = split
+            .iter()
+            .map(|s| s.get(pos).and_then(|seg| seg.parse::<usize>().ok()))
+            .collect();
+        let Some(values) = parsed else {
+            continue; // EXPLICIT: non-numeric segment at this position, not a candidate layer index
+        };
+        let unique: std::collections::BTreeSet<usize> = values.iter().copied().collect();
+        if unique.len() <= 1 {
+            continue; // EXPLICIT: constant at this position, not a layer index
+        }
+        if varying.is_some() {
+            return None; // more than one varying numeric position: ambiguous
+        }
+        varying = Some(unique.into_iter().collect());
+    }
+    varying
+}
+
+/// Aggregated MATCHED/OTHER byte rollup produced by `--group-by`, plus an
+/// optional per-layer average when matched tensor names carry a single,
+/// unambiguous numeric layer index.
+struct GroupByRollup {
+    matched_tensors: usize,
+    matched_params: u64,
+    matched_bytes: u64,
+    other_tensors: usize,
+    other_params: u64,
+    other_bytes: u64,
+    total_tensors: usize,
+    total_params: u64,
+    total_bytes: u64,
+    layer_count: Option<usize>,
+    per_layer_bytes: Option<u64>,
+}
+
+/// Buckets tensors into MATCHED (name matches `matcher`) and OTHER, summing
+/// tensor counts, param counts, and byte totals for each bucket. Generic over
+/// any iterator of `&TensorInfo`, mirroring `compute_dtype_groups`.
+fn compute_group_by_rollup<'a, I>(tensors: I, matcher: &globset::GlobMatcher) -> GroupByRollup
+where
+    I: IntoIterator<Item = &'a inspect::TensorInfo>,
+{
+    let mut matched_tensors = 0usize;
+    let mut matched_params = 0u64;
+    let mut matched_bytes = 0u64;
+    let mut other_tensors = 0usize;
+    let mut other_params = 0u64;
+    let mut other_bytes = 0u64;
+    let mut matched_names: Vec<&str> = Vec::new();
+
+    for t in tensors {
+        if matcher.is_match(&t.name) {
+            matched_tensors += 1;
+            matched_params = matched_params.saturating_add(t.num_elements());
+            matched_bytes = matched_bytes.saturating_add(t.byte_len());
+            matched_names.push(t.name.as_str()); // BORROW: explicit .as_str()
+        } else {
+            other_tensors += 1;
+            other_params = other_params.saturating_add(t.num_elements());
+            other_bytes = other_bytes.saturating_add(t.byte_len());
+        }
+    }
+
+    let layer_count = distinct_layer_indices(&matched_names).map(|v| v.len());
+    let per_layer_bytes = layer_count.and_then(|n| {
+        if n == 0 {
+            None
+        } else {
+            // CAST: usize -> u64, layer count is a small tensor-name-derived count, fits comfortably
+            #[allow(clippy::as_conversions)]
+            let n = n as u64;
+            Some(matched_bytes / n)
+        }
+    });
+
+    GroupByRollup {
+        matched_tensors,
+        matched_params,
+        matched_bytes,
+        other_tensors,
+        other_params,
+        other_bytes,
+        total_tensors: matched_tensors + other_tensors,
+        total_params: matched_params.saturating_add(other_params),
+        total_bytes: matched_bytes.saturating_add(other_bytes),
+        layer_count,
+        per_layer_bytes,
+    }
+}
+
+/// Prints a `--group-by` rollup table: MATCHED / OTHER / TOTAL rows, plus an
+/// optional per-MoE-layer average line.
+fn print_group_by_summary(pattern: &str, rollup: &GroupByRollup) {
+    let matched_label = format!("MATCHED ({pattern})");
+    let label_width = matched_label.len().max("OTHER".len()).max("TOTAL".len());
+    let row_width = label_width + 2 + 8 + 2 + 12 + 2 + 8;
+
+    let pct = |bytes: u64| -> f64 {
+        if rollup.total_bytes == 0 {
+            0.0
+        } else {
+            // CAST: u64 -> f64, percentage display only, precision loss acceptable
+            #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+            let ratio = bytes as f64 / rollup.total_bytes as f64;
+            ratio * 100.0
+        }
+    };
+
+    println!();
+    println!(
+        "  {:<label_width$} {:>8} {:>12} {:>8}",
+        "Group", "Tensors", "Size", "Percent"
+    );
+    println!(
+        "  {:<label_width$} {:>8} {:>12} {:>7.1}%",
+        matched_label,
+        rollup.matched_tensors,
+        format_size(rollup.matched_bytes),
+        pct(rollup.matched_bytes),
+    );
+    println!(
+        "  {:<label_width$} {:>8} {:>12} {:>7.1}%",
+        "OTHER",
+        rollup.other_tensors,
+        format_size(rollup.other_bytes),
+        pct(rollup.other_bytes),
+    );
+    println!("  {}", "\u{2500}".repeat(row_width));
+    println!(
+        "  {:<label_width$} {:>8} {:>12} {:>7.1}%",
+        "TOTAL",
+        rollup.total_tensors,
+        format_size(rollup.total_bytes),
+        pct(rollup.total_bytes),
+    );
+
+    if let (Some(layer_count), Some(per_layer)) = (rollup.layer_count, rollup.per_layer_bytes) {
+        println!();
+        println!(
+            "  per-MoE-layer expert cost: {} ({layer_count} layers)",
+            format_size(per_layer)
+        );
+    }
+}
+
+/// One bucket (`matched` or `other`) of a `--group-by --json` rollup.
+#[derive(serde::Serialize)]
+struct GroupByBucketJson {
+    tensors: usize,
+    params: u64,
+    bytes: u64,
+}
+
+/// JSON shape emitted by `inspect --group-by --json`.
+#[derive(serde::Serialize)]
+struct GroupByJson<'a> {
+    pattern: &'a str,
+    matched: GroupByBucketJson,
+    other: GroupByBucketJson,
+    total_tensors: usize,
+    total_params: u64,
+    total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_layer_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_check: Option<serde_json::Value>,
+}
+
+/// Emits the `--group-by` rollup as JSON.
+fn print_group_by_summary_json(
+    pattern: &str,
+    rollup: &GroupByRollup,
+    gpu_check: Option<serde_json::Value>,
+) -> Result<(), FetchError> {
+    let output = GroupByJson {
+        pattern,
+        matched: GroupByBucketJson {
+            tensors: rollup.matched_tensors,
+            params: rollup.matched_params,
+            bytes: rollup.matched_bytes,
+        },
+        other: GroupByBucketJson {
+            tensors: rollup.other_tensors,
+            params: rollup.other_params,
+            bytes: rollup.other_bytes,
+        },
+        total_tensors: rollup.total_tensors,
+        total_params: rollup.total_params,
+        total_bytes: rollup.total_bytes,
+        layer_count: rollup.layer_count,
+        per_layer_bytes: rollup.per_layer_bytes,
+        gpu_check,
+    };
+    let serialized = serde_json::to_string_pretty(&output)
+        .map_err(|e| FetchError::Http(format!("failed to serialize JSON: {e}")))?;
+    println!("{serialized}");
+    Ok(())
 }
 
 /// Prints the shard-index rollup: tensor counts per shard, plus the matched
@@ -9935,6 +10234,92 @@ mod tests {
             assert_eq!(row.2, *params);
             assert_eq!(row.3, *bytes);
         }
+    }
+
+    // ---------- inspect --group-by ----------
+
+    #[test]
+    fn group_by_rollup_buckets_matched_and_other() {
+        let tensors = vec![
+            make_tensor_info("blk.0.ffn_gate_exps.weight", "Q4_K", vec![256, 2048], 3_000),
+            make_tensor_info("blk.1.ffn_gate_exps.weight", "Q4_K", vec![256, 2048], 3_000),
+            make_tensor_info("blk.0.attn_output.weight", "F16", vec![2048, 2048], 1_000),
+        ];
+        let matcher =
+            compile_group_by_pattern("blk.*.ffn_*_exps.weight").expect("pattern compiles");
+        let rollup = compute_group_by_rollup(&tensors, &matcher);
+
+        assert_eq!(rollup.matched_tensors, 2);
+        assert_eq!(rollup.matched_bytes, 6_000);
+        assert_eq!(rollup.other_tensors, 1);
+        assert_eq!(rollup.other_bytes, 1_000);
+        assert_eq!(rollup.total_tensors, 3);
+        assert_eq!(rollup.total_bytes, 7_000);
+    }
+
+    #[test]
+    fn group_by_rollup_computes_per_layer_average_when_unambiguous() {
+        let tensors = vec![
+            make_tensor_info("blk.0.ffn_gate_exps.weight", "Q4_K", vec![256, 2048], 1_000),
+            make_tensor_info("blk.1.ffn_gate_exps.weight", "Q4_K", vec![256, 2048], 1_500),
+            make_tensor_info("blk.2.ffn_gate_exps.weight", "Q4_K", vec![256, 2048], 500),
+        ];
+        let matcher =
+            compile_group_by_pattern("blk.*.ffn_*_exps.weight").expect("pattern compiles");
+        let rollup = compute_group_by_rollup(&tensors, &matcher);
+
+        assert_eq!(rollup.layer_count, Some(3));
+        assert_eq!(rollup.per_layer_bytes, Some(1_000)); // 3_000 / 3 layers
+    }
+
+    #[test]
+    fn group_by_rollup_omits_per_layer_average_when_no_layer_matched() {
+        let tensors = vec![make_tensor_info(
+            "model.embed_tokens.weight",
+            "F16",
+            vec![100, 100],
+            1_000,
+        )];
+        let matcher =
+            compile_group_by_pattern("blk.*.ffn_*_exps.weight").expect("pattern compiles");
+        let rollup = compute_group_by_rollup(&tensors, &matcher);
+
+        assert_eq!(rollup.matched_tensors, 0);
+        assert_eq!(rollup.layer_count, None);
+        assert_eq!(rollup.per_layer_bytes, None);
+    }
+
+    #[test]
+    fn distinct_layer_indices_returns_none_when_two_positions_vary() {
+        // Both the layer index (position 1) and the expert index (position 3)
+        // vary — ambiguous, so no single layer count can be derived.
+        let names = [
+            "blk.0.ffn_gate_exps.0.weight",
+            "blk.1.ffn_gate_exps.1.weight",
+        ];
+        assert_eq!(distinct_layer_indices(&names), None);
+    }
+
+    #[test]
+    fn distinct_layer_indices_returns_none_when_nothing_varies() {
+        let names = ["blk.0.ffn_gate_exps.weight"];
+        assert_eq!(distinct_layer_indices(&names), None);
+    }
+
+    #[test]
+    fn distinct_layer_indices_finds_the_single_varying_position() {
+        let names = [
+            "blk.3.ffn_gate_exps.weight",
+            "blk.7.ffn_gate_exps.weight",
+            "blk.1.ffn_gate_exps.weight",
+        ];
+        assert_eq!(distinct_layer_indices(&names), Some(vec![1, 3, 7]));
+    }
+
+    #[test]
+    fn compile_group_by_pattern_rejects_invalid_glob() {
+        let err = compile_group_by_pattern("blk.[.weight").expect_err("malformed glob rejected");
+        assert!(matches!(err, FetchError::InvalidPattern { .. }));
     }
 
     #[test]

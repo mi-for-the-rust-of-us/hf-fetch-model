@@ -2037,6 +2037,91 @@ fn inspect_cached_gguf_dtypes_renders() {
 }
 
 #[test]
+fn inspect_cached_gguf_group_by_renders() {
+    // `*` matches every tensor, so MATCHED == TOTAL and OTHER == 0 regardless
+    // of the cached fixture's actual naming — this exercises the renderer
+    // end-to-end without depending on a specific model's tensor names.
+    let Some((repo_id, filename)) = find_cached_gguf_repo() else {
+        eprintln!("SKIP: no cached .gguf file found");
+        return;
+    };
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "inspect",
+        &repo_id,
+        &filename,
+        "--cached",
+        "--group-by",
+        "*",
+    ]));
+    assert!(
+        success,
+        "inspect --cached --group-by on GGUF should succeed: {stderr}"
+    );
+    assert!(
+        stdout.contains("MATCHED") && stdout.contains("OTHER") && stdout.contains("TOTAL"),
+        "GGUF --group-by should show the rollup rows, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn inspect_cached_gguf_group_by_json_renders() {
+    let Some((repo_id, filename)) = find_cached_gguf_repo() else {
+        eprintln!("SKIP: no cached .gguf file found");
+        return;
+    };
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "inspect",
+        &repo_id,
+        &filename,
+        "--cached",
+        "--group-by",
+        "*",
+        "--json",
+    ]));
+    assert!(
+        success,
+        "inspect --cached --group-by --json on GGUF should succeed: {stderr}"
+    );
+    let v = parse_json(&stdout);
+    assert_eq!(v.get("pattern").and_then(Value::as_str), Some("*"));
+    let matched = v
+        .get("matched")
+        .and_then(Value::as_object)
+        .expect("matched object present");
+    assert!(matched.contains_key("tensors"));
+    assert!(matched.contains_key("bytes"));
+    // `*` matches every tensor, so OTHER is empty.
+    assert_eq!(
+        v.get("other")
+            .and_then(|o| o.get("tensors"))
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+}
+
+#[test]
+fn inspect_cached_sharded_group_by_aggregates() {
+    let Some(repo_id) = find_cached_sharded_repo() else {
+        eprintln!("SKIP: no cached sharded safetensors model found");
+        return;
+    };
+    let (stdout, stderr, success) =
+        run(hf_fm().args(["inspect", &repo_id, "--cached", "--group-by", "*"]));
+    assert!(
+        success,
+        "inspect --cached --group-by sharded model should succeed: {stderr}"
+    );
+    assert!(
+        stdout.contains("aggregated across"),
+        "sharded --group-by should report aggregated source, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("MATCHED") && stdout.contains("TOTAL"),
+        "sharded --group-by should show the rollup rows, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn inspect_cached_npz_renders() {
     // v0.10.3 Phase B commit 5: confirm `--cached` inspect works for `.npz`.
     // Delegates to `anamnesis::inspect_npz` which reads only the ZIP central
