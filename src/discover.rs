@@ -706,9 +706,37 @@ fn gguf_source_backlinks(metadata: &HashMap<String, String>) -> Vec<&str> {
         .collect()
 }
 
+/// Picks the `.gguf` file whose header [`build_quant_candidate`] should
+/// inspect for a `general.source.url`-style backlink.
+///
+/// A genuinely sharded `GGUF` file (see [`classify_gguf_files`]) carries its
+/// metadata `KV` table in the *first* split only — `llama.cpp`'s own
+/// convention; later shards' headers hold tensor info alone, no metadata.
+/// Picking the smallest shard by size (very often the *last* one, not the
+/// first) would inspect a header with no backlink key at all and misreport
+/// [`QuantVerification::Unverified`] even when the repo genuinely names its
+/// source. For a mutually-exclusive quant-alternatives set (or a lone
+/// `.gguf` file), smallest-by-size stays the right choice: it is the
+/// cheapest header to fetch, and every alternative carries the same
+/// backlink (they are re-quantizations of the same source checkpoint).
+fn pick_backlink_representative(
+    gguf_files: &[crate::repo::RepoFile],
+) -> Option<&crate::repo::RepoFile> {
+    let filenames: Vec<&str> = gguf_files.iter().map(|f| f.filename.as_str()).collect();
+    if matches!(classify_gguf_files(&filenames), GgufFileSetKind::Sharded) {
+        let first_shard = gguf_files
+            .iter()
+            .find(|f| matches!(parse_gguf_split_name(&f.filename), Some((_, 1, _))));
+        if first_shard.is_some() {
+            return first_shard;
+        }
+    }
+    gguf_files.iter().min_by_key(|f| f.size.unwrap_or(u64::MAX))
+}
+
 /// Lists `candidate_repo_id`'s files and, if it holds at least one `.gguf`
-/// file, cross-checks the smallest one's metadata backlink against
-/// `base_repo_id`.
+/// file, cross-checks a representative one's metadata backlink (see
+/// [`pick_backlink_representative`]) against `base_repo_id`.
 ///
 /// Returns `None` only when a backlink is present and explicitly names a
 /// *different* repo — a naming collision, not a real sibling. Every other
@@ -728,14 +756,13 @@ async fn build_quant_candidate(
         .await
         .ok()?;
 
-    let mut gguf_files: Vec<_> = files
+    let gguf_files: Vec<_> = files
         .iter()
         .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
         .cloned()
         .collect();
-    gguf_files.sort_by_key(|f| f.size.unwrap_or(u64::MAX));
 
-    let Some(representative) = gguf_files.first() else {
+    let Some(representative) = pick_backlink_representative(&gguf_files) else {
         return Some(QuantCandidate {
             repo_id: candidate_repo_id,
             verification: QuantVerification::Unverified,
@@ -1261,6 +1288,60 @@ mod tests {
             "README.md",
         ];
         assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
+    }
+
+    // ---------- pick_backlink_representative ----------
+
+    fn repo_file(filename: &str, size: u64) -> crate::repo::RepoFile {
+        crate::repo::RepoFile {
+            // BORROW: explicit .to_owned() for &str → owned String field
+            filename: filename.to_owned(),
+            size: Some(size),
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn pick_backlink_representative_picks_first_shard_for_a_sharded_set() {
+        // The metadata KV table (and any backlink key) lives only in the
+        // first split, per llama.cpp's own convention — even though it is
+        // not the smallest file here, it must still be the one chosen.
+        let files = vec![
+            repo_file("model-00001-of-00003.gguf", 5_000),
+            repo_file("model-00002-of-00003.gguf", 5_000),
+            repo_file("model-00003-of-00003.gguf", 1_000),
+        ];
+        assert_eq!(
+            pick_backlink_representative(&files).map(|f| f.filename.as_str()),
+            Some("model-00001-of-00003.gguf")
+        );
+    }
+
+    #[test]
+    fn pick_backlink_representative_picks_smallest_for_quant_alternatives() {
+        let files = vec![
+            repo_file("model-Q8_0.gguf", 20_000),
+            repo_file("model-Q4_K_M.gguf", 10_000),
+            repo_file("model-Q3_K_S.gguf", 14_000),
+        ];
+        assert_eq!(
+            pick_backlink_representative(&files).map(|f| f.filename.as_str()),
+            Some("model-Q4_K_M.gguf")
+        );
+    }
+
+    #[test]
+    fn pick_backlink_representative_picks_the_lone_file() {
+        let files = vec![repo_file("model.gguf", 10_000)];
+        assert_eq!(
+            pick_backlink_representative(&files).map(|f| f.filename.as_str()),
+            Some("model.gguf")
+        );
+    }
+
+    #[test]
+    fn pick_backlink_representative_returns_none_for_no_gguf_files() {
+        assert!(pick_backlink_representative(&[]).is_none());
     }
 
     // ---------- fan_out_bounded ----------
