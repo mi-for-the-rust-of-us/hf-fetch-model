@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`hypomnesis` bumped `0.2.10` → `0.2.11`.** Purely additive upstream release (its own changelog carries only an `### Added` section, no `Changed`/`Fixed`), and additive in the part `hf-fm` does not even compile: three of the four new features are `hmn` CLI surface (`ps`'s `SPILL` column and `--min`, a new `fits` exit-code predicate, `watch --json`'s `wall_clock` field), which the `default-features = false` pin here deliberately excludes. The one new library entry point, `hypomnesis::snapshot_is_spilling(device_index) -> Option<bool>`, is a single-snapshot PDH approximation of the spill co-condition and is **not** what `inspect --check-gpu`'s v0.12.0 `Spilling:` line reads — that still calls `is_spill_measurable()`, whose contract 0.2.11 cites as the existing honesty pattern its new `Option<bool>` returns were made to match, and which is unchanged here. Adopting `snapshot_is_spilling` for a live verdict would need its own design pass (upstream is explicit it is not equivalent to `hmn watch`'s verdict for the same instant), so it stays deferred, as the v0.12.0 entry left it. Both the runtime and dev-dependency entries move together, as the `test-helpers` comment in `Cargo.toml` requires. `cargo update -p hypomnesis` touched one package and nothing else; full local CI (fmt, both clippy feature sets, both test commands, and `cargo +1.91` MSRV clippy) is green.
+
 ## [0.12.0] — Backlog cleaning
 
 ### Added

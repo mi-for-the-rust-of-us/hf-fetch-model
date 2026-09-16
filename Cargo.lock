@@ -1149,9 +1149,9 @@ dependencies = [
 
 [[package]]
 name = "hypomnesis"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "572dfa9a7e24ad5b8f9ed7fa9f5f789718f0f634819c2b658d5a6d0084221a1b"
+checksum = "208d4f350bc166045793743e50ead51ec0be5367aa490ad88fd8020ff9f400df"
 dependencies = [
  "libloading",
  "objc2",
