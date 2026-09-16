@@ -3637,6 +3637,51 @@ fn inspect_cache_headers_second_call_hits_the_cache() {
 }
 
 #[test]
+fn inspect_cache_headers_prefers_an_already_locally_cached_file() {
+    // Regression test: every `inspect_*` entry point prefers a file already
+    // in the local hf-hub cache over the network, and `--cache-headers`
+    // must not be the one path that loses that shortcut just because its
+    // cache-miss branch needs an already-open reader to probe the etag —
+    // this is the FIRST-ever `--cache-headers` call for this file, so the
+    // header cache itself is guaranteed to miss.
+    let dir = temp_hf_home();
+    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "download-file",
+        "hf-internal-testing/tiny-random-gpt2",
+        "model.safetensors",
+    ]));
+    assert!(success, "seeding the local cache should succeed: {stderr}");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "inspect",
+        "hf-internal-testing/tiny-random-gpt2",
+        "model.safetensors",
+        "--cache-headers",
+    ]));
+    assert!(success, "--cache-headers inspect should succeed: {stderr}");
+    assert!(
+        stdout.contains("Source:   cached"),
+        "an already-locally-cached file must short-circuit to the local cache, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Source:   remote"),
+        "must not fall through to a remote fetch when the file is locally cached, got:\n{stdout}"
+    );
+
+    // The local-cache short-circuit must happen before the header-cache
+    // sidecar is ever touched — no directory should be created for it.
+    let sidecar_dir = dir
+        .path()
+        .join("hub")
+        .join("models--hf-internal-testing--tiny-random-gpt2")
+        .join(".hf-fm-header-cache");
+    assert!(
+        !sidecar_dir.exists(),
+        "must not create a header-cache sidecar when the local cache already answers the request"
+    );
+}
+
+#[test]
 fn inspect_without_cache_headers_never_creates_the_sidecar_dir() {
     let dir = temp_hf_home();
     let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([

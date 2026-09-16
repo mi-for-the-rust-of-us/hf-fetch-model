@@ -601,9 +601,9 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
         // shape for every caller.
         let cached_files = collect_repo_files(&repo_dir);
         // BORROW: explicit .as_str() instead of Deref coercion
-        let sized: Vec<(&str, u64)> = cached_files
+        let sized: Vec<(&str, Option<u64>)> = cached_files
             .iter()
-            .map(|f| (f.filename.as_str(), f.size))
+            .map(|f| (f.filename.as_str(), Some(f.size)))
             .collect();
         let gguf_size_range = crate::discover::gguf_size_range(sized);
 

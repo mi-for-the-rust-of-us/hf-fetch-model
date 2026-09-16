@@ -522,8 +522,8 @@ pub fn classify_gguf_files(filenames: &[&str]) -> GgufFileSetKind {
     }
 }
 
-/// Computes the min/max size across `.gguf` files in `sized_filenames`, when
-/// they are mutually-exclusive quant alternatives (see
+/// Computes the min/max size across `.gguf` files in `filenames_with_size`,
+/// when they are mutually-exclusive quant alternatives (see
 /// [`classify_gguf_files`]). Returns `None` when the set is `Sharded` or
 /// `NotApplicable` (summing is already correct there) or when none of the
 /// `.gguf` files carry a known size.
@@ -531,14 +531,21 @@ pub fn classify_gguf_files(filenames: &[&str]) -> GgufFileSetKind {
 /// Takes `(filename, size)` pairs rather than a concrete file type so both
 /// the remote listing (`repo::RepoFile`, whose `size` is `Option<u64>`) and
 /// the local cache listing (`cache::CacheFileUsage`, whose `size` is always
-/// known) can share one implementation — callers filter out entries with an
-/// unknown size before calling.
+/// known) can share one implementation. `size` is `Option<u64>` — and every
+/// filename must be passed, not just the ones with a known size —
+/// because classification (`Sharded` vs `QuantAlternatives`) depends on
+/// seeing the *complete* file set: a genuinely sharded repo where the Hub
+/// API happens not to report one shard's size would otherwise lose that
+/// shard's filename before `classify_gguf_files` ever saw it, undercounting
+/// the shard total and misclassifying the whole set as `QuantAlternatives`.
+/// Only the size-known subset feeds the min/max once classification itself
+/// has already run on every filename.
 #[must_use]
-pub fn gguf_size_range<'a, I>(sized_filenames: I) -> Option<(u64, u64)>
+pub fn gguf_size_range<'a, I>(filenames_with_size: I) -> Option<(u64, u64)>
 where
-    I: IntoIterator<Item = (&'a str, u64)>,
+    I: IntoIterator<Item = (&'a str, Option<u64>)>,
 {
-    let pairs: Vec<(&str, u64)> = sized_filenames.into_iter().collect();
+    let pairs: Vec<(&str, Option<u64>)> = filenames_with_size.into_iter().collect();
     let filenames: Vec<&str> = pairs.iter().map(|&(name, _)| name).collect();
     if !matches!(
         classify_gguf_files(&filenames),
@@ -550,7 +557,7 @@ where
     let sizes: Vec<u64> = pairs
         .iter()
         .filter(|&&(name, _)| is_gguf_filename(name))
-        .map(|&(_, size)| size)
+        .filter_map(|&(_, size)| size)
         .collect();
     let min = sizes.iter().copied().min()?;
     let max = sizes.iter().copied().max()?;
@@ -597,9 +604,9 @@ pub async fn fetch_repo_size_summary(
     let total: u64 = files.iter().filter_map(|f| f.size).sum();
 
     // BORROW: explicit .as_str() instead of Deref coercion
-    let sized: Vec<(&str, u64)> = files
+    let sized: Vec<(&str, Option<u64>)> = files
         .iter()
-        .filter_map(|f| f.size.map(|size| (f.filename.as_str(), size)))
+        .map(|f| (f.filename.as_str(), f.size))
         .collect();
     let range = gguf_size_range(sized);
 
@@ -954,6 +961,12 @@ pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<Strin
 ///
 /// Per-repo failures are silently dropped from the returned map; callers
 /// should render rows whose `repo_id` is absent with a placeholder (`—`).
+/// This is deliberately distinct from a client-build failure (see Errors
+/// below): one bad repo is an expected, per-item outcome across a fan-out
+/// this wide, but a token too malformed to become an HTTP header is a
+/// caller configuration error every row would otherwise fail identically
+/// and silently for — worth surfacing loudly instead, the same way
+/// [`search_models`] already does for the same failure mode.
 ///
 /// # Arguments
 ///
@@ -963,21 +976,24 @@ pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<Strin
 ///   applied to every fanned-out request via [`crate::chunked::build_client`]
 ///   — without this, a private or gated repo silently fails to size (the
 ///   same per-repo failure path as a 404, indistinguishable to the caller).
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if `token` cannot be turned into a valid
+/// HTTP header value (via [`crate::chunked::build_client`]) — before any
+/// per-repo request is attempted.
 pub async fn fetch_repo_size_summaries_concurrent(
     repo_ids: Vec<String>,
     token: Option<&str>,
-) -> HashMap<String, RepoSizeSummary> {
-    let Ok(client) = crate::chunked::build_client(token) else {
-        return HashMap::new();
-    };
-    fan_out_bounded(repo_ids, 8, move |repo_id| {
+) -> Result<HashMap<String, RepoSizeSummary>, FetchError> {
+    let client = crate::chunked::build_client(token)?;
+    Ok(fan_out_bounded(repo_ids, 8, move |repo_id| {
         let client = client.clone();
         // EXPLICIT: per-repo failure intentionally swallowed — the caller
         // renders the row with "—" rather than aborting the search.
         async move { fetch_repo_size_summary(&repo_id, &client).await.ok() }
     })
-    .await
+    .await)
 }
 
 /// Fans out [`fetch_model_card`] across the given repository IDs through a
@@ -1290,6 +1306,59 @@ mod tests {
         assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
     }
 
+    // ---------- gguf_size_range ----------
+
+    #[test]
+    fn gguf_size_range_computes_min_max_for_quant_alternatives() {
+        let files = vec![
+            ("model-Q8_0.gguf", Some(20_000)),
+            ("model-Q4_K_M.gguf", Some(10_000)),
+            ("model-Q3_K_S.gguf", Some(14_000)),
+        ];
+        assert_eq!(gguf_size_range(files), Some((10_000, 20_000)));
+    }
+
+    #[test]
+    fn gguf_size_range_returns_none_for_a_sharded_set() {
+        let files = vec![
+            ("model-00001-of-00002.gguf", Some(10_000)),
+            ("model-00002-of-00002.gguf", Some(10_000)),
+        ];
+        assert_eq!(gguf_size_range(files), None);
+    }
+
+    #[test]
+    fn gguf_size_range_still_classifies_sharded_when_one_shard_has_no_known_size() {
+        // Regression test: a genuinely sharded 3-file set where the Hub API
+        // happened not to report one shard's size must still classify as
+        // Sharded (via the full filename list) and therefore return None —
+        // dropping the unsized shard's filename before classification would
+        // leave only 2 of 3 expected filenames, tripping the "file count
+        // must equal the parsed total" check and misclassifying the whole
+        // set as QuantAlternatives, which then reports a bogus min/max
+        // range over only the 2 known-size shards.
+        let files = vec![
+            ("model-00001-of-00003.gguf", Some(5_000)),
+            ("model-00002-of-00003.gguf", None),
+            ("model-00003-of-00003.gguf", Some(5_000)),
+        ];
+        assert_eq!(gguf_size_range(files), None);
+    }
+
+    #[test]
+    fn gguf_size_range_excludes_unsized_files_from_min_max_but_keeps_classifying_on_all() {
+        // A quant-alternatives set where one candidate's size is unknown:
+        // classification still sees all 3 filenames (so 3 mutually-exclusive
+        // `.gguf` files are correctly detected), but the unsized entry is
+        // excluded from the min/max computation itself.
+        let files = vec![
+            ("model-Q8_0.gguf", Some(20_000)),
+            ("model-Q4_K_M.gguf", None),
+            ("model-Q3_K_S.gguf", Some(14_000)),
+        ];
+        assert_eq!(gguf_size_range(files), Some((14_000, 20_000)));
+    }
+
     // ---------- pick_backlink_representative ----------
 
     fn repo_file(filename: &str, size: u64) -> crate::repo::RepoFile {
@@ -1398,6 +1467,25 @@ mod tests {
         assert!(
             max_seen.load(std::sync::atomic::Ordering::SeqCst) <= 2,
             "observed more than 2 tasks in flight at once"
+        );
+    }
+
+    // ---------- fetch_repo_size_summaries_concurrent ----------
+
+    #[tokio::test]
+    async fn fetch_repo_size_summaries_concurrent_reports_a_malformed_token_loudly() {
+        // A token with an embedded newline can never become a valid HTTP
+        // header value — `build_client` fails before any per-repo request
+        // is attempted. This must surface as an `Err`, the same way
+        // `search_models` already fails loudly for the identical cause,
+        // rather than silently degrading to an empty map indistinguishable
+        // from "every repo failed to size".
+        let result =
+            fetch_repo_size_summaries_concurrent(vec!["org/model".to_owned()], Some("bad\ntoken"))
+                .await;
+        assert!(
+            result.is_err(),
+            "a malformed token must be reported as an error"
         );
     }
 }

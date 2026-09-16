@@ -2265,7 +2265,7 @@ fn run_search(
             rt.block_on(discover::fetch_repo_size_summaries_concurrent(
                 repo_ids,
                 token.as_deref(),
-            ))
+            ))?
         } else {
             HashMap::new()
         };
@@ -3580,9 +3580,9 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     // min/max range instead of a total — see `list-files`' identical fix and
     // `discover::gguf_size_range`.
     // BORROW: explicit .as_str() instead of Deref coercion
-    let sized: Vec<(&str, u64)> = files
+    let sized: Vec<(&str, Option<u64>)> = files
         .iter()
-        .map(|f| (f.filename.as_str(), f.size))
+        .map(|f| (f.filename.as_str(), Some(f.size)))
         .collect();
     if let Some((min, max)) = discover::gguf_size_range(sized) {
         println!(
@@ -3810,9 +3810,9 @@ fn print_du_repo_json(
         });
     }
     // BORROW: explicit .as_str() instead of Deref coercion
-    let sized: Vec<(&str, u64)> = files
+    let sized: Vec<(&str, Option<u64>)> = files
         .iter()
-        .map(|f| (f.filename.as_str(), f.size))
+        .map(|f| (f.filename.as_str(), Some(f.size)))
         .collect();
     let range = discover::gguf_size_range(sized);
     let quant_alternatives = range.is_some();
@@ -7760,10 +7760,14 @@ async fn dispatch_inspect_remote_from_reader(
 /// Resolves `filename`'s remote header, transparently consulting and
 /// populating the on-disk header cache when `cache_headers` is set.
 ///
-/// With `cache_headers` off, this is exactly [`dispatch_inspect_remote`].
-/// With it on: probes for the file's current etag first (one extra round
-/// trip — the same "2 extra requests" cost `HttpRangeReader::open` already
-/// pays internally, paid here up front on *every* call, hit or miss, since
+/// With `cache_headers` off, or when `filename` already sits in the local
+/// hf-hub cache (checked via [`inspect::resolve_cached_path`] — every
+/// `inspect_*` entry point prefers a local file over the network, and this
+/// path must not be the one place that preference is lost), this is exactly
+/// [`dispatch_inspect_remote`]. Otherwise: probes for the file's current
+/// etag first (one extra round trip — the same "2 extra requests" cost
+/// `HttpRangeReader::open` already pays internally, paid here up front on
+/// *every* call, hit or miss, since
 /// the etag is the only way to tell which one this is), checks the header
 /// cache keyed on `(repo, revision, filename, etag)`, and on a hit returns
 /// the cached header with [`inspect::InspectSource::CachedHeader`] — no
@@ -7792,14 +7796,19 @@ async fn inspect_remote_with_cache(
     ),
     FetchError,
 > {
-    if !cache_headers {
+    let rev = revision.unwrap_or("main");
+    if !cache_headers || inspect::resolve_cached_path(repo_id, rev, filename).is_some() {
+        // Either the header cache is off, or the file already sits in the
+        // local hf-hub cache — every `inspect_*` entry point prefers a
+        // local file over the network, and `--cache-headers` must not be
+        // the one path that loses that shortcut just because its cache-miss
+        // branch needs an already-open reader to probe the etag.
         return dispatch_inspect_remote(
             repo_id, filename, revision, token, is_npz, is_gguf, is_pth,
         )
         .await;
     }
 
-    let rev = revision.unwrap_or("main");
     let cache_dir = cache::hf_cache_dir()?;
     let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id);
 
@@ -10077,9 +10086,9 @@ fn run_list_files(
     let row_width = fw + 2 + 10 + 2 + 12;
     println!("  {:\u{2500}<row_width$}", "");
     // BORROW: explicit .as_str() instead of Deref coercion
-    let sized: Vec<(&str, u64)> = filtered
+    let sized: Vec<(&str, Option<u64>)> = filtered
         .iter()
-        .filter_map(|f| f.size.map(|size| (f.filename.as_str(), size)))
+        .map(|f| (f.filename.as_str(), f.size))
         .collect();
     if let Some((min, max)) = discover::gguf_size_range(sized) {
         let cached_suffix = if show_cached {
@@ -10193,9 +10202,9 @@ fn print_list_files_json(
     }
 
     // BORROW: explicit .as_str() instead of Deref coercion
-    let sized: Vec<(&str, u64)> = files
+    let sized: Vec<(&str, Option<u64>)> = files
         .iter()
-        .filter_map(|f| f.size.map(|size| (f.filename.as_str(), size)))
+        .map(|f| (f.filename.as_str(), f.size))
         .collect();
     let range = discover::gguf_size_range(sized);
     let quant_alternatives = range.is_some();

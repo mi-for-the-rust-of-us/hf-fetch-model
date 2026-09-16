@@ -379,8 +379,15 @@ pub struct ModelConfig {
 
 /// Resolves a cached file path for a given repo, revision, and filename.
 ///
-/// Returns `None` if the file is not in the local cache.
-fn resolve_cached_path(repo_id: &str, revision: &str, filename: &str) -> Option<PathBuf> {
+/// Returns `None` if the file is not in the local cache. Every `inspect_*`
+/// entry point in this module checks this first, before ever touching the
+/// network — `pub` so a caller composing its own dispatch around these
+/// entry points (the `hf-fm` CLI's `--cache-headers` path, which needs to
+/// probe a reader for the file's etag before it can consult its own header
+/// cache) can preserve that same local-cache preference instead of losing
+/// it.
+#[must_use]
+pub fn resolve_cached_path(repo_id: &str, revision: &str, filename: &str) -> Option<PathBuf> {
     let cache_dir = cache::hf_cache_dir().ok()?;
     let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id);
     let commit_hash = cache::read_ref(&repo_dir, revision)?;
