@@ -565,8 +565,29 @@ pub async fn inspect_safetensors(
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
-    // then hand the reader to a blocking thread for the sync parse.
+    // then hand the reader off to the shared from-reader parse path.
     let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    inspect_safetensors_from_reader(reader, filename).await
+}
+
+/// Parses a `.safetensors` header from an already-open [`HttpRangeReader`].
+///
+/// Split out of [`inspect_safetensors`] so a caller that already had a
+/// reason to open a reader over the same file — `hf-fm`'s `--cache-headers`
+/// path probes one for the file's current etag before consulting its header
+/// cache — can reuse it here on a cache miss instead of paying for a second
+/// [`HttpRangeReader::open`] round trip.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if a range request fails — including gated
+/// repos, which surface as `returned status 401/403` errors (the `hf-fm`
+/// CLI upgrades those into a gated-repo diagnosis).
+/// Returns [`FetchError::SafetensorsHeader`] if the header is malformed.
+pub async fn inspect_safetensors_from_reader(
+    reader: HttpRangeReader,
+    filename: &str,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     let file_size = reader.total_size();
 
     let (parse_result, stats, transport_error) = tokio::task::spawn_blocking(move || {
@@ -805,8 +826,29 @@ pub async fn inspect_gguf(
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
-    // then hand the reader to a blocking thread for the sync parse.
+    // then hand the reader off to the shared from-reader parse path.
     let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    inspect_gguf_from_reader(reader, filename).await
+}
+
+/// Parses a `.gguf` file's metadata from an already-open [`HttpRangeReader`].
+///
+/// Split out of [`inspect_gguf`] so a caller that already had a reason to
+/// open a reader over the same file — `hf-fm`'s `--cache-headers` path
+/// probes one for the file's current etag before consulting its header
+/// cache — can reuse it here on a cache miss instead of paying for a second
+/// [`HttpRangeReader::open`] round trip.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if a range request fails — including gated
+/// repos, which surface as `returned status 401/403` errors (the `hf-fm`
+/// CLI upgrades those into a gated-repo diagnosis).
+/// Returns [`FetchError::SafetensorsHeader`] if the GGUF file is malformed.
+pub async fn inspect_gguf_from_reader(
+    reader: HttpRangeReader,
+    filename: &str,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     let file_size = reader.total_size();
 
     let (parse_result, stats, transport_error) = tokio::task::spawn_blocking(move || {
@@ -980,8 +1022,29 @@ pub async fn inspect_npz(
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
-    // then hand the reader to a blocking thread for the sync parse.
+    // then hand the reader off to the shared from-reader parse path.
     let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    inspect_npz_from_reader(reader, filename).await
+}
+
+/// Parses a `.npz` archive's metadata from an already-open [`HttpRangeReader`].
+///
+/// Split out of [`inspect_npz`] so a caller that already had a reason to
+/// open a reader over the same file — `hf-fm`'s `--cache-headers` path
+/// probes one for the file's current etag before consulting its header
+/// cache — can reuse it here on a cache miss instead of paying for a second
+/// [`HttpRangeReader::open`] round trip.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if a range request fails — including gated
+/// repos, which surface as `returned status 401/403` errors (the `hf-fm`
+/// CLI upgrades those into a gated-repo diagnosis).
+/// Returns [`FetchError::SafetensorsHeader`] if the `NPZ` archive is malformed.
+pub async fn inspect_npz_from_reader(
+    reader: HttpRangeReader,
+    filename: &str,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     let file_size = reader.total_size();
 
     let (parse_result, stats, transport_error) = tokio::task::spawn_blocking(move || {
@@ -1164,8 +1227,29 @@ pub async fn inspect_pth(
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
-    // then hand the reader to a blocking thread for the sync parse.
+    // then hand the reader off to the shared from-reader parse path.
     let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    inspect_pth_from_reader(reader, filename).await
+}
+
+/// Parses a `.pth` archive's metadata from an already-open [`HttpRangeReader`].
+///
+/// Split out of [`inspect_pth`] so a caller that already had a reason to
+/// open a reader over the same file — `hf-fm`'s `--cache-headers` path
+/// probes one for the file's current etag before consulting its header
+/// cache — can reuse it here on a cache miss instead of paying for a second
+/// [`HttpRangeReader::open`] round trip.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if a range request fails — including gated
+/// repos, which surface as `returned status 401/403` errors (the `hf-fm`
+/// CLI upgrades those into a gated-repo diagnosis).
+/// Returns [`FetchError::SafetensorsHeader`] if the PTH file is malformed.
+pub async fn inspect_pth_from_reader(
+    reader: HttpRangeReader,
+    filename: &str,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     let file_size = reader.total_size();
 
     let (parse_result, stats, transport_error) = tokio::task::spawn_blocking(move || {

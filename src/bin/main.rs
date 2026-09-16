@@ -7691,8 +7691,11 @@ struct InspectJsonOutput<'a> {
 
 /// Dispatches to the format-specific remote `inspect_*` entry point.
 ///
-/// Shared by the plain remote path and [`inspect_remote_with_cache`]'s
-/// cache-miss path, so the four-way format dispatch exists in one place.
+/// Used by the plain remote path (no `--cache-headers`). On a
+/// `--cache-headers` cache miss, [`inspect_remote_with_cache`] instead calls
+/// [`dispatch_inspect_remote_from_reader`], reusing the reader it already
+/// opened to probe the etag rather than dispatching here and paying for a
+/// second [`HttpRangeReader::open`].
 async fn dispatch_inspect_remote(
     repo_id: &str,
     filename: &str,
@@ -7722,6 +7725,38 @@ async fn dispatch_inspect_remote(
     }
 }
 
+/// Dispatches to the format-specific `inspect_*_from_reader` entry point,
+/// parsing `reader` in place rather than opening a fresh one.
+///
+/// The reader-accepting counterpart to [`dispatch_inspect_remote`] — see
+/// its callers' doc comments for why this variant exists.
+async fn dispatch_inspect_remote_from_reader(
+    reader: HttpRangeReader,
+    filename: &str,
+    is_npz: bool,
+    is_gguf: bool,
+    is_pth: bool,
+) -> Result<
+    (
+        inspect::SafetensorsHeaderInfo,
+        inspect::InspectSource,
+        Option<RangeStats>,
+    ),
+    FetchError,
+> {
+    if is_npz {
+        inspect::inspect_npz_from_reader(reader, filename).await
+    } else if is_gguf {
+        inspect::inspect_gguf_from_reader(reader, filename).await
+    } else if is_pth {
+        inspect::inspect_pth_from_reader(reader, filename).await
+    } else {
+        // Reachable only for is_safetensors — the caller already rejected
+        // any other extension before reaching here.
+        inspect::inspect_safetensors_from_reader(reader, filename).await
+    }
+}
+
 /// Resolves `filename`'s remote header, transparently consulting and
 /// populating the on-disk header cache when `cache_headers` is set.
 ///
@@ -7732,12 +7767,13 @@ async fn dispatch_inspect_remote(
 /// the etag is the only way to tell which one this is), checks the header
 /// cache keyed on `(repo, revision, filename, etag)`, and on a hit returns
 /// the cached header with [`inspect::InspectSource::CachedHeader`] — no
-/// further range requests. On a miss, falls through to
-/// [`dispatch_inspect_remote`] (which reprobes internally; not deduplicated
-/// against the probe above, a known minor redundancy) and writes the result
-/// to the cache before returning it. A cache **write** failure is logged to
-/// stderr but never fails the inspect — the header was still fetched
-/// successfully; only the opportunistic save didn't stick.
+/// further range requests. On a miss, the already-open reader is handed to
+/// [`dispatch_inspect_remote_from_reader`] instead of re-dispatching through
+/// [`dispatch_inspect_remote`], which would open a second, redundant
+/// [`HttpRangeReader`] over the same file — and the result is written to the
+/// cache before returning it. A cache **write** failure is logged to stderr
+/// but never fails the inspect — the header was still fetched successfully;
+/// only the opportunistic save didn't stick.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 async fn inspect_remote_with_cache(
     repo_id: &str,
@@ -7768,11 +7804,11 @@ async fn inspect_remote_with_cache(
     let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id);
 
     let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
-    // BORROW: explicit .to_owned() — the reader borrows this etag, and is
-    // dropped at the end of this statement (its probe already paid for by
-    // `open` above; no range reads are issued through it).
+    // BORROW: explicit .to_owned() — the etag is needed both to build the
+    // cache-lookup key below and, later, as an owned field in the cache
+    // entry written on a miss, while `reader` itself is consumed by
+    // `dispatch_inspect_remote_from_reader` on that same miss path.
     let etag = reader.probe_etag().to_owned();
-    drop(reader);
 
     let cache_path = cache_layout::header_cache_path(&repo_dir, filename, &etag);
     if let Some(entry) =
@@ -7786,9 +7822,11 @@ async fn inspect_remote_with_cache(
         ));
     }
 
+    // Cache miss: reuse the reader already opened above for the etag probe
+    // instead of dispatching through `dispatch_inspect_remote`, which would
+    // open a second one over the same file.
     let (info, source, stats) =
-        dispatch_inspect_remote(repo_id, filename, revision, token, is_npz, is_gguf, is_pth)
-            .await?;
+        dispatch_inspect_remote_from_reader(reader, filename, is_npz, is_gguf, is_pth).await?;
 
     // BORROW: explicit .to_owned() for &str → owned String fields
     let entry = header_cache::HeaderCacheEntry::new(
