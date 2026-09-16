@@ -427,7 +427,7 @@ pub enum GgufFileSetKind {
     /// split whose index is `1` — under `llama.cpp`'s own convention, the
     /// *only* shard carrying the `GGUF` metadata `KV` table (and therefore
     /// any backlink key); later shards' headers hold tensor info alone.
-    /// Carried here, rather than re-derived by [`pick_backlink_representative`]
+    /// Carried here, rather than re-derived by `pick_backlink_representative`
     /// via its own separate scan, so classification and "which file is
     /// shard 1" can never drift apart.
     Sharded {
@@ -477,7 +477,7 @@ fn parse_gguf_split_name(filename: &str) -> Option<(&str, u32, u32)> {
 /// mutually-exclusive quant alternatives.
 ///
 /// `Sharded` requires **every** `.gguf` file in `filenames` to match
-/// [`parse_gguf_split_name`] with the same prefix and total, the file count
+/// `parse_gguf_split_name` with the same prefix and total, the file count
 /// to equal that total, and the indices to cover `1..=total` exactly.
 /// Anything else with two or more `.gguf` files — a mismatched prefix, a
 /// file outside the split convention entirely, a missing or duplicate index
@@ -738,7 +738,7 @@ fn gguf_source_backlinks(metadata: &HashMap<String, String>) -> Vec<&str> {
         .collect()
 }
 
-/// Picks the `.gguf` file whose header [`build_quant_candidate`] should
+/// Picks the `.gguf` file whose header `build_quant_candidate` should
 /// inspect for a `general.source.url`-style backlink.
 ///
 /// A genuinely sharded `GGUF` file (see [`classify_gguf_files`]) carries its
@@ -848,7 +848,7 @@ async fn build_quant_candidate(
 /// Searches the Hub for the base model's short name (the part of
 /// `base_repo_id` after `/`), keeps results whose repo ID contains that name
 /// as a case-insensitive substring (excluding `base_repo_id` itself), then
-/// fans out [`build_quant_candidate`] across the survivors through a bounded
+/// fans out `build_quant_candidate` across the survivors through a bounded
 /// `tokio::sync::Semaphore` (8 permits, mirroring [`fetch_repo_sizes_concurrent`]).
 ///
 /// Sibling discovery has no dedicated Hub endpoint — quant repos

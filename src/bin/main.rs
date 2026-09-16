@@ -10400,7 +10400,7 @@ fn format_age(time: std::time::SystemTime) -> String {
     }
 }
 
-/// Formats a [`Duration`](std::time::Duration) as a compact age string with
+/// Formats a [`Duration`] as a compact age string with
 /// minute granularity (`"32s"`, `"5m"`, `"3h"`, `"2d"`).
 ///
 /// Distinct from [`format_age`]: that one formats a [`SystemTime`] with

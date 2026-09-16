@@ -85,8 +85,8 @@ pub fn read_snapshot(repo_dir: &Path) -> Result<Option<Snapshot>, FetchError> {
 
 /// Writes the [`Snapshot`] sidecar for a repository, atomically (write to a
 /// `.tmp` sibling, then rename), via the shared
-/// [`crate::atomic_write::write_atomic_sync`] helper — the same durability
-/// pattern [`crate::chunked_state::ChunkedState::save_atomic`] and
+/// `atomic_write::write_atomic_sync` helper — the same durability
+/// pattern `chunked_state::ChunkedState::save_atomic` and
 /// [`crate::header_cache::HeaderCacheEntry::save_atomic`] use, synchronous
 /// here since this call site has no `tokio` runtime handy.
 ///

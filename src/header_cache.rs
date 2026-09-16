@@ -3,8 +3,8 @@
 //! Opt-in on-disk cache for parsed remote tensor-file headers.
 //!
 //! `inspect --cache-headers` persists the parsed header — the same
-//! [`SafetensorsHeaderInfo`](crate::inspect::SafetensorsHeaderInfo) every
-//! format (`.safetensors` / `.gguf` / `.npz` / `.pth`) normalizes into —
+//! [`SafetensorsHeaderInfo`] every format (`.safetensors` / `.gguf` /
+//! `.npz` / `.pth`) normalizes into —
 //! keyed on `(repo, revision, filename, etag)`, so repeat inspection of the
 //! same remote file across invocations (the natural pattern of iterative
 //! narrowing over a handful of quant candidates) is free on the second and
@@ -35,7 +35,7 @@ const SCHEMA_VERSION: u32 = 1;
 /// On-disk cache entry for one parsed remote header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeaderCacheEntry {
-    /// Cache schema version. Compared against [`SCHEMA_VERSION`].
+    /// Cache schema version. Compared against `SCHEMA_VERSION`.
     pub schema_version: u32,
     /// The repository identifier this entry was parsed for.
     pub repo: String,
@@ -115,8 +115,8 @@ impl HeaderCacheEntry {
     }
 
     /// Writes this entry to `path` atomically (write-tmp + rename), via the
-    /// shared [`crate::atomic_write::write_atomic`] helper — the same
-    /// durability pattern [`crate::chunked_state::ChunkedState::save_atomic`]
+    /// shared `atomic_write::write_atomic` helper — the same
+    /// durability pattern `chunked_state::ChunkedState::save_atomic`
     /// uses. Creates the parent directory (`.hf-fm-header-cache/`) if it
     /// does not exist yet — the first `--cache-headers` call against a repo
     /// that was never downloaded.
