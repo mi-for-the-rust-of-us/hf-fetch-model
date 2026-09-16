@@ -307,6 +307,10 @@ hf-fm inspect poolside/Laguna-XS-2.1-GGUF Q4_K_M.gguf --group-by 'blk.*.ffn_*_ex
 # Inspect a PyTorch .pth checkpoint (remote or cached, since v0.11.4 — reads
 # only the data.pkl pickle stream, never the tensor-data files)
 hf-fm inspect RWKV/RWKV7-Goose-World-PTH RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth --dtypes
+
+# Cache the parsed header locally — a repeat call against the same file
+# reports "Source: cached header (age: ...)" and skips the range requests
+hf-fm inspect bartowski/gemma-2-2b-it-GGUF gemma-2-2b-it-Q4_K_M.gguf --cache-headers
 ```
 
 ## Peek examples
@@ -676,6 +680,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `--cache-headers` | Persist the parsed remote header to a `.hf-fm-header-cache/` sidecar keyed on `(repo, revision, filename, etag)`, so a repeat inspect of the same file reports `Source: cached header (age: ...)` and skips the range requests entirely. Off by default — a plain remote inspect never touches local disk without this flag. A changed etag is a cache miss, not a stale hit. Applies to the single-file inspect path only (a specific `FILENAME`, or an index resolved from `--list`); the whole-repo aggregation path does not cache per-shard yet. Conflicts with `--cached` (which never does a remote fetch to cache in the first place). | off |
 | `--cached` | Cache-only mode: fail if the file is not cached locally | off |
 | `--check-gpu [N]` | Append a one-line GPU-fit verdict comparing model weight bytes against free VRAM on device `N` (default `0`). Reads device info via [`hypomnesis`](https://crates.io/crates/hypomnesis) (NVML on Linux/Windows, DXGI on Windows; falls back to `nvidia-smi`). On systems with no NVIDIA GPU detected, prints `GPU N: unavailable — <reason>` and skips the verdict (exit code stays `0` — the command is informational, not a gate). Uses the **unfiltered** model totals (so `--filter` / `--limit` affect only the printed table). On success, also prints a `Spilling:` line reporting whether this platform *can* detect `WDDM` VRAM spilling at all (`hypomnesis::is_spill_measurable`) — a capability check, not a live observation; `hf-fm` does not sample over time. Composes with `--json`: a `gpu_check` object is added to the per-file schema, the `--tree --json` schema, and the `--dtypes --json` schema (gaining a `spill_measurable` boolean alongside `device`/`fits`); the repo-level plain `--json` schema becomes `{"files": [...], "gpu_check": {...}}` when `--check-gpu` is passed (the array schema is preserved when it is absent). At the whole-repo level, forces shard aggregation so the verdict reflects the total weight bytes across every shard. Conflicts with `--list` (no headers are read in `--list` mode). | off |
 | `--context N` | KV-cache context length for the `--check-gpu` verdict (**requires `--check-gpu`**). Reads the model's `config.json`, computes the KV cache at sequence length `N`, and measures fit against `weights + KV` instead of weights alone — adding `KV cache @ ctx=N` and `Total` lines. Parameter-driven and architecture-aware: GQA, sliding-window (Gemma / Mistral, with mixed local/global blended), and hybrid Mamba/attention (Granite-4, Nemotron-H, Bamba, Qwen3-Next — a separate `Recurrent state` line for the Mamba2 state). MLA (DeepSeek) is **skipped** with a note; an absent / dimension-less `config.json` prints `KV cache: unavailable` and falls back to weights-only (exit code stays `0`). KV element size is the activation dtype (`torch_dtype`, bf16/fp16 = 2 B). Composes with `--json` (the `gpu_check` object gains a `kv_cache` sub-object and `model.total_bytes`). | — |

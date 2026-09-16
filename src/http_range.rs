@@ -479,6 +479,13 @@ pub struct HttpRangeFetcher {
     /// First `ETag` observed on a range response — later responses must
     /// match it (self-consistency across requests).
     response_etag: Option<String>,
+    /// The etag observed at probe time, before any range request — the
+    /// same value `chunked::probe_range_support` uses for the blob path in
+    /// the `hf-hub` cache. Read by `inspect --cache-headers` to key its
+    /// header cache without an extra round trip; distinct from
+    /// `response_etag`, which validates self-consistency across the range
+    /// requests this reader itself issues.
+    probe_etag: String,
     /// Total file size from the probe's `Content-Range`.
     total_size: u64,
     /// Probe requests spent (no-redirect probe + CDN size fetch).
@@ -554,9 +561,25 @@ impl HttpRangeReader {
             max_transfer_bytes,
         ))
     }
+
+    /// The etag observed at probe time, before any range request.
+    ///
+    /// Lets a caller key a cache entry (`inspect --cache-headers`) on the
+    /// same etag `hf-hub`'s own blob layout uses, without an extra round
+    /// trip beyond the probe [`HttpRangeReader::open`] already made.
+    #[must_use]
+    pub fn probe_etag(&self) -> &str {
+        self.fetcher.probe_etag()
+    }
 }
 
 impl HttpRangeFetcher {
+    /// The etag observed at probe time, before any range request.
+    #[must_use]
+    fn probe_etag(&self) -> &str {
+        self.probe_etag.as_str()
+    }
+
     /// Probes `filename` and constructs the transport (see
     /// [`HttpRangeReader::open`]).
     ///
@@ -592,6 +615,7 @@ impl HttpRangeFetcher {
             // BORROW: explicit .to_owned() for the owned field
             filename: filename.to_owned(),
             response_etag: None,
+            probe_etag: info.etag,
             total_size: info.content_length,
             extra: 2, // no-redirect probe + CDN size fetch
         })

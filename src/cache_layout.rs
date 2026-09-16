@@ -111,6 +111,34 @@ pub fn ref_path(repo_dir: &Path, revision: &str) -> PathBuf {
     refs_dir(repo_dir).join(revision)
 }
 
+/// Header-cache directory: `{repo_dir}/.hf-fm-header-cache/`.
+///
+/// An `hf-fm`-private sidecar directory, not part of the standard `hf-hub`
+/// layout — holds `inspect --cache-headers` entries, following the same
+/// precedent as the `.hf-fm-snapshot.json` sidecar in [`crate::cache`].
+#[must_use]
+pub fn header_cache_dir(repo_dir: &Path) -> PathBuf {
+    repo_dir.join(".hf-fm-header-cache")
+}
+
+/// Header-cache entry path:
+/// `{repo_dir}/.hf-fm-header-cache/{sanitized filename}.{etag}.json`.
+///
+/// `filename` may contain path separators (a nested file, e.g.
+/// `subdir/model.gguf`) — sanitized to a single path component by replacing
+/// `/` and `\` with `__`, so the cache directory never needs subdirectories
+/// of its own. Uses string concatenation rather than [`Path::with_extension`]
+/// so an etag containing periods round-trips correctly, the same rationale
+/// as [`temp_blob_path`] / [`temp_state_path`].
+#[must_use]
+pub fn header_cache_path(repo_dir: &Path, filename: &str, etag: &str) -> PathBuf {
+    let mut name = filename.replace(['/', '\\'], "__");
+    name.push('.');
+    name.push_str(etag);
+    name.push_str(".json");
+    header_cache_dir(repo_dir).join(name)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
@@ -158,6 +186,45 @@ mod tests {
         assert_eq!(
             temp_state_path(rd, "abc.def"),
             rd.join("blobs").join("abc.def.chunked.part.state")
+        );
+    }
+
+    #[test]
+    fn header_cache_path_joins_repo_dir_filename_and_etag() {
+        let rd = Path::new("/tmp/models--x--y");
+        assert_eq!(
+            header_cache_path(rd, "model.gguf", "abc123"),
+            rd.join(".hf-fm-header-cache")
+                .join("model.gguf.abc123.json")
+        );
+    }
+
+    #[test]
+    fn header_cache_path_sanitizes_nested_filenames() {
+        let rd = Path::new("/tmp/models--x--y");
+        assert_eq!(
+            header_cache_path(rd, "subdir/model.gguf", "abc123"),
+            rd.join(".hf-fm-header-cache")
+                .join("subdir__model.gguf.abc123.json")
+        );
+    }
+
+    #[test]
+    fn header_cache_path_preserves_periods_in_etag() {
+        let rd = Path::new("/tmp/models--x--y");
+        assert_eq!(
+            header_cache_path(rd, "model.gguf", "abc.def"),
+            rd.join(".hf-fm-header-cache")
+                .join("model.gguf.abc.def.json")
+        );
+    }
+
+    #[test]
+    fn header_cache_path_lives_under_header_cache_dir() {
+        let rd = Path::new("/tmp/models--x--y");
+        assert_eq!(
+            header_cache_path(rd, "model.gguf", "abc123").parent(),
+            Some(header_cache_dir(rd).as_path())
         );
     }
 }

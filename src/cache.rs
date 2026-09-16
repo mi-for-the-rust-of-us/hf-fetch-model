@@ -592,6 +592,16 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
         // Check for partial downloads.
         let has_partial = find_partial_blob_size(&crate::cache_layout::blobs_dir(&repo_dir)) > 0;
 
+        // A repo directory that exists but holds no snapshot files and no
+        // partial download uses zero disk for actual model data — most
+        // commonly today, a repo whose directory was created solely by
+        // `inspect --cache-headers` (a header-cache sidecar, not a
+        // download). `du` reports disk usage, so a repo contributing
+        // nothing to it does not belong in the list.
+        if file_count == 0 && total_size == 0 && !has_partial {
+            continue;
+        }
+
         summaries.push(CachedModelSummary {
             repo_id,
             file_count,

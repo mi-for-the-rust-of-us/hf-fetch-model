@@ -3562,6 +3562,67 @@ fn info_json_output() {
 // -----------------------------------------------------------------------
 
 #[test]
+fn inspect_cache_headers_second_call_hits_the_cache() {
+    // Isolated HF_HOME: a real repo directory gets created here solely by
+    // the header-cache write (never downloaded), and we want a clean slate
+    // to assert the first call is a genuine miss.
+    let dir = temp_hf_home();
+    let (stdout1, stderr1, success1) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "inspect",
+        "hf-internal-testing/tiny-random-gpt2",
+        "model.safetensors",
+        "--cache-headers",
+    ]));
+    assert!(
+        success1,
+        "first --cache-headers call should succeed: {stderr1}"
+    );
+    assert!(
+        stdout1.contains("Source:   remote ("),
+        "first call should be a genuine remote fetch, got:\n{stdout1}"
+    );
+
+    let (stdout2, stderr2, success2) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "inspect",
+        "hf-internal-testing/tiny-random-gpt2",
+        "model.safetensors",
+        "--cache-headers",
+    ]));
+    assert!(
+        success2,
+        "second --cache-headers call should succeed: {stderr2}"
+    );
+    assert!(
+        stdout2.contains("Source:   cached header (age:"),
+        "second call should hit the header cache, got:\n{stdout2}"
+    );
+    // The tensor table itself must be identical whether cached or not.
+    assert!(stdout2.contains("transformer.wte.weight"));
+}
+
+#[test]
+fn inspect_without_cache_headers_never_creates_the_sidecar_dir() {
+    let dir = temp_hf_home();
+    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "inspect",
+        "hf-internal-testing/tiny-random-gpt2",
+        "model.safetensors",
+    ]));
+    assert!(success, "plain remote inspect should succeed: {stderr}");
+
+    // No repo directory at all should have been created — a plain remote
+    // inspect never touches local disk without --cache-headers.
+    let hub_dir = dir.path().join("hub");
+    let has_repo_dir =
+        std::fs::read_dir(&hub_dir).is_ok_and(|mut entries| entries.next().is_some());
+    assert!(
+        !has_repo_dir,
+        "plain inspect must not create any cache directory, found entries under {}",
+        hub_dir.display()
+    );
+}
+
+#[test]
 fn quants_help_shows_fits_and_reserve_flags() {
     let (stdout, stderr, success) = run(hf_fm().args(["quants", "--help"]));
     assert!(success, "quants --help failed: {stderr}");

@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-08-28, hf-fm v0.12.0 (diff --collapse, diff-config) -->
+<!-- Last updated: 2026-09-16, hf-fm v0.12.1 (inspect --group-by, quants --fits, --cache-headers) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -72,6 +72,7 @@ A living list of the questions we and our early users have actually run into. If
   - [Is it safe to `inspect` a `.pth` file from a repo I don't trust?](#is-it-safe-to-inspect-a-pth-file-from-a-repo-i-dont-trust)
   - [I got a `checksum mismatch` error — what do I do?](#i-got-a-checksum-mismatch-error--what-do-i-do)
   - [Why does `inspect` say `Source: remote (N range requests, X fetched)`?](#why-does-inspect-say-source-remote-n-range-requests-x-fetched)
+  - [How do I avoid re-fetching the same remote header on every inspect call?](#how-do-i-avoid-re-fetching-the-same-remote-header-on-every-inspect-call)
   - [Why didn't my pipeline catch a download failure?](#why-didnt-my-pipeline-catch-a-download-failure)
 
 ---
@@ -423,9 +424,19 @@ A `checksum mismatch` means the file's computed SHA256 does not match the hash H
 
 ### Why does `inspect` say `Source: remote (N range requests, X fetched)`?
 
-Remote `.safetensors`, `.npz`, and `.gguf` inspect (v0.11.1, v0.11.0, and v0.11.2 respectively) all ride the same `HttpRangeReader` substrate, and the line reports the *measured* cost of that run rather than a fixed count — the on-screen proof that `inspect` read metadata, not weights. The reader enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted file cannot silently turn an inspect into a full download. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all.
+Remote `.safetensors`, `.npz`, and `.gguf` inspect (v0.11.1, v0.11.0, and v0.11.2 respectively) all ride the same `HttpRangeReader` substrate, and the line reports the *measured* cost of that run rather than a fixed count — the on-screen proof that `inspect` read metadata, not weights. The reader enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted file cannot silently turn an inspect into a full download. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all — distinct from `Source: cached header (age: ...)`, which `--cache-headers` (below) produces for a *remote* file whose already-parsed header was reused.
 
 For `.safetensors`, the header is a little-endian `u64` length prefix followed by the `JSON` header itself, both at the very start of the file — the reader's 4 KiB read-ahead window usually covers both in a single fetch, with a second fetch only when the header is larger than that window (common on many-tensor models). Every remote path on this substrate also bakes in a fixed one-time access probe (2 requests), so a small shard reads e.g. `Source: remote (4 range requests, 8.0 KiB fetched)` (live-measured against `hf-internal-testing/tiny-random-gpt2`). For `.npz`, the requests fetch the `ZIP` central directory and the per-array `NPY` headers — e.g. `Source: remote (6 range requests, 136.0 KiB fetched)` against a 72 MiB GemmaScope archive. For `.gguf`, the requests cover the front-loaded metadata KV table and tensor-info table (both live before the tensor-data section, so a single linear scan never touches weight bytes) — e.g. `Source: remote (30 range requests, 1.75 MiB fetched)` against an 84 MiB quantized `bartowski/SmolLM2-135M-Instruct-GGUF` shard. No format on this substrate ever downloads tensor data.
+
+### How do I avoid re-fetching the same remote header on every inspect call?
+
+Pass `--cache-headers`:
+
+```
+hf-fm inspect bartowski/gemma-2-2b-it-GGUF gemma-2-2b-it-Q4_K_M.gguf --cache-headers
+```
+
+The first call parses the header normally and saves it to a `.hf-fm-header-cache/` sidecar next to the repo's usual cache directory, keyed on `(repo, revision, filename, etag)`. A second call against the same file reports `Source: cached header (age: 2m)` and skips the range requests entirely — a changed etag (the upstream file was updated) is a cache miss, not a stale hit. Off by default: a plain `inspect` never touches local disk without this flag, even against a repo you have never downloaded. Useful for the iterative-narrowing pattern `hf-fm quants` encourages — checking the same handful of candidates more than once while deciding.
 
 ### Why didn't my pipeline catch a download failure?
 

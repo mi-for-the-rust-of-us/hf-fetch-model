@@ -17,14 +17,16 @@ use clap::{
 use tracing_subscriber::EnvFilter;
 
 use hf_fetch_model::cache;
+use hf_fetch_model::cache_layout;
 use hf_fetch_model::discover;
+use hf_fetch_model::header_cache;
 use hf_fetch_model::inspect;
 use hf_fetch_model::peek;
 use hf_fetch_model::progress::IndicatifProgress;
 use hf_fetch_model::repo;
 use hf_fetch_model::{
-    DownloadPlan, FetchConfig, FetchConfigBuilder, FetchError, Filter, compile_glob_patterns,
-    file_matches, has_glob_chars,
+    DownloadPlan, FetchConfig, FetchConfigBuilder, FetchError, Filter, HttpRangeReader, RangeStats,
+    compile_glob_patterns, file_matches, has_glob_chars,
 };
 
 #[path = "../format.rs"]
@@ -517,6 +519,22 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Cache-only mode: fail if the file is not cached locally.
         #[arg(long)]
         cached: bool,
+        /// Persist parsed remote headers to a local sidecar so repeat
+        /// inspection of the same file is free on later calls.
+        ///
+        /// Off by default — a plain remote `inspect` never touches local
+        /// disk without this flag. Keyed on `(repo, revision, filename,
+        /// etag)`; a changed etag on a later call is a cache miss, not a
+        /// stale hit. Entries live under a `.hf-fm-header-cache/` sidecar
+        /// directory next to the repo's normal cache tree (created on first
+        /// use if the repo was never downloaded). Meaningless with
+        /// `--cached` (which never does a remote fetch to cache in the
+        /// first place), so the two conflict. Applies to the single-file
+        /// inspect path only (a specific `FILENAME`, or an index resolved
+        /// from `--list`) — the whole-repo, multi-shard aggregation path
+        /// (bare `inspect <repo>`) does not cache per-shard yet.
+        #[arg(long, conflicts_with = "cached")]
+        cache_headers: bool,
         /// List supported tensor files in the repo (filename + size) and exit.
         ///
         /// Covers `.safetensors` / `.gguf` / `.npz` / `.pth`. Prints a numbered
@@ -1111,6 +1129,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             revision,
             token,
             cached,
+            cache_headers,
             list,
             pick,
             no_metadata,
@@ -1128,6 +1147,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             revision.as_deref(),
             token.as_deref(),
             cached,
+            cache_headers,
             list,
             pick,
             no_metadata,
@@ -6263,6 +6283,7 @@ fn run_inspect(
     revision: Option<&str>,
     token: Option<&str>,
     cached: bool,
+    cache_headers: bool,
     list: bool,
     pick: bool,
     no_metadata: bool,
@@ -6287,6 +6308,7 @@ fn run_inspect(
             revision,
             token,
             cached,
+            cache_headers,
             no_metadata,
             json,
             filter,
@@ -6309,6 +6331,7 @@ fn run_inspect(
                 revision,
                 token,
                 cached,
+                cache_headers,
                 no_metadata,
                 json,
                 filter,
@@ -7502,6 +7525,121 @@ struct InspectJsonOutput<'a> {
     gpu_check: Option<serde_json::Value>,
 }
 
+/// Dispatches to the format-specific remote `inspect_*` entry point.
+///
+/// Shared by the plain remote path and [`inspect_remote_with_cache`]'s
+/// cache-miss path, so the four-way format dispatch exists in one place.
+async fn dispatch_inspect_remote(
+    repo_id: &str,
+    filename: &str,
+    revision: Option<&str>,
+    token: Option<&str>,
+    is_npz: bool,
+    is_gguf: bool,
+    is_pth: bool,
+) -> Result<
+    (
+        inspect::SafetensorsHeaderInfo,
+        inspect::InspectSource,
+        Option<RangeStats>,
+    ),
+    FetchError,
+> {
+    if is_npz {
+        inspect::inspect_npz(repo_id, filename, token, revision).await
+    } else if is_gguf {
+        inspect::inspect_gguf(repo_id, filename, token, revision).await
+    } else if is_pth {
+        inspect::inspect_pth(repo_id, filename, token, revision).await
+    } else {
+        // Reachable only for is_safetensors — the caller already rejected
+        // any other extension before reaching here.
+        inspect::inspect_safetensors(repo_id, filename, token, revision).await
+    }
+}
+
+/// Resolves `filename`'s remote header, transparently consulting and
+/// populating the on-disk header cache when `cache_headers` is set.
+///
+/// With `cache_headers` off, this is exactly [`dispatch_inspect_remote`].
+/// With it on: probes for the file's current etag first (one extra round
+/// trip — the same "2 extra requests" cost `HttpRangeReader::open` already
+/// pays internally, paid here up front on *every* call, hit or miss, since
+/// the etag is the only way to tell which one this is), checks the header
+/// cache keyed on `(repo, revision, filename, etag)`, and on a hit returns
+/// the cached header with [`inspect::InspectSource::CachedHeader`] — no
+/// further range requests. On a miss, falls through to
+/// [`dispatch_inspect_remote`] (which reprobes internally; not deduplicated
+/// against the probe above, a known minor redundancy) and writes the result
+/// to the cache before returning it. A cache **write** failure is logged to
+/// stderr but never fails the inspect — the header was still fetched
+/// successfully; only the opportunistic save didn't stick.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+async fn inspect_remote_with_cache(
+    repo_id: &str,
+    filename: &str,
+    revision: Option<&str>,
+    token: Option<&str>,
+    is_npz: bool,
+    is_gguf: bool,
+    is_pth: bool,
+    cache_headers: bool,
+) -> Result<
+    (
+        inspect::SafetensorsHeaderInfo,
+        inspect::InspectSource,
+        Option<RangeStats>,
+    ),
+    FetchError,
+> {
+    if !cache_headers {
+        return dispatch_inspect_remote(
+            repo_id, filename, revision, token, is_npz, is_gguf, is_pth,
+        )
+        .await;
+    }
+
+    let rev = revision.unwrap_or("main");
+    let cache_dir = cache::hf_cache_dir()?;
+    let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id);
+
+    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    // BORROW: explicit .to_owned() — the reader borrows this etag, and is
+    // dropped at the end of this statement (its probe already paid for by
+    // `open` above; no range reads are issued through it).
+    let etag = reader.probe_etag().to_owned();
+    drop(reader);
+
+    let cache_path = cache_layout::header_cache_path(&repo_dir, filename, &etag);
+    if let Some(entry) =
+        header_cache::HeaderCacheEntry::load(&cache_path, repo_id, rev, filename, &etag).await
+    {
+        let age = entry.cached_at.elapsed().unwrap_or_default();
+        return Ok((
+            entry.info,
+            inspect::InspectSource::CachedHeader { age },
+            None,
+        ));
+    }
+
+    let (info, source, stats) =
+        dispatch_inspect_remote(repo_id, filename, revision, token, is_npz, is_gguf, is_pth)
+            .await?;
+
+    let entry = header_cache::HeaderCacheEntry::new(
+        repo_id.to_owned(),
+        rev.to_owned(),
+        filename.to_owned(),
+        etag,
+        info.clone(),
+    );
+    if let Err(e) = entry.save_atomic(&cache_path).await {
+        eprintln!("warning: failed to write header cache entry: {e}");
+    }
+
+    Ok((info, source, stats))
+}
+
 /// Inspects a single `.safetensors` file and prints the result.
 // EXPLICIT: composes header fetch, filter/tree/dtypes/limit branching, and
 // JSON-vs-table output formatting. Splitting would obscure the inspect mode
@@ -7517,6 +7655,7 @@ fn run_inspect_single(
     revision: Option<&str>,
     token: Option<&str>,
     cached: bool,
+    cache_headers: bool,
     no_metadata: bool,
     json: bool,
     filter: Option<&str>,
@@ -7572,36 +7711,16 @@ fn run_inspect_single(
             source: e,
         })?;
         // BORROW: explicit .as_deref() for Option<String> → Option<&str>
-        if is_npz {
-            rt.block_on(inspect::inspect_npz(
-                repo_id,
-                filename,
-                token.as_deref(),
-                revision,
-            ))?
-        } else if is_gguf {
-            rt.block_on(inspect::inspect_gguf(
-                repo_id,
-                filename,
-                token.as_deref(),
-                revision,
-            ))?
-        } else if is_pth {
-            rt.block_on(inspect::inspect_pth(
-                repo_id,
-                filename,
-                token.as_deref(),
-                revision,
-            ))?
-        } else {
-            // Reachable only for is_safetensors (see the comment above).
-            rt.block_on(inspect::inspect_safetensors(
-                repo_id,
-                filename,
-                token.as_deref(),
-                revision,
-            ))?
-        }
+        rt.block_on(inspect_remote_with_cache(
+            repo_id,
+            filename,
+            revision,
+            token.as_deref(),
+            is_npz,
+            is_gguf,
+            is_pth,
+            cache_headers,
+        ))?
     };
 
     // `--check-gpu` uses the unfiltered model totals — fit is a whole-model
@@ -7715,6 +7834,9 @@ fn run_inspect_single(
         // Unreachable via any current call path (see comment above); a
         // generic label beats guessing at a request count.
         (inspect::InspectSource::Remote, None) => "remote".to_owned(),
+        (inspect::InspectSource::CachedHeader { age }, _) => {
+            format!("cached header (age: {})", format_short_age(age))
+        }
         _ => "unknown".to_owned(),
     };
     println!("  Repo:     {repo_id}");
@@ -10069,6 +10191,34 @@ fn format_age(time: std::time::SystemTime) -> String {
     }
 }
 
+/// Formats a [`Duration`](std::time::Duration) as a compact age string with
+/// minute granularity (`"32s"`, `"5m"`, `"3h"`, `"2d"`).
+///
+/// Distinct from [`format_age`]: that one formats a [`SystemTime`] with
+/// hour-or-coarser buckets for `du --age`'s day-to-day cache freshness;
+/// `inspect --cache-headers`'s `Source:` line wants finer resolution for the
+/// "I re-ran this five minutes ago" case the header cache specifically
+/// targets, so it gets its own formatter rather than a `format_age` change
+/// that would also affect `du --age`'s unrelated display.
+///
+/// [`SystemTime`]: std::time::SystemTime
+fn format_short_age(age: std::time::Duration) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    let secs = age.as_secs();
+    if secs < MINUTE {
+        format!("{secs}s")
+    } else if secs < HOUR {
+        format!("{}m", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h", secs / HOUR)
+    } else {
+        format!("{}d", secs / DAY)
+    }
+}
+
 /// Resolves the flat-copy target directory from an optional `--output-dir`.
 ///
 /// Falls back to the current working directory when no explicit directory is given.
@@ -11011,6 +11161,20 @@ mod tests {
     fn compile_group_by_pattern_rejects_invalid_glob() {
         let err = compile_group_by_pattern("blk.[.weight").expect_err("malformed glob rejected");
         assert!(matches!(err, FetchError::InvalidPattern { .. }));
+    }
+
+    // ---------- inspect --cache-headers ----------
+
+    #[test]
+    fn format_short_age_buckets_by_unit() {
+        assert_eq!(format_short_age(Duration::from_secs(5)), "5s");
+        assert_eq!(format_short_age(Duration::from_secs(59)), "59s");
+        assert_eq!(format_short_age(Duration::from_secs(60)), "1m");
+        assert_eq!(format_short_age(Duration::from_secs(150)), "2m");
+        assert_eq!(format_short_age(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_short_age(Duration::from_secs(7200)), "2h");
+        assert_eq!(format_short_age(Duration::from_secs(86_400)), "1d");
+        assert_eq!(format_short_age(Duration::from_secs(2 * 86_400)), "2d");
     }
 
     // ---------- quants / --fits ----------

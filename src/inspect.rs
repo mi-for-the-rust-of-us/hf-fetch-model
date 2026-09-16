@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 use crate::cache;
@@ -51,7 +51,7 @@ use crate::http_range::{HttpRangeReader, RangeStats};
 ///
 /// This is hf-fetch-model's own type — lightweight, no quantization logic.
 /// Consumers (e.g., anamnesis) map this into their own richer types.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorInfo {
     /// Tensor name (e.g., `"model.layers.0.self_attn.q_proj.weight"`).
     pub name: String,
@@ -145,7 +145,7 @@ pub fn torch_dtype_bytes(torch_dtype: Option<&str>) -> u8 {
 /// output (`"FineGrainedFp8"`, `"Bnb4"`, `"Gptq"`, `"Awq"`, …); consumers
 /// that need to match exact variants should call
 /// `anamnesis::parse_safetensors_header` themselves.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantInfo {
     /// Detected quantization scheme as the `Display` form of
     /// `anamnesis::QuantScheme` (e.g. `"FineGrainedFp8"`, `"Bnb4"`).
@@ -168,7 +168,7 @@ pub struct QuantInfo {
 /// and will keep growing in v0.11.x. External library consumers should
 /// pattern-match with `..` or use field reads, not exhaustive struct
 /// literals.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SafetensorsHeaderInfo {
     /// All tensors in the header, in the order they appear in the JSON.
@@ -255,6 +255,15 @@ pub enum InspectSource {
     Cached,
     /// Fetched via HTTP Range requests.
     Remote,
+    /// Read from `inspect --cache-headers`'s on-disk header cache.
+    ///
+    /// A real network probe still happened (to read the current etag and
+    /// confirm the cache entry is still valid), but the full header parse —
+    /// the dozens of range requests `Remote` implies — was skipped.
+    CachedHeader {
+        /// How long ago this entry was written.
+        age: std::time::Duration,
+    },
 }
 
 /// Parsed `model.safetensors.index.json` for a sharded model.

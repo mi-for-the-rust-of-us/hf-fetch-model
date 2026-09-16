@@ -235,6 +235,7 @@ pub mod config;
 pub mod discover;
 pub mod download;
 pub mod error;
+pub mod header_cache;
 pub mod http_range;
 pub mod inspect;
 pub mod peek;
