@@ -3289,6 +3289,17 @@ fn resolve_du_arg(arg: &str) -> Result<String, FetchError> {
 }
 
 /// Shows disk usage summary for all cached repos, sorted by size descending.
+/// Renders one repo's size cell: the plain formatted total, or a `min to
+/// max` range when `gguf_size_range` is `Some` (the repo's `.gguf` files
+/// are mutually-exclusive quant alternatives — see
+/// [`discover::gguf_size_range`]). Shared by `du`'s flat and `--tree` views.
+fn format_repo_size_cell(total_size: u64, gguf_size_range: Option<(u64, u64)>) -> String {
+    match gguf_size_range {
+        Some((min, max)) => format!("{} to {}", format_size(min), format_size(max)),
+        None => format_size(total_size),
+    }
+}
+
 fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
 
@@ -3321,14 +3332,25 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         .unwrap_or(0)
         .max(48);
 
+    // Pre-format each row's size cell (plain total, or a `min to max` range
+    // for a repo whose `.gguf` files are mutually-exclusive quant
+    // alternatives — see `format_repo_size_cell`) so the SIZE column can
+    // size itself to the widest cell, the same dynamic-width convention
+    // every other hf-fm table uses.
+    let size_cells: Vec<String> = summaries
+        .iter()
+        .map(|s| format_repo_size_cell(s.total_size, s.gguf_size_range))
+        .collect();
+    let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // BORROW: "SIZE".len()
+
     if age {
         println!(
-            "  {:>3}  {:>10}  {:<repo_width$} {:>5}  {:<15}",
+            "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}  {:<15}",
             "#", "SIZE", "REPO", "FILES", "AGE"
         );
     } else {
         println!(
-            "  {:>3}  {:>10}  {:<repo_width$} {:>5}",
+            "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}",
             "#", "SIZE", "REPO", "FILES"
         );
     }
@@ -3336,10 +3358,12 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let mut total_size: u64 = 0;
     let mut total_files: usize = 0;
     let mut any_partial = false;
+    let mut any_quant_alternatives = false;
 
-    for (i, s) in summaries.iter().enumerate() {
+    for (i, (s, size_cell)) in summaries.iter().zip(size_cells.iter()).enumerate() {
         total_size = total_size.saturating_add(s.total_size);
         total_files = total_files.saturating_add(s.file_count);
+        any_quant_alternatives |= s.gguf_size_range.is_some();
 
         let partial_marker = if s.has_partial {
             any_partial = true;
@@ -3353,9 +3377,9 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
                 .last_modified
                 .map_or_else(|| "\u{2014}".to_owned(), format_age);
             println!(
-                "  {:>3}  {:>10}  {:<repo_width$} {:>5}  {:<15}{}",
+                "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}  {:<15}{}",
                 i + 1,
-                format_size(s.total_size),
+                size_cell,
                 s.repo_id,
                 s.file_count,
                 age_str,
@@ -3363,9 +3387,9 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
             );
         } else {
             println!(
-                "  {:>3}  {:>10}  {:<repo_width$} {:>5}{}",
+                "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}{}",
                 i + 1,
-                format_size(s.total_size),
+                size_cell,
                 s.repo_id,
                 s.file_count,
                 partial_marker,
@@ -3373,16 +3397,16 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         }
     }
 
-    // 3 (pad) + 2 + 3 (#) + 2 + 10 (SIZE) + 2 + repo_width + 2 + 5 (FILES) = repo_width + 29
+    // 3 (pad) + 2 + 3 (#) + 2 + sw (SIZE) + 2 + repo_width + 2 + 5 (FILES) = repo_width + sw + 19
     // When --age is active, add 2 (gap) + 15 (AGE column) = 17 extra.
     let rule_width = if age {
-        repo_width + 46
+        repo_width + sw + 36
     } else {
-        repo_width + 29
+        repo_width + sw + 19
     };
     println!("  {}", "\u{2500}".repeat(rule_width));
     println!(
-        "  {:>10}  total ({} {}, {} {})",
+        "  {:>sw$}  total ({} {}, {} {})",
         format_size(total_size),
         summaries.len(),
         pluralize(summaries.len(), "repo", "repos"),
@@ -3391,6 +3415,15 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     );
     if any_partial {
         println!("  \u{25cf} = partial downloads");
+    }
+    if any_quant_alternatives {
+        println!(
+            "  Note: a size range means that repo's cached `.gguf` files are \
+             mutually exclusive quant alternatives rather than shards of one \
+             file — you likely only need one of them (see `du <repo>` for the \
+             exact file sizes). The total above still reflects real bytes on \
+             disk across every cached file."
+        );
     }
 
     Ok(())
@@ -3438,21 +3471,13 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     println!("  {}", "\u{2500}".repeat(row_width));
     // A repo holding N mutually-exclusive `.gguf` quant alternatives gets a
     // min/max range instead of a total — see `list-files`' identical fix and
-    // `discover::classify_gguf_files`.
+    // `discover::gguf_size_range`.
     // BORROW: explicit .as_str() instead of Deref coercion
-    let cached_filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
-    let quant_alternatives = matches!(
-        discover::classify_gguf_files(&cached_filenames),
-        discover::GgufFileSetKind::QuantAlternatives
-    );
-    if quant_alternatives {
-        let gguf_sizes: Vec<u64> = files
-            .iter()
-            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
-            .map(|f| f.size)
-            .collect();
-        let min = gguf_sizes.iter().copied().min().unwrap_or(0);
-        let max = gguf_sizes.iter().copied().max().unwrap_or(0);
+    let sized: Vec<(&str, u64)> = files
+        .iter()
+        .map(|f| (f.filename.as_str(), f.size))
+        .collect();
+    if let Some((min, max)) = discover::gguf_size_range(sized) {
         println!(
             "  {} to {}  (mutually exclusive quants, {} {})",
             format_size(min),
@@ -3520,6 +3545,17 @@ struct DuRepoJson {
     has_partial: bool,
     /// Most recent file mtime as Unix epoch seconds (`null` if unknown).
     last_modified: Option<u64>,
+    /// `true` when this repo's `.gguf` files are mutually-exclusive quant
+    /// alternatives rather than shards of one logical file (same meaning as
+    /// `list-files --json`'s field of the same name). `size` above stays a
+    /// well-defined sum either way.
+    quant_alternatives: bool,
+    /// Smallest cached `.gguf` file's size, present only when `quant_alternatives` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_min: Option<u64>,
+    /// Largest cached `.gguf` file's size, present only when `quant_alternatives` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_max: Option<u64>,
     /// Per-file leaves; present only under `--tree`.
     #[serde(skip_serializing_if = "Option::is_none")]
     files: Option<Vec<DuFileJson>>,
@@ -3586,6 +3622,9 @@ fn print_du_json(
             file_count: s.file_count,
             has_partial: s.has_partial,
             last_modified: system_time_to_unix(s.last_modified),
+            quant_alternatives: s.gguf_size_range.is_some(),
+            size_min: s.gguf_size_range.map(|(min, _)| min),
+            size_max: s.gguf_size_range.map(|(_, max)| max),
             files: None,
         });
     }
@@ -3628,6 +3667,9 @@ fn print_du_tree_json(
             file_count: r.file_count,
             has_partial: r.has_partial,
             last_modified: system_time_to_unix(r.last_modified),
+            quant_alternatives: r.gguf_size_range.is_some(),
+            size_min: r.gguf_size_range.map(|(min, _)| min),
+            size_max: r.gguf_size_range.map(|(_, max)| max),
             files: Some(files),
         });
     }
@@ -3661,24 +3703,14 @@ fn print_du_repo_json(
         });
     }
     // BORROW: explicit .as_str() instead of Deref coercion
-    let cached_filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
-    let quant_alternatives = matches!(
-        discover::classify_gguf_files(&cached_filenames),
-        discover::GgufFileSetKind::QuantAlternatives
-    );
-    let (size_min, size_max) = if quant_alternatives {
-        let gguf_sizes: Vec<u64> = files
-            .iter()
-            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
-            .map(|f| f.size)
-            .collect();
-        (
-            gguf_sizes.iter().copied().min(),
-            gguf_sizes.iter().copied().max(),
-        )
-    } else {
-        (None, None)
-    };
+    let sized: Vec<(&str, u64)> = files
+        .iter()
+        .map(|f| (f.filename.as_str(), f.size))
+        .collect();
+    let range = discover::gguf_size_range(sized);
+    let quant_alternatives = range.is_some();
+    let size_min = range.map(|(min, _)| min);
+    let size_max = range.map(|(_, max)| max);
 
     let result = DuRepoDetailJson {
         // BORROW: explicit .to_string()/.to_owned() for owned fields
@@ -3773,6 +3805,10 @@ struct CacheTreeRepo {
     has_partial: bool,
     /// Most recent file modification time, if available.
     last_modified: Option<std::time::SystemTime>,
+    /// `(min, max)` size across this repo's `.gguf` files, when they are
+    /// mutually-exclusive quant alternatives (see
+    /// [`discover::gguf_size_range`]). `None` when not applicable.
+    gguf_size_range: Option<(u64, u64)>,
     /// Per-file leaves, sorted by size descending.
     files: Vec<CacheTreeFile>,
 }
@@ -3814,6 +3850,7 @@ fn build_cache_tree() -> Result<Vec<CacheTreeRepo>, FetchError> {
             file_count: s.file_count,
             has_partial: s.has_partial,
             last_modified: s.last_modified,
+            gguf_size_range: s.gguf_size_range,
             files,
         });
     }
@@ -3887,7 +3924,7 @@ impl CacheTreeWidths {
 
         let natural_size = repos
             .iter()
-            .map(|r| format_size(r.total_size).len())
+            .map(|r| format_repo_size_cell(r.total_size, r.gguf_size_range).len())
             .max()
             .unwrap_or(0)
             .max(8); // floor: typical "x.xx GiB" length
@@ -3984,7 +4021,7 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
     let connector = if is_last { "└── " } else { "├── " };
     let indent = if is_last { "    " } else { "│   " };
 
-    let size_str = format_size(repo.total_size);
+    let size_str = format_repo_size_cell(repo.total_size, repo.gguf_size_range);
     let files_str = format_file_count(repo.file_count);
     let partial_marker = if repo.has_partial { "  \u{25cf}" } else { "" };
 
@@ -4073,6 +4110,7 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
         .map(|r| r.file_count)
         .fold(0_usize, usize::saturating_add);
     let any_partial = repos.iter().any(|r| r.has_partial);
+    let any_quant_alternatives = repos.iter().any(|r| r.gguf_size_range.is_some());
 
     println!("\n  {}", "\u{2500}".repeat(widths.rule_width()));
     println!(
@@ -4085,6 +4123,14 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     );
     if any_partial {
         println!("  \u{25cf} = partial downloads");
+    }
+    if any_quant_alternatives {
+        println!(
+            "  Note: a size range means that repo's cached `.gguf` files are \
+             mutually exclusive quant alternatives rather than shards of one \
+             file — you likely only need one of them. The total above still \
+             reflects real bytes on disk across every cached file."
+        );
     }
 
     Ok(())
@@ -9878,25 +9924,17 @@ fn run_list_files(
     // alternatives gets a min/max range instead of a total — summing them
     // implies a single download nobody would make (unlike a genuinely
     // sharded file, where the total is correct because every shard is
-    // needed). See `discover::classify_gguf_files`.
+    // needed). See `discover::gguf_size_range`.
     let count = filtered.len();
     let file_label = pluralize(count, "file", "files");
     let row_width = fw + 2 + 10 + 2 + 12;
     println!("  {:\u{2500}<row_width$}", "");
     // BORROW: explicit .as_str() instead of Deref coercion
-    let listed_filenames: Vec<&str> = filtered.iter().map(|f| f.filename.as_str()).collect();
-    let quant_alternatives = matches!(
-        discover::classify_gguf_files(&listed_filenames),
-        discover::GgufFileSetKind::QuantAlternatives
-    );
-    if quant_alternatives {
-        let gguf_sizes: Vec<u64> = filtered
-            .iter()
-            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
-            .filter_map(|f| f.size)
-            .collect();
-        let min = gguf_sizes.iter().copied().min().unwrap_or(0);
-        let max = gguf_sizes.iter().copied().max().unwrap_or(0);
+    let sized: Vec<(&str, u64)> = filtered
+        .iter()
+        .filter_map(|f| f.size.map(|size| (f.filename.as_str(), size)))
+        .collect();
+    if let Some((min, max)) = discover::gguf_size_range(sized) {
         let cached_suffix = if show_cached {
             format!(" ({cached_count} cached)")
         } else {
@@ -10008,24 +10046,14 @@ fn print_list_files_json(
     }
 
     // BORROW: explicit .as_str() instead of Deref coercion
-    let listed_filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
-    let quant_alternatives = matches!(
-        discover::classify_gguf_files(&listed_filenames),
-        discover::GgufFileSetKind::QuantAlternatives
-    );
-    let (size_min, size_max) = if quant_alternatives {
-        let gguf_sizes: Vec<u64> = files
-            .iter()
-            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
-            .filter_map(|f| f.size)
-            .collect();
-        (
-            gguf_sizes.iter().copied().min(),
-            gguf_sizes.iter().copied().max(),
-        )
-    } else {
-        (None, None)
-    };
+    let sized: Vec<(&str, u64)> = files
+        .iter()
+        .filter_map(|f| f.size.map(|size| (f.filename.as_str(), size)))
+        .collect();
+    let range = discover::gguf_size_range(sized);
+    let quant_alternatives = range.is_some();
+    let size_min = range.map(|(min, _)| min);
+    let size_max = range.map(|(_, max)| max);
 
     let result = ListFilesResult {
         // BORROW: explicit .to_owned() for &str → owned String
@@ -10681,6 +10709,7 @@ mod tests {
             total_size: size,
             has_partial,
             last_modified: mtime,
+            gguf_size_range: None,
         }
     }
 

@@ -3665,6 +3665,42 @@ fn cache_headers_only_repo_is_hidden_from_du_but_visible_to_status() {
 }
 
 #[test]
+fn du_and_du_tree_show_range_for_locally_cached_quant_alternatives() {
+    // Synthetic cache fixture (no network): two mutually-exclusive .gguf
+    // "quant" files of different sizes, staged directly into an isolated
+    // HF_HOME's cache layout. Regression pin for the whole-cache `du` and
+    // `du --tree` views, which previously kept summing these instead of
+    // showing a range the way `du <repo>` and `list-files` already do.
+    let dir = temp_hf_home();
+    let snapshot_dir = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--multi-quant-repo")
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&snapshot_dir).expect("create synthetic snapshot dir");
+    std::fs::write(snapshot_dir.join("model-Q4_K_M.gguf"), vec![0u8; 4_000])
+        .expect("write small quant fixture");
+    std::fs::write(snapshot_dir.join("model-Q8_0.gguf"), vec![0u8; 8_000])
+        .expect("write large quant fixture");
+
+    let (du_stdout, du_stderr, du_success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(du_success, "du should succeed: {du_stderr}");
+    assert!(
+        du_stdout.contains(" to ") && du_stdout.contains("mutually"),
+        "du should show a size range for the quant-alternatives repo, got:\n{du_stdout}"
+    );
+
+    let (tree_stdout, tree_stderr, tree_success) =
+        run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--tree"]));
+    assert!(tree_success, "du --tree should succeed: {tree_stderr}");
+    assert!(
+        tree_stdout.contains(" to ") && tree_stdout.contains("mutually"),
+        "du --tree should show a size range for the quant-alternatives repo, got:\n{tree_stdout}"
+    );
+}
+
+#[test]
 fn quants_help_shows_fits_and_reserve_flags() {
     let (stdout, stderr, success) = run(hf_fm().args(["quants", "--help"]));
     assert!(success, "quants --help failed: {stderr}");

@@ -550,6 +550,11 @@ pub struct CachedModelSummary {
     ///
     /// `None` if no files were found or all metadata reads failed.
     pub last_modified: Option<std::time::SystemTime>,
+    /// `(min, max)` size across this repo's `.gguf` files, when they are
+    /// mutually-exclusive quant alternatives rather than shards of one
+    /// logical file (see [`crate::discover::gguf_size_range`]). `None` when
+    /// not applicable — `total_size` is already the correct figure then.
+    pub gguf_size_range: Option<(u64, u64)>,
 }
 
 /// Scans the entire HF cache and returns a summary for each cached model.
@@ -589,6 +594,19 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
         // Count files and total size in snapshots.
         let (file_count, total_size, last_modified) = count_snapshot_files(&repo_dir);
 
+        // A second, lightweight walk to classify `.gguf` quant alternatives
+        // — kept separate from `count_snapshot_files` above (which tracks
+        // last-modified time that `CacheFileUsage` doesn't carry) rather
+        // than unifying the two, to avoid changing that struct's public
+        // shape for every caller.
+        let cached_files = collect_repo_files(&repo_dir);
+        // BORROW: explicit .as_str() instead of Deref coercion
+        let sized: Vec<(&str, u64)> = cached_files
+            .iter()
+            .map(|f| (f.filename.as_str(), f.size))
+            .collect();
+        let gguf_size_range = crate::discover::gguf_size_range(sized);
+
         // Check for partial downloads.
         let has_partial = find_partial_blob_size(&crate::cache_layout::blobs_dir(&repo_dir)) > 0;
 
@@ -608,6 +626,7 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
             total_size,
             has_partial,
             last_modified,
+            gguf_size_range,
         });
     }
 
@@ -907,13 +926,23 @@ pub fn cache_repo_usage(repo_id: &str) -> Result<Vec<CacheFileUsage>, FetchError
         return Ok(Vec::new());
     }
 
-    let snapshots_dir = crate::cache_layout::snapshots_dir(&repo_dir);
-    let Ok(snapshots) = std::fs::read_dir(&snapshots_dir) else {
-        return Ok(Vec::new());
+    let mut files = collect_repo_files(&repo_dir);
+    files.sort_by_key(|f| std::cmp::Reverse(f.size));
+    Ok(files)
+}
+
+/// Collects every file (relative path + size) across `repo_dir`'s snapshot
+/// directories. Shared walking logic behind [`cache_repo_usage`] (which
+/// additionally resolves `repo_id` → `repo_dir` and sorts by size) and
+/// [`cache_summary`] (which needs the raw filenames to classify `.gguf`
+/// quant alternatives via [`crate::discover::gguf_size_range`]).
+fn collect_repo_files(repo_dir: &Path) -> Vec<CacheFileUsage> {
+    let snapshots_dir = crate::cache_layout::snapshots_dir(repo_dir);
+    let Ok(snapshots) = std::fs::read_dir(snapshots_dir) else {
+        return Vec::new();
     };
 
     let mut files: Vec<CacheFileUsage> = Vec::new();
-
     for snap_entry in snapshots {
         let Ok(snap_entry) = snap_entry else { continue };
         let snap_path = snap_entry.path();
@@ -922,10 +951,7 @@ pub fn cache_repo_usage(repo_id: &str) -> Result<Vec<CacheFileUsage>, FetchError
         }
         collect_snapshot_files(&snap_path, "", &mut files);
     }
-
-    files.sort_by_key(|f| std::cmp::Reverse(f.size));
-
-    Ok(files)
+    files
 }
 
 /// Recursively collects files from a snapshot directory into `CacheFileUsage` entries.

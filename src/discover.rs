@@ -428,11 +428,17 @@ pub enum GgufFileSetKind {
     NotApplicable,
 }
 
+/// Returns `true` when `filename` has a `.gguf` extension, case-insensitively.
+#[must_use]
+pub fn is_gguf_filename(filename: &str) -> bool {
+    filename.to_ascii_lowercase().ends_with(".gguf")
+}
+
 /// Parses `filename` against `llama.cpp`'s split-file convention
 /// (`<prefix>-<index>-of-<total>.gguf`, `index`/`total` equal-width,
 /// zero-padded digit strings). Returns `(prefix, index, total)` on a match.
 fn parse_gguf_split_name(filename: &str) -> Option<(&str, u32, u32)> {
-    if !filename.to_ascii_lowercase().ends_with(".gguf") {
+    if !is_gguf_filename(filename) {
         return None;
     }
     // `.gguf` is 5 ASCII bytes, so this length is always a valid boundary.
@@ -466,7 +472,7 @@ pub fn classify_gguf_files(filenames: &[&str]) -> GgufFileSetKind {
     let gguf: Vec<&str> = filenames
         .iter()
         .copied()
-        .filter(|f| f.to_ascii_lowercase().ends_with(".gguf"))
+        .filter(|f| is_gguf_filename(f))
         .collect();
     if gguf.len() <= 1 {
         return GgufFileSetKind::NotApplicable;
@@ -510,6 +516,41 @@ pub fn classify_gguf_files(filenames: &[&str]) -> GgufFileSetKind {
     }
 }
 
+/// Computes the min/max size across `.gguf` files in `sized_filenames`, when
+/// they are mutually-exclusive quant alternatives (see
+/// [`classify_gguf_files`]). Returns `None` when the set is `Sharded` or
+/// `NotApplicable` (summing is already correct there) or when none of the
+/// `.gguf` files carry a known size.
+///
+/// Takes `(filename, size)` pairs rather than a concrete file type so both
+/// the remote listing (`repo::RepoFile`, whose `size` is `Option<u64>`) and
+/// the local cache listing (`cache::CacheFileUsage`, whose `size` is always
+/// known) can share one implementation — callers filter out entries with an
+/// unknown size before calling.
+#[must_use]
+pub fn gguf_size_range<'a, I>(sized_filenames: I) -> Option<(u64, u64)>
+where
+    I: IntoIterator<Item = (&'a str, u64)>,
+{
+    let pairs: Vec<(&str, u64)> = sized_filenames.into_iter().collect();
+    let filenames: Vec<&str> = pairs.iter().map(|&(name, _)| name).collect();
+    if !matches!(
+        classify_gguf_files(&filenames),
+        GgufFileSetKind::QuantAlternatives
+    ) {
+        return None;
+    }
+
+    let sizes: Vec<u64> = pairs
+        .iter()
+        .filter(|&&(name, _)| is_gguf_filename(name))
+        .map(|&(_, size)| size)
+        .collect();
+    let min = sizes.iter().copied().min()?;
+    let max = sizes.iter().copied().max()?;
+    Some((min, max))
+}
+
 /// A repo's aggregate size, aware of the `.gguf` quant-alternatives case.
 ///
 /// `total` is always the raw sum of every listed file's size — well-defined,
@@ -550,29 +591,17 @@ pub async fn fetch_repo_size_summary(
     let total: u64 = files.iter().filter_map(|f| f.size).sum();
 
     // BORROW: explicit .as_str() instead of Deref coercion
-    let filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
-    if !matches!(
-        classify_gguf_files(&filenames),
-        GgufFileSetKind::QuantAlternatives
-    ) {
-        return Ok(RepoSizeSummary {
-            total,
-            quant_alternatives: false,
-            size_min: None,
-            size_max: None,
-        });
-    }
-
-    let gguf_sizes: Vec<u64> = files
+    let sized: Vec<(&str, u64)> = files
         .iter()
-        .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
-        .filter_map(|f| f.size)
+        .filter_map(|f| f.size.map(|size| (f.filename.as_str(), size)))
         .collect();
+    let range = gguf_size_range(sized);
+
     Ok(RepoSizeSummary {
         total,
-        quant_alternatives: true,
-        size_min: gguf_sizes.iter().copied().min(),
-        size_max: gguf_sizes.iter().copied().max(),
+        quant_alternatives: range.is_some(),
+        size_min: range.map(|(min, _)| min),
+        size_max: range.map(|(_, max)| max),
     })
 }
 

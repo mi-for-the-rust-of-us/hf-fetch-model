@@ -422,7 +422,7 @@ hf-fm du --tree --age
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--age` | Show a last-modified age column (e.g., `2 days ago`, `3 months ago`) | off |
-| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,size,file_count,has_partial,last_modified}],total_bytes,total_files,repo_count}` (`last_modified` is Unix epoch seconds, regardless of `--age`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down, gaining `quant_alternatives`/`size_min`/`size_max` (same shape as `list-files --json`) when the repo's cached `.gguf` files are mutually-exclusive quant alternatives. | off |
+| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,size,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,total_files,repo_count}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max` — same meaning as `list-files --json` — are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down with the same quant-range fields. | off |
 | `--tree` | Hierarchical tree view: repos as branches, files as leaves, using box-drawing connectors. Composes with `--age` and `--json`; conflicts with the positional repo argument (the per-repo view is already covered by `du <REPO_ID>`). | off |
 
 A repo with an in-progress or interrupted download carries a leading `●` marker in the `du` listing (`● = partial downloads`); run `hf-fm status <REPO_ID>` for the per-file breakdown.
