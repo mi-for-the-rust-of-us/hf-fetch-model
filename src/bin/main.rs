@@ -2492,6 +2492,7 @@ fn build_quant_rows(candidates: Vec<discover::QuantCandidate>) -> Vec<QuantArtif
                 .next()
                 .unwrap_or(candidate.repo_id.as_str());
             rows.push(QuantArtifactRow {
+                // BORROW: explicit .to_owned() for &str → owned String field
                 artifact: short_name.to_owned(),
                 size: total,
                 bits: bits_for_artifact(&candidate.repo_id),
@@ -2553,6 +2554,7 @@ async fn compute_fit_verdict(
         return FitVerdict::FullGpu;
     }
     if !row.is_gguf {
+        // BORROW: explicit .to_owned() for &str → owned String field
         return FitVerdict::DoesNotFit {
             reason: "no offload mechanism for this format".to_owned(),
         };
@@ -2567,18 +2569,21 @@ async fn compute_fit_verdict(
                 };
             }
         };
+    // BORROW: explicit .to_owned() for &str → owned String field
     let Ok(matcher) = compile_group_by_pattern(MOE_EXPERT_PATTERN) else {
         return FitVerdict::DoesNotFit {
             reason: "internal offload pattern failed to compile".to_owned(),
         };
     };
     let rollup = compute_group_by_rollup(&info.tensors, &matcher);
+    // BORROW: explicit .to_owned() for &str → owned String field
     let (Some(layer_count), Some(per_layer)) = (rollup.layer_count, rollup.per_layer_bytes) else {
         return FitVerdict::DoesNotFit {
             reason: "no MoE experts to offload".to_owned(),
         };
     };
     if per_layer == 0 {
+        // BORROW: explicit .to_owned() for &str → owned String field
         return FitVerdict::DoesNotFit {
             reason: "no MoE experts to offload".to_owned(),
         };
@@ -2657,6 +2662,7 @@ fn print_quants_table(rows: &[QuantArtifactRow], fits: Option<&[FitVerdict]>) {
         );
         for (row, verdict) in rows.iter().zip(verdicts) {
             let (resident, plan) = match verdict {
+                // BORROW: explicit .to_owned() for &str → owned String
                 FitVerdict::FullGpu => (format_size(row.size), "full GPU".to_owned()),
                 FitVerdict::Offload {
                     n_cpu_moe,
@@ -2669,6 +2675,7 @@ fn print_quants_table(rows: &[QuantArtifactRow], fits: Option<&[FitVerdict]>) {
                         format_size(*moved_bytes)
                     ),
                 ),
+                // BORROW: explicit .to_owned() — em-dash placeholder
                 FitVerdict::DoesNotFit { reason } => {
                     ("\u{2014}".to_owned(), format!("does not fit ({reason})"))
                 }
@@ -2687,6 +2694,7 @@ fn print_quants_table(rows: &[QuantArtifactRow], fits: Option<&[FitVerdict]>) {
             "ARTIFACT", "SIZE", "REPO"
         );
         for row in rows {
+            // BORROW: explicit .to_owned() for &str → owned String
             let bits = row
                 .bits
                 .map_or_else(|| "?".to_owned(), |b| format!("~{b:.1}"));
@@ -2754,6 +2762,7 @@ fn print_quants_json(
         .iter()
         .enumerate()
         .map(|(i, row)| {
+            // BORROW: explicit .as_str() instead of Deref coercion
             let (verification, verification_note) = match &row.verification {
                 discover::QuantVerification::Verified => (VerificationJson::Verified, None),
                 discover::QuantVerification::CheckFailed(reason) => {
@@ -2792,8 +2801,10 @@ fn print_quants_json(
                 },
             });
             QuantRowJson {
+                // BORROW: explicit .as_str() instead of Deref coercion
                 artifact: row.artifact.as_str(),
                 size_bytes: row.size,
+                // BORROW: explicit .as_str() instead of Deref coercion
                 repo: row.repo.as_str(),
                 bits: row.bits,
                 verification,
@@ -7710,6 +7721,7 @@ async fn inspect_remote_with_cache(
         dispatch_inspect_remote(repo_id, filename, revision, token, is_npz, is_gguf, is_pth)
             .await?;
 
+    // BORROW: explicit .to_owned() for &str → owned String fields
     let entry = header_cache::HeaderCacheEntry::new(
         repo_id.to_owned(),
         rev.to_owned(),
@@ -8849,6 +8861,7 @@ fn compile_group_by_pattern(pattern: &str) -> Result<globset::GlobMatcher, Fetch
     globset::Glob::new(pattern)
         .map(|g| g.compile_matcher())
         .map_err(|e| FetchError::InvalidPattern {
+            // BORROW: explicit .to_owned() for &str → owned String field
             pattern: pattern.to_owned(),
             reason: e.to_string(),
         })

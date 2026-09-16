@@ -577,6 +577,7 @@ impl HttpRangeFetcher {
     /// The etag observed at probe time, before any range request.
     #[must_use]
     fn probe_etag(&self) -> &str {
+        // BORROW: explicit .as_str() instead of Deref coercion
         self.probe_etag.as_str()
     }
 
