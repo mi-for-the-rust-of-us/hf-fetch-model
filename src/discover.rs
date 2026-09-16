@@ -439,6 +439,219 @@ pub async fn fetch_repo_total_size(
     Ok(files.iter().filter_map(|f| f.size).sum())
 }
 
+/// Backlink verification outcome for a [`QuantCandidate`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum QuantVerification {
+    /// A `.gguf` file's `general.source.url` / `general.base_model.*.repo_url`
+    /// metadata confirms this repo targets the base model.
+    Verified,
+    /// No verification could run: the candidate has no `.gguf` file, or its
+    /// GGUF metadata carries no recognized backlink key. The naming match
+    /// stands alone.
+    Unverified,
+    /// The backlink check itself failed (network error, timeout, a gated
+    /// repo) rather than returning a definite answer. The naming match
+    /// stands alone; the reason is kept for display.
+    CheckFailed(String),
+}
+
+/// A quant-sibling repo candidate discovered for a base model, plus its file
+/// listing (reused by callers building a size table, so [`discover_quant_siblings`]
+/// is the only Hub round-trip needed per candidate beyond the initial search).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct QuantCandidate {
+    /// The candidate repository identifier.
+    pub repo_id: String,
+    /// Backlink verification outcome (see [`QuantVerification`]).
+    pub verification: QuantVerification,
+    /// The candidate repo's file listing (sizes and SHA256 where known).
+    pub files: Vec<crate::repo::RepoFile>,
+}
+
+impl QuantCandidate {
+    /// Builds a [`QuantCandidate`] directly.
+    ///
+    /// `#[non_exhaustive]` blocks struct-literal construction from outside
+    /// this crate, so this is the canonical way to build one from the `hf-fm`
+    /// binary crate — used by its test suite; production code only ever
+    /// receives `QuantCandidate` values from [`discover_quant_siblings`].
+    #[must_use]
+    pub fn new(
+        repo_id: String,
+        verification: QuantVerification,
+        files: Vec<crate::repo::RepoFile>,
+    ) -> Self {
+        Self {
+            repo_id,
+            verification,
+            files,
+        }
+    }
+}
+
+/// Known `GGUF` metadata keys that point back at a source `HuggingFace` repo,
+/// per `llama.cpp`'s `gguf-py` metadata writer conventions.
+fn gguf_source_backlinks(metadata: &HashMap<String, String>) -> Vec<&str> {
+    metadata
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() == "general.source.url"
+                || key.as_str() == "general.source.huggingface.repository"
+                || (key.starts_with("general.base_model.") && key.ends_with(".repo_url"))
+        })
+        // BORROW: explicit .as_str() instead of Deref coercion
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
+/// Lists `candidate_repo_id`'s files and, if it holds at least one `.gguf`
+/// file, cross-checks the smallest one's metadata backlink against
+/// `base_repo_id`.
+///
+/// Returns `None` only when a backlink is present and explicitly names a
+/// *different* repo — a naming collision, not a real sibling. Every other
+/// outcome (no `.gguf` file, no backlink key, or the header fetch itself
+/// failing) is returned as a kept candidate with the reason recorded in
+/// [`QuantVerification`], per [`discover_quant_siblings`]'s contract that a
+/// transient failure must not hide a real candidate. A file-listing failure
+/// (the repo cannot be enumerated at all) drops the candidate silently —
+/// there would be nothing to render for it regardless of verification status.
+async fn build_quant_candidate(
+    candidate_repo_id: String,
+    base_repo_id: &str,
+    token: Option<&str>,
+    client: &reqwest::Client,
+) -> Option<QuantCandidate> {
+    let files = crate::repo::list_repo_files_with_metadata(&candidate_repo_id, token, None, client)
+        .await
+        .ok()?;
+
+    let mut gguf_files: Vec<_> = files
+        .iter()
+        .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+        .cloned()
+        .collect();
+    gguf_files.sort_by_key(|f| f.size.unwrap_or(u64::MAX));
+
+    let Some(representative) = gguf_files.first() else {
+        return Some(QuantCandidate {
+            repo_id: candidate_repo_id,
+            verification: QuantVerification::Unverified,
+            files,
+        });
+    };
+
+    match crate::inspect::inspect_gguf(&candidate_repo_id, &representative.filename, token, None)
+        .await
+    {
+        Err(e) => Some(QuantCandidate {
+            repo_id: candidate_repo_id,
+            verification: QuantVerification::CheckFailed(e.to_string()),
+            files,
+        }),
+        Ok((info, _source, _stats)) => {
+            let backlinks = info
+                .metadata
+                .as_ref()
+                .map(|m| gguf_source_backlinks(m))
+                .unwrap_or_default();
+            if backlinks.is_empty() {
+                return Some(QuantCandidate {
+                    repo_id: candidate_repo_id,
+                    verification: QuantVerification::Unverified,
+                    files,
+                });
+            }
+            // BORROW: explicit .to_lowercase() for case-insensitive substring match
+            let base_lower = base_repo_id.to_lowercase();
+            let matched = backlinks
+                .iter()
+                .any(|b| b.to_lowercase().contains(&base_lower));
+            if matched {
+                Some(QuantCandidate {
+                    repo_id: candidate_repo_id,
+                    verification: QuantVerification::Verified,
+                    files,
+                })
+            } else {
+                None // EXPLICIT: backlink present but points elsewhere — not a real sibling
+            }
+        }
+    }
+}
+
+/// Discovers quant-sibling repos for a base model.
+///
+/// Searches the Hub for the base model's short name (the part of
+/// `base_repo_id` after `/`), keeps results whose repo ID contains that name
+/// as a case-insensitive substring (excluding `base_repo_id` itself), then
+/// fans out [`build_quant_candidate`] across the survivors through a bounded
+/// `tokio::sync::Semaphore` (8 permits, mirroring [`fetch_repo_sizes_concurrent`]).
+///
+/// Sibling discovery has no dedicated Hub endpoint — quant repos
+/// overwhelmingly either name themselves `<base>-<SCHEME>` or carry a GGUF
+/// metadata backlink to the original, so this combines both signals: the
+/// naming match decides the candidate *pool*, and the backlink (when present
+/// and checkable) raises confidence without ever silently dropping a
+/// candidate over a transient network failure.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the initial Hub search fails. Per-candidate
+/// failures below that point are absorbed into [`QuantVerification::CheckFailed`]
+/// rather than aborting the whole discovery.
+pub async fn discover_quant_siblings(
+    base_repo_id: &str,
+    token: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<Vec<QuantCandidate>, FetchError> {
+    let short_name = base_repo_id.rsplit('/').next().unwrap_or(base_repo_id);
+    let results = search_models(short_name, 50, None, None, None).await?;
+
+    // BORROW: explicit .to_lowercase() for case-insensitive substring match
+    let short_name_lower = short_name.to_lowercase();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut set: tokio::task::JoinSet<Option<QuantCandidate>> = tokio::task::JoinSet::new();
+
+    for result in results {
+        if result.model_id.eq_ignore_ascii_case(base_repo_id) {
+            continue; // EXPLICIT: the base repo itself, not a sibling
+        }
+        if !result.model_id.to_lowercase().contains(&short_name_lower) {
+            continue;
+        }
+
+        let limiter = Arc::clone(&semaphore);
+        let client = client.clone();
+        // BORROW: explicit .to_owned() — the spawned task must be 'static
+        let base_repo_owned = base_repo_id.to_owned();
+        let token_owned = token.map(str::to_owned);
+        set.spawn(async move {
+            let _permit = limiter.acquire_owned().await.ok()?;
+            // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+            build_quant_candidate(
+                result.model_id,
+                &base_repo_owned,
+                token_owned.as_deref(),
+                &client,
+            )
+            .await
+        });
+    }
+
+    let mut candidates: Vec<QuantCandidate> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(candidate)) = joined {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+
+    Ok(candidates)
+}
+
 /// Fans out [`fetch_repo_total_size`] across the given repository IDs through
 /// a bounded `tokio::sync::Semaphore` (8 permits) to stay friendly to the HF
 /// Hub on `--limit 100`-style invocations.
@@ -663,5 +876,49 @@ mod tests {
     fn normalize_passthrough() {
         assert_eq!(normalize_quantization_terms("llama 3"), "llama 3");
         assert_eq!(normalize_quantization_terms("RWKV-7"), "RWKV-7");
+    }
+
+    // ---------- quants sibling discovery ----------
+
+    #[test]
+    fn gguf_source_backlinks_finds_source_url() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.source.url".to_owned(),
+            "https://huggingface.co/poolside/Laguna-XS-2.1".to_owned(),
+        );
+        metadata.insert("general.architecture".to_owned(), "llama".to_owned());
+        assert_eq!(
+            gguf_source_backlinks(&metadata),
+            vec!["https://huggingface.co/poolside/Laguna-XS-2.1"]
+        );
+    }
+
+    #[test]
+    fn gguf_source_backlinks_finds_base_model_repo_url() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.base_model.0.repo_url".to_owned(),
+            "https://huggingface.co/poolside/Laguna-XS-2.1".to_owned(),
+        );
+        assert_eq!(gguf_source_backlinks(&metadata).len(), 1);
+    }
+
+    #[test]
+    fn gguf_source_backlinks_finds_huggingface_repository_key() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.source.huggingface.repository".to_owned(),
+            "poolside/Laguna-XS-2.1".to_owned(),
+        );
+        assert_eq!(gguf_source_backlinks(&metadata).len(), 1);
+    }
+
+    #[test]
+    fn gguf_source_backlinks_ignores_unrelated_keys() {
+        let mut metadata = HashMap::new();
+        metadata.insert("general.architecture".to_owned(), "llama".to_owned());
+        metadata.insert("general.name".to_owned(), "Laguna-XS-2.1-GGUF".to_owned());
+        assert!(gguf_source_backlinks(&metadata).is_empty());
     }
 }

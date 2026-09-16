@@ -3460,3 +3460,72 @@ fn info_json_output() {
         "info json needs a gated string, got:\n{stdout}"
     );
 }
+
+// -----------------------------------------------------------------------
+// quants / --fits
+// -----------------------------------------------------------------------
+
+#[test]
+fn quants_help_shows_fits_and_reserve_flags() {
+    let (stdout, stderr, success) = run(hf_fm().args(["quants", "--help"]));
+    assert!(success, "quants --help failed: {stderr}");
+    for flag in ["--fits", "--reserve", "--token", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "quants help should contain {flag}, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn quants_reserve_without_fits_is_rejected() {
+    let (_stdout, stderr, success) =
+        run(hf_fm().args(["quants", "julien-c/dummy-unknown", "--reserve", "1GiB"]));
+    assert!(
+        !success,
+        "quants --reserve without --fits should be a clap parse error"
+    );
+    assert!(
+        stderr.contains("--fits") || stderr.contains("required"),
+        "error should mention the --fits requirement, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn quants_nonexistent_base_reports_no_siblings() {
+    // No naming-convention match exists for a nonsense repo name, so the
+    // Hub search returns (near-)zero results and the command should report
+    // "no siblings" cleanly rather than erroring.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "quants",
+        "hf-fm-test-fixture-org/totally-nonexistent-base-model-987654321",
+    ]));
+    assert!(
+        success,
+        "quants on a nonexistent base should succeed: {stderr}"
+    );
+    assert!(stdout.contains("No quant siblings found"), "got:\n{stdout}");
+}
+
+#[test]
+fn quants_nonexistent_base_json_is_valid_with_empty_artifacts() {
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "quants",
+        "hf-fm-test-fixture-org/totally-nonexistent-base-model-987654321",
+        "--json",
+    ]));
+    assert!(
+        success,
+        "quants --json on a nonexistent base should succeed: {stderr}"
+    );
+    let v = parse_json(&stdout);
+    assert_eq!(
+        v.get("repo_id").and_then(Value::as_str),
+        Some("hf-fm-test-fixture-org/totally-nonexistent-base-model-987654321")
+    );
+    assert_eq!(
+        v.get("artifacts").and_then(Value::as_array).map(Vec::len),
+        Some(0),
+        "got:\n{stdout}"
+    );
+}

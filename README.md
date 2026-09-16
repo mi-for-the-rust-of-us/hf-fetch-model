@@ -14,6 +14,7 @@ A Rust library and CLI for downloading and inspecting HuggingFace models. Multi-
 - [Commands](#commands)
 - [Try it](#try-it)
 - [Inspect & compare](#inspect--compare)
+- [Quant fit planning](#quant-fit-planning)
 - [Disk usage](#disk-usage)
 - [Library quick start](#library-quick-start)
 - [Documentation](#documentation)
@@ -23,6 +24,7 @@ A Rust library and CLI for downloading and inspecting HuggingFace models. Multi-
 
 > **New to hf-fm?**
 > - **I want to know which model to download** → [Inspect before you download](docs/tutorials/inspect-before-downloading.md): read tensor shapes, size, and architecture without pulling a single weight byte.
+> - **I want to know which quant fits my GPU** → [Pick a quant that fits before you download it](docs/tutorials/pick-a-quant-that-fits.md): aggregate a model's quant siblings into one table and plan `MoE` CPU offload before choosing.
 > - **I want to manage the models on my disk** → [Clean up before your disk fills](docs/tutorials/clean-up-before-your-disk-fills.md): see what the cache holds, then reclaim space safely.
 >
 > Common questions live in the [FAQ](docs/FAQ.md); every flag is in the [CLI Reference](docs/cli-reference.md).
@@ -69,6 +71,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 | `hf-fm list-families` | List model families in local cache |
 | `hf-fm list-files <REPO_ID>` | List remote files (sizes, SHA256) without downloading |
 | `hf-fm peek <REPO_ID> <FILE>` | Print a small file's content (config, README, `.gz` sidecar) without downloading — `--head`/`--tail` bound the read, `--gunzip` decodes, `--max` caps the size (no tensor formats — use `inspect` for those) |
+| `hf-fm quants <REPO_ID>` | Aggregate a base model's quant sibling repos into one sorted table; add `--fits <SIZE> [--reserve <SIZE>]` for an offload-aware VRAM fit plan |
 | `hf-fm search <QUERY>` | Search the HuggingFace Hub for models |
 | `hf-fm status [REPO_ID]` | Per-repo: per-file download status (complete / partial / missing / excluded). With no `REPO_ID`: a table of all cached repos, each marked `ok` or `PARTIAL`. |
 
@@ -245,6 +248,28 @@ $ hf-fm inspect meta-llama/Llama-3.2-3B --cached --check-gpu --context 32768
 ```
 
 Inspect reads tensor metadata via HTTP Range requests — no weight data downloaded: 2 requests per `.safetensors` file, a handful (reported live on the `Source:` line, e.g. `remote (6 range requests, 136.0 KiB fetched)`) per NumPy `.npz` archive (remote NPZ since v0.11.0), a similar handful per `.gguf` file (remote GGUF since v0.11.2, e.g. `remote (30 range requests, 1.75 MiB fetched)` on an 84 MiB quantized model, `--tree`/`--dtypes` included), and likewise per `.pth` checkpoint (remote PTH since v0.11.4, e.g. `remote (12 range requests, 113.7 KiB fetched)` on a 364 MiB PyTorch `state_dict` — only the ZIP-archived `data.pkl` pickle stream is read, never the tensor-data files). When a repo has many tensor files, `--list` prints a numbered table (pass the `#` back as the `FILE` argument) and `--pick` chooses interactively, narrowing first by a case-insensitive substring — both cover every format inspect reads (`.safetensors` / `.gguf` / `.npz` / `.pth`). The `--tree` flag shows the hierarchical namespace with numeric sibling groups auto-collapsed to `[0..N]` for structural discovery. The `--group-by <PATTERN>` flag rolls tensors up into a MATCHED / OTHER byte split against a glob pattern instead — the tool for "what fraction of this file is the MoE expert weights" (`blk.*.ffn_*_exps.weight` on a GGUF checkpoint), with a `per-MoE-layer expert cost` line once the matched tensor names carry a single, unambiguous layer index. The `--check-gpu` flag adds a one-line GPU-fit verdict using [`hypomnesis`](https://crates.io/crates/hypomnesis) (NVML on Linux/Windows, DXGI on Windows); composes with `--json`. Add `--context N` to fold in the KV cache at a context length and get a real `weights + KV` verdict — the difference between "fits" and "OOM at token 8000" on a consumer card. The estimate is parameter-driven from the model's `config.json` (`GQA`, sliding-window, and hybrid Mamba/attention all handled; `MLA` is detected and skipped); see the [FAQ entry on GPU fit](docs/FAQ.md#how-do-i-know-if-a-model-fits-on-my-gpu) for the formula and its limitations. Diff compares tensor names, dtypes, and shapes between any two models (remote or cached); `--dtypes` swaps the per-tensor body for a side-by-side per-dtype histogram with a signed Δ Size column — the high-leverage view for scaled-sibling pairs. `--collapse` groups only-A / only-B / dtype-shape-differences by numeric-segment pattern (`model.layers.{N}.mlp.gate_proj.weight`) into a `Pattern / Tensors / Bytes` table, the built-in counterpart to the `jq` recipe below. See the [FAQ entry on comparing two models](docs/FAQ.md#how-do-i-compare-two-huggingface-models-structurally) for that `jq` recipe, which uses the `byte_count` field in `--json` output for cases `--collapse`'s digit-run heuristic doesn't cover. `diff-config` complements `diff` at the architecture level: a field-by-field comparison of `config.json` (layer counts, hidden size, GQA/sliding-window/hybrid-layout fields) instead of tensor headers — the tool to reach for when `diff --dtypes` shows a size jump and you want to know *why* (more layers? wider hidden dim? a different attention pattern?) without eyeballing two raw `config.json` files.
+
+## Quant fit planning
+
+```
+$ hf-fm quants google/gemma-2-2b-it
+Searching for quant siblings of google/gemma-2-2b-it...
+8 repos found, 0 verified via GGUF backlink
+
+  ARTIFACT                                     SIZE  REPO                                      BITS
+  gemma-2-2b-it.IQ1_S.gguf               793.61 MiB  MaziyarPanahi/gemma-2-2b-it-GGUF          ~1.6
+  gemma-2-2b-it.Q2_K.gguf                  1.15 GiB  MaziyarPanahi/gemma-2-2b-it-GGUF          ~2.6
+  gemma-2-2b-it-IQ3_M.gguf                 1.30 GiB  bartowski/gemma-2-2b-it-GGUF              ~3.7
+  ...
+  gemma-2-2b-it-f32.gguf                   9.74 GiB  bartowski/gemma-2-2b-it-GGUF              ~32.0
+
+$ hf-fm quants google/gemma-2-2b-it --fits 9.5GiB
+...
+  gemma-2-2b-it.fp16.gguf                  4.88 GiB   4.88 GiB  full GPU
+  gemma-2-2b-it-f32.gguf                   9.74 GiB          —  does not fit (no MoE experts to offload)
+```
+
+`quants` aggregates a base model's quant sibling repos — discovered by searching the Hub for the base model's short name and keeping results whose repo ID contains it, cross-checked against each `.gguf` candidate's own `general.source.url` / `general.base_model.*.repo_url` metadata backlink where present. No dedicated Hub endpoint exists for "sibling repos", so this is best-effort: a candidate with no backlink, or whose backlink check itself failed (network error, gated repo), is still listed rather than silently dropped — only an explicit backlink *mismatch* excludes a candidate. `--fits <SIZE>` adds a `RESIDENT`/`PLAN` column pair; candidates that already fit under budget are never inspected (`full GPU`, no header fetch), and only over-budget `MoE` `GGUF` files trigger a header fetch to compute a `--n-cpu-moe N` offload plan against the internal `blk.*.*_exps.weight` expert-tensor pattern — the plan a naive size-vs-budget comparison would miss, since a checkpoint 40% over the raw VRAM budget can still be viable once its expert tensors (touched only a few times per token) move to system RAM. `--reserve <SIZE>` carves out headroom (KV cache, runtime) from the budget before the comparison. See [Pick a quant that fits before you download it](docs/tutorials/pick-a-quant-that-fits.md) for the walkthrough this feature was built from, and the [FAQ](docs/FAQ.md#what-fraction-of-a-gguf-file-is-the-moe-expert-weights) for the underlying `inspect --group-by` rollup.
 
 ## Disk usage
 

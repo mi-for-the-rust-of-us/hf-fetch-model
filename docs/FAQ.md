@@ -55,6 +55,8 @@ A living list of the questions we and our early users have actually run into. If
   - [How do I compare two models' architecture, not just their tensors?](#how-do-i-compare-two-models-architecture-not-just-their-tensors)
   - [How do I know if a model fits on my GPU?](#how-do-i-know-if-a-model-fits-on-my-gpu)
   - [What fraction of a GGUF file is the MoE expert weights?](#what-fraction-of-a-gguf-file-is-the-moe-expert-weights)
+  - [Which quant of a model fits my GPU?](#which-quant-of-a-model-fits-my-gpu)
+  - [How reliable is `quants`'s sibling-repo discovery?](#how-reliable-is-quantss-sibling-repo-discovery)
   - [How do I list only the weight files in a repo, not the tokenizer and README?](#how-do-i-list-only-the-weight-files-in-a-repo-not-the-tokenizer-and-readme)
   - [How do I see what is already cached locally?](#how-do-i-see-what-is-already-cached-locally)
 - [Cache location and management](#cache-location-and-management)
@@ -324,6 +326,20 @@ hf-fm inspect poolside/Laguna-XS-2.1-GGUF Q4_K_M.gguf --group-by 'blk.*.ffn_*_ex
 ```
 
 This buckets every tensor into MATCHED / OTHER by name and prints byte totals, percentages, and — when the matched names carry a single, unambiguous numeric layer index — a `per-MoE-layer expert cost` line. That per-layer figure is exactly what CPU-expert-offload planning (`llama.cpp`'s `--n-cpu-moe`) needs: a large MoE checkpoint that looks too big for your VRAM at first glance can still fit once you know only a fraction of it is expert weight that can live in system RAM. This surfaced from a real [dogfooding session](dogfooding-feedbacks/hf-fm-dogfooding-vram-fit-laguna-session.md) sizing quant candidates by hand with `awk`.
+
+### Which quant of a model fits my GPU?
+
+Pass `--fits` to `quants`:
+
+```
+hf-fm quants poolside/Laguna-XS-2.1 --fits 16GiB --reserve 2.5GiB
+```
+
+This aggregates the base model's quant sibling repos into one table, sorted by size, and adds a `RESIDENT`/`PLAN` column pair. Candidates that already fit under the budget render `full GPU` with no network cost; only over-budget `.gguf` files are inspected to compute a `--n-cpu-moe N` offload plan, so a checkpoint that looks too big at first glance can still surface as viable once its `MoE` expert tensors are known to be offloadable. `--reserve` carves out headroom (KV cache, runtime) from the budget before the comparison. See the [tutorial](tutorials/pick-a-quant-that-fits.md) for the full walkthrough.
+
+### How reliable is `quants`'s sibling-repo discovery?
+
+There is no HuggingFace Hub endpoint for "find the quant siblings of this repo", so `quants` combines two imperfect signals: a naming match (any repo whose ID contains the base model's short name) builds the candidate pool, and — for `.gguf` candidates — the file's own metadata backlink (`general.source.url` / `general.base_model.*.repo_url`) confirms it when present and checkable. A candidate is only ever *excluded* when a backlink explicitly names a different repo; no backlink, or a failed backlink check (network error, a gated repo), still lists the candidate, just without the `verified` mark — a transient failure should never hide a real candidate. In practice this means naming matches occasionally include unrelated repos that happen to share the base model's name (a full-precision mirror, an unrelated fine-tune) — the stderr summary line's verified count and each row's provenance are the signal to sanity-check before trusting a result.
 
 ### How do I list only the weight files in a repo, not the tokenizer and README?
 

@@ -13,6 +13,7 @@ cargo install hf-fetch-model --features cli
 - [Dry-run example](#dry-run-example)
 - [List-files examples](#list-files-examples)
 - [Search examples](#search-examples)
+- [Quants examples](#quants-examples)
 - [Info examples](#info-examples)
 - [Inspect examples](#inspect-examples)
 - [Peek examples](#peek-examples)
@@ -29,6 +30,7 @@ cargo install hf-fetch-model --features cli
 - [Download flags](#download-flags)
 - [List-files flags](#list-files-flags)
 - [Search flags](#search-flags)
+- [Quants flags](#quants-flags)
 - [List-families flags](#list-families-flags)
 - [Status flags](#status-flags)
 - [Info flags](#info-flags)
@@ -54,6 +56,7 @@ cargo install hf-fetch-model --features cli
 | `list-families` | List model families (`model_type`) in local cache |
 | `list-files <REPO_ID>` | List files in a remote repo (filenames, sizes, SHA256) without downloading |
 | `peek <REPO_ID> <FILENAME>` | Print a small file's content — `config.yaml`, `README.md`, `.gz` sidecars — without downloading. No tensor formats (use `inspect`); no anamnesis dispatch |
+| `quants <REPO_ID>` | Aggregate a base model's quant sibling repos into one sorted table; `--fits <SIZE> [--reserve <SIZE>]` adds an offload-aware VRAM fit plan |
 | `search <QUERY>` | Search the HuggingFace Hub for models (by downloads) |
 | `status [REPO_ID]` | Show download status — per-repo detail, or cache-wide summary |
 
@@ -176,6 +179,23 @@ hf-fm search fp4 --tag bitsandbytes --show tags,size
 ```
 
 Common quantization synonyms are normalized automatically: `8bit`, `8-bit`, `int8`, and `INT8` all produce the same results. Same for `4bit`/`4-bit`/`int4` and `fp8`/`float8`.
+
+## Quants examples
+
+```sh
+# Aggregate a base model's quant siblings into one sorted table
+hf-fm quants poolside/Laguna-XS-2.1
+
+# Offload-aware fit plan against a 16 GiB card with 2.5 GiB reserved for KV/runtime
+hf-fm quants poolside/Laguna-XS-2.1 --fits 16GiB --reserve 2.5GiB
+
+# For scripting
+hf-fm quants poolside/Laguna-XS-2.1 --json
+```
+
+Discovery has two signals, combined: a naming match (any repo whose ID contains the base model's short name) decides the candidate pool, and — for `.gguf` candidates — the file's own `general.source.url` / `general.base_model.*.repo_url` metadata backlink raises confidence when present and checkable. There is no dedicated Hub endpoint for "sibling repos", so naming matches can include false positives (a full-precision mirror, an unrelated fine-tune sharing the base name) — the `BITS` column reading `?` and a low verified count in the stderr summary line are the signal to double-check a row before trusting it.
+
+`--fits <SIZE>` never inspects a candidate that already fits under `SIZE` minus `--reserve` — those render `full GPU` with no header fetch. Only candidates over budget are inspected, and only `.gguf` files can receive an offload plan (`--n-cpu-moe N`) — computed against the internal `blk.*.*_exps.weight` `MoE` expert-tensor pattern, the same rollup `inspect --group-by` exposes directly. A non-`MoE` file, or one where offloading every expert still leaves it over budget, renders `does not fit (<reason>)` instead.
 
 ## Info examples
 
@@ -612,6 +632,15 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--pipeline` | Filter by pipeline task (e.g., `text-generation`, `text-classification`) | — |
 | `--tag` | Filter by model tag (e.g., `gguf`, `conversational`, `imatrix`) | — |
 | `--show` | Comma-separated columns to add: `tags` (free; from the existing API payload), `size` (one extra HTTP request per result, bounded to 8 concurrent). | — |
+
+## Quants flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--fits SIZE` | VRAM budget to fit within (e.g. `16GiB`). Adds `RESIDENT`/`PLAN` columns. Candidates already under `SIZE` minus `--reserve` are never inspected. | — |
+| `--json` | Output the full table as JSON: `{repo_id, artifacts[{artifact, size_bytes, repo, bits, verification, verification_note, fit}]}` | off |
+| `--reserve SIZE` | Bytes reserved out of `--fits` for KV cache / runtime overhead. Requires `--fits`. | none |
+| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
 
 ## List-families flags
 

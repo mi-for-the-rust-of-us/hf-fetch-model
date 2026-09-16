@@ -224,6 +224,45 @@ See also: hf-fm list-families, hf-fm discover")]
         #[arg(long, value_delimiter = ',', value_enum)]
         show: Vec<ShowColumn>,
     },
+    /// Aggregate a base model's quant sibling repos into one sorted table.
+    ///
+    /// Discovers quant repos by searching the Hub for the base model's short
+    /// name and keeping results whose repo ID contains it, cross-checked
+    /// (where a `.gguf` file is present) against that file's own
+    /// `general.source.url` / `general.base_model.*.repo_url` metadata
+    /// backlink. No dedicated Hub endpoint exists for "sibling repos", so
+    /// this is best-effort: a candidate with no backlink, or whose backlink
+    /// check itself failed (network error, gated repo), is still listed —
+    /// only an explicit backlink *mismatch* excludes a candidate.
+    #[command(after_help = "Examples:\n  \
+        hf-fm quants poolside/Laguna-XS-2.1                                # sorted quant table\n  \
+        hf-fm quants poolside/Laguna-XS-2.1 --fits 16GiB --reserve 2.5GiB  # offload-aware fit plan\n  \
+        hf-fm quants poolside/Laguna-XS-2.1 --json                        # for scripting\n\n\
+        --fits skips header inspection for candidates that already fit under\n\
+        budget without offload; only over-budget MoE GGUF files are\n\
+        inspected (against the internal blk.*.*_exps.weight pattern) to\n\
+        compute a --n-cpu-moe plan.\n\n\
+        See also: hf-fm inspect <repo> <file> --group-by <PATTERN>   # the rollup --fits uses internally")]
+    Quants {
+        /// The base model's repository identifier (e.g., `"poolside/Laguna-XS-2.1"`).
+        repo_id: String,
+        /// VRAM budget to fit within (e.g. `16GiB`). Adds RESIDENT/PLAN columns.
+        ///
+        /// Candidates whose raw size already fits under `--fits` minus
+        /// `--reserve` are never inspected (no rollup fetch) — only
+        /// candidates over budget are, to compute an offload plan.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size_arg)]
+        fits: Option<u64>,
+        /// Bytes reserved out of `--fits` for KV cache / runtime overhead (default: none). Requires `--fits`.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size_arg, requires = "fits")]
+        reserve: Option<u64>,
+        /// Authentication token (or set `HF_TOKEN` env var).
+        #[arg(long)]
+        token: Option<String>,
+        /// Output the full table as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show model card metadata and README text for a repository.
     Info {
         /// The repository identifier (e.g., `"mistralai/Ministral-3-3B-Instruct-2512"`).
@@ -827,6 +866,7 @@ fn main() -> ExitCode {
             Commands::ListFamilies { .. }
             | Commands::Discover { .. }
             | Commands::Search { .. }
+            | Commands::Quants { .. }
             | Commands::Info { .. }
             | Commands::Status { .. }
             | Commands::Diff { .. }
@@ -925,6 +965,14 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             tag.as_deref(),
             &show,
         ),
+        // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
+        Some(Commands::Quants {
+            repo_id,
+            fits,
+            reserve,
+            token,
+            json,
+        }) => run_quants(repo_id.as_str(), fits, reserve, token.as_deref(), json),
         // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
         Some(Commands::Info {
             repo_id,
@@ -2271,6 +2319,515 @@ fn print_search_result(
         format_downloads(result.downloads),
         nw = name_width,
     );
+}
+
+/// Internal glob for `llama.cpp`'s `MoE` expert-tensor naming convention,
+/// used by `quants --fits` to plan CPU-expert-offload — never user-supplied
+/// (contrast `inspect --group-by`, whose pattern always comes from the CLI).
+const MOE_EXPERT_PATTERN: &str = "blk.*.*_exps.weight";
+
+/// Approximate bits-per-weight for common `GGUF`/quant scheme tokens, most
+/// specific first so e.g. `Q4_K_M` matches before the more general `Q4_K`
+/// fallback would. Values are illustrative (`~`) — actual bits vary slightly
+/// by tensor mix within a scheme; unrecognized tokens return `None` rather
+/// than guessing.
+const QUANT_SCHEME_BITS: &[(&str, f64)] = &[
+    ("IQ1_S", 1.56),
+    ("IQ1_M", 1.75),
+    ("IQ2_XXS", 2.06),
+    ("IQ2_XS", 2.31),
+    ("IQ2_S", 2.5),
+    ("IQ2_M", 2.7),
+    ("Q2_K_S", 2.16),
+    ("Q2_K", 2.63),
+    ("IQ3_XXS", 3.06),
+    ("IQ3_XS", 3.3),
+    ("IQ3_S", 3.44),
+    ("IQ3_M", 3.66),
+    ("Q3_K_S", 3.44),
+    ("Q3_K_M", 3.74),
+    ("Q3_K_L", 4.03),
+    ("Q3_K", 3.74),
+    ("IQ4_XS", 4.25),
+    ("IQ4_NL", 4.5),
+    ("Q4_0", 4.5),
+    ("Q4_1", 5.0),
+    ("Q4_K_S", 4.58),
+    ("Q4_K_M", 4.85),
+    ("Q4_K", 4.85),
+    ("Q5_0", 5.5),
+    ("Q5_1", 6.0),
+    ("Q5_K_S", 5.54),
+    ("Q5_K_M", 5.68),
+    ("Q5_K", 5.68),
+    ("Q6_K", 6.56),
+    ("Q8_0", 8.5),
+    ("BF16", 16.0),
+    ("F16", 16.0),
+    ("F32", 32.0),
+    ("NVFP4", 4.0),
+    ("MXFP4", 4.0),
+    ("FP8", 8.0),
+    ("INT8", 8.0),
+    ("INT4", 4.0),
+];
+
+/// Looks up an approximate bits-per-weight figure from a `GGUF` filename or
+/// quant-suffixed repo name (e.g. `"...-Q4_K_M.gguf"` or
+/// `"Laguna-XS-2.1-NVFP4"`), matching case-insensitively against
+/// [`QUANT_SCHEME_BITS`]. Returns `None` when no known scheme token appears.
+fn bits_for_artifact(name: &str) -> Option<f64> {
+    // BORROW: explicit .to_ascii_uppercase() for case-insensitive token match
+    let upper = name.to_ascii_uppercase();
+    QUANT_SCHEME_BITS
+        .iter()
+        .find(|(token, _)| upper.contains(token))
+        .map(|(_, bits)| *bits)
+}
+
+/// One row of a `quants` table: either a single `.gguf` file, or (for a
+/// candidate with no `.gguf` file) the whole repo's summed `.safetensors`
+/// bytes under the repo's short name as a pseudo-artifact.
+struct QuantArtifactRow {
+    /// The `.gguf` filename, or the repo's short name for a safetensors-only candidate.
+    artifact: String,
+    /// Byte size of this artifact.
+    size: u64,
+    /// The owning repository identifier.
+    repo: String,
+    /// Whether `artifact` names an actual `.gguf` file — offload planning
+    /// (`--fits`) only applies to these.
+    is_gguf: bool,
+    /// Approximate bits-per-weight, when a known quant scheme token was found.
+    bits: Option<f64>,
+    /// Backlink verification outcome for the owning candidate repo.
+    verification: discover::QuantVerification,
+}
+
+/// Flattens discovered candidates into one row per `.gguf` file (or one
+/// aggregate row per safetensors-only candidate), sorted by size ascending.
+fn build_quant_rows(candidates: Vec<discover::QuantCandidate>) -> Vec<QuantArtifactRow> {
+    let mut rows = Vec::new();
+    for candidate in candidates {
+        // BORROW: explicit .to_ascii_lowercase() for case-insensitive extension match
+        let gguf_files: Vec<&repo::RepoFile> = candidate
+            .files
+            .iter()
+            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+            .collect();
+
+        if gguf_files.is_empty() {
+            let total: u64 = candidate
+                .files
+                .iter()
+                .filter(|f| f.filename.to_ascii_lowercase().ends_with(".safetensors"))
+                .filter_map(|f| f.size)
+                .fold(0u64, u64::saturating_add);
+            if total == 0 {
+                continue; // EXPLICIT: no recognized weight files in this repo, nothing to show
+            }
+            // BORROW: explicit .rsplit + unwrap_or for "org/name" → "name"
+            let short_name = candidate
+                .repo_id
+                .rsplit('/')
+                .next()
+                .unwrap_or(candidate.repo_id.as_str());
+            rows.push(QuantArtifactRow {
+                artifact: short_name.to_owned(),
+                size: total,
+                bits: bits_for_artifact(&candidate.repo_id),
+                is_gguf: false,
+                repo: candidate.repo_id.clone(),
+                verification: candidate.verification.clone(),
+            });
+            continue;
+        }
+
+        for f in &gguf_files {
+            rows.push(QuantArtifactRow {
+                artifact: f.filename.clone(),
+                size: f.size.unwrap_or(0),
+                bits: bits_for_artifact(&f.filename),
+                is_gguf: true,
+                repo: candidate.repo_id.clone(),
+                verification: candidate.verification.clone(),
+            });
+        }
+    }
+    rows.sort_by_key(|r| r.size);
+    rows
+}
+
+/// The `--fits` outcome for one [`QuantArtifactRow`].
+#[derive(Debug, Clone)]
+enum FitVerdict {
+    /// Fits under `budget - reserve` at full residency; never inspected.
+    FullGpu,
+    /// Over budget, but `n_cpu_moe` layers of `MoE` experts can move to
+    /// system RAM to bring the resident footprint under budget.
+    Offload {
+        n_cpu_moe: u32,
+        moved_bytes: u64,
+        resident_bytes: u64,
+    },
+    /// Over budget with no rescue: not a `MoE` file, no experts to offload,
+    /// offloading every expert still leaves it over budget, or the header
+    /// fetch needed to compute the plan failed.
+    DoesNotFit { reason: String },
+}
+
+/// Computes the `--fits` verdict for one row.
+///
+/// Rows already under `budget - reserve` are never inspected — this is the
+/// cost bound `--fits` was designed around: only the rows where the answer
+/// is actually in doubt trigger a header fetch. Offload planning applies the
+/// fixed internal [`MOE_EXPERT_PATTERN`] (`llama.cpp`'s own `MoE`
+/// expert-tensor naming convention), never a user-supplied pattern.
+async fn compute_fit_verdict(
+    row: &QuantArtifactRow,
+    budget: u64,
+    reserve: u64,
+    token: Option<&str>,
+) -> FitVerdict {
+    let budget_after_reserve = budget.saturating_sub(reserve);
+    if row.size <= budget_after_reserve {
+        return FitVerdict::FullGpu;
+    }
+    if !row.is_gguf {
+        return FitVerdict::DoesNotFit {
+            reason: "no offload mechanism for this format".to_owned(),
+        };
+    }
+
+    let (info, _source, _stats) =
+        match inspect::inspect_gguf(&row.repo, &row.artifact, token, None).await {
+            Ok(v) => v,
+            Err(e) => {
+                return FitVerdict::DoesNotFit {
+                    reason: format!("offload plan unavailable: {e}"),
+                };
+            }
+        };
+    let Ok(matcher) = compile_group_by_pattern(MOE_EXPERT_PATTERN) else {
+        return FitVerdict::DoesNotFit {
+            reason: "internal offload pattern failed to compile".to_owned(),
+        };
+    };
+    let rollup = compute_group_by_rollup(&info.tensors, &matcher);
+    let (Some(layer_count), Some(per_layer)) = (rollup.layer_count, rollup.per_layer_bytes) else {
+        return FitVerdict::DoesNotFit {
+            reason: "no MoE experts to offload".to_owned(),
+        };
+    };
+    if per_layer == 0 {
+        return FitVerdict::DoesNotFit {
+            reason: "no MoE experts to offload".to_owned(),
+        };
+    }
+
+    compute_offload_plan(
+        row.size,
+        rollup.matched_bytes,
+        layer_count,
+        per_layer,
+        budget_after_reserve,
+    )
+}
+
+/// Pure offload-plan arithmetic, factored out of [`compute_fit_verdict`] so
+/// it can be unit tested without a network-backed header fetch.
+///
+/// `total_bytes` is the whole artifact's size, `matched_bytes` the summed
+/// `MoE` expert bytes (from [`compute_group_by_rollup`]), `layer_count` and
+/// `per_layer_bytes` its derived layer split, and `budget_after_reserve` the
+/// resident-byte ceiling (`--fits` minus `--reserve`). Offloading `N` layers
+/// leaves `total_bytes - N * per_layer_bytes` resident; the minimum viable
+/// `N` is `ceil((total_bytes - budget_after_reserve) / per_layer_bytes)`,
+/// clamped to `[0, layer_count]` since there is no such thing as offloading
+/// more layers than the model has.
+fn compute_offload_plan(
+    total_bytes: u64,
+    matched_bytes: u64,
+    layer_count: usize,
+    per_layer_bytes: u64,
+    budget_after_reserve: u64,
+) -> FitVerdict {
+    let shortfall = total_bytes.saturating_sub(budget_after_reserve);
+    let n = shortfall.div_ceil(per_layer_bytes);
+    // CAST: usize -> u64, layer_count is a small tensor-name-derived count
+    #[allow(clippy::as_conversions)]
+    let layer_count = layer_count as u64;
+    let n = n.min(layer_count);
+    let moved = n.saturating_mul(per_layer_bytes);
+    let resident = total_bytes.saturating_sub(moved);
+
+    if resident > budget_after_reserve {
+        FitVerdict::DoesNotFit {
+            reason: format!(
+                "does not fit even with full expert offload ({} non-expert weight)",
+                format_size(total_bytes.saturating_sub(matched_bytes))
+            ),
+        }
+    } else {
+        // CAST: u64 -> u32, n is clamped to layer_count, a small model-layer count
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let n_cpu_moe = n as u32;
+        FitVerdict::Offload {
+            n_cpu_moe,
+            moved_bytes: moved,
+            resident_bytes: resident,
+        }
+    }
+}
+
+/// Prints the human-readable `quants` table, with RESIDENT/PLAN columns
+/// swapped in for REPO/BITS when `--fits` was passed.
+fn print_quants_table(rows: &[QuantArtifactRow], fits: Option<&[FitVerdict]>) {
+    let aw = rows
+        .iter()
+        .map(|r| r.artifact.len())
+        .max()
+        .unwrap_or(8)
+        .max(8); // BORROW: "ARTIFACT".len()
+
+    println!();
+    if let Some(verdicts) = fits {
+        println!(
+            "  {:<aw$} {:>10} {:>10}  PLAN",
+            "ARTIFACT", "SIZE", "RESIDENT"
+        );
+        for (row, verdict) in rows.iter().zip(verdicts) {
+            let (resident, plan) = match verdict {
+                FitVerdict::FullGpu => (format_size(row.size), "full GPU".to_owned()),
+                FitVerdict::Offload {
+                    n_cpu_moe,
+                    moved_bytes,
+                    resident_bytes,
+                } => (
+                    format_size(*resident_bytes),
+                    format!(
+                        "--n-cpu-moe {n_cpu_moe}  ({} -> RAM)",
+                        format_size(*moved_bytes)
+                    ),
+                ),
+                FitVerdict::DoesNotFit { reason } => {
+                    ("\u{2014}".to_owned(), format!("does not fit ({reason})"))
+                }
+            };
+            println!(
+                "  {:<aw$} {:>10} {:>10}  {plan}",
+                row.artifact,
+                format_size(row.size),
+                resident,
+            );
+        }
+    } else {
+        let rw = rows.iter().map(|r| r.repo.len()).max().unwrap_or(4).max(4); // BORROW: "REPO".len()
+        println!(
+            "  {:<aw$} {:>10}  {:<rw$}  BITS",
+            "ARTIFACT", "SIZE", "REPO"
+        );
+        for row in rows {
+            let bits = row
+                .bits
+                .map_or_else(|| "?".to_owned(), |b| format!("~{b:.1}"));
+            println!(
+                "  {:<aw$} {:>10}  {:<rw$}  {bits}",
+                row.artifact,
+                format_size(row.size),
+                row.repo,
+            );
+        }
+    }
+}
+
+/// Backlink verification outcome, as rendered in `quants --json`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VerificationJson {
+    Verified,
+    Unverified,
+    CheckFailed,
+}
+
+/// The `--fits` outcome for one row, as rendered in `quants --json`.
+#[derive(serde::Serialize)]
+struct FitJson {
+    fits: bool,
+    resident_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_cpu_moe: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// One row of `quants --json`.
+#[derive(serde::Serialize)]
+struct QuantRowJson<'a> {
+    artifact: &'a str,
+    size_bytes: u64,
+    repo: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bits: Option<f64>,
+    verification: VerificationJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_note: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fit: Option<FitJson>,
+}
+
+/// JSON shape emitted by `quants`/`quants --fits`.
+#[derive(serde::Serialize)]
+struct QuantsJson<'a> {
+    repo_id: &'a str,
+    artifacts: Vec<QuantRowJson<'a>>,
+}
+
+/// Emits `quants`/`quants --fits` output as JSON.
+fn print_quants_json(
+    repo_id: &str,
+    rows: &[QuantArtifactRow],
+    fits: Option<&[FitVerdict]>,
+) -> Result<(), FetchError> {
+    let artifacts: Vec<QuantRowJson<'_>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let (verification, verification_note) = match &row.verification {
+                discover::QuantVerification::Verified => (VerificationJson::Verified, None),
+                discover::QuantVerification::CheckFailed(reason) => {
+                    (VerificationJson::CheckFailed, Some(reason.as_str()))
+                }
+                // `Unverified`, plus any future variant `QuantVerification`'s
+                // `#[non_exhaustive]` might add — both render as "unverified"
+                // rather than failing to compile or panicking.
+                discover::QuantVerification::Unverified | _ => (VerificationJson::Unverified, None),
+            };
+            let fit = fits.and_then(|v| v.get(i)).map(|verdict| match verdict {
+                FitVerdict::FullGpu => FitJson {
+                    fits: true,
+                    resident_bytes: row.size,
+                    n_cpu_moe: None,
+                    moved_bytes: None,
+                    reason: None,
+                },
+                FitVerdict::Offload {
+                    n_cpu_moe,
+                    moved_bytes,
+                    resident_bytes,
+                } => FitJson {
+                    fits: true,
+                    resident_bytes: *resident_bytes,
+                    n_cpu_moe: Some(*n_cpu_moe),
+                    moved_bytes: Some(*moved_bytes),
+                    reason: None,
+                },
+                FitVerdict::DoesNotFit { reason } => FitJson {
+                    fits: false,
+                    resident_bytes: row.size,
+                    n_cpu_moe: None,
+                    moved_bytes: None,
+                    reason: Some(reason.clone()),
+                },
+            });
+            QuantRowJson {
+                artifact: row.artifact.as_str(),
+                size_bytes: row.size,
+                repo: row.repo.as_str(),
+                bits: row.bits,
+                verification,
+                verification_note,
+                fit,
+            }
+        })
+        .collect();
+
+    let serialized = serde_json::to_string_pretty(&QuantsJson { repo_id, artifacts })
+        .map_err(|e| FetchError::Http(format!("failed to serialize JSON: {e}")))?;
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Runs `hf-fm quants <REPO_ID> [--fits SIZE] [--reserve SIZE] [--json]`.
+fn run_quants(
+    repo_id: &str,
+    fits: Option<u64>,
+    reserve: Option<u64>,
+    token: Option<&str>,
+    json: bool,
+) -> Result<(), FetchError> {
+    // BORROW: explicit String::from for Option<&str> → Option<String>
+    let owned_token = token
+        .map(String::from)
+        .or_else(|| std::env::var("HF_TOKEN").ok());
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
+        path: PathBuf::from("<runtime>"),
+        source: e,
+    })?;
+
+    eprintln!("Searching for quant siblings of {repo_id}...");
+    let client = hf_fetch_model::build_client(owned_token.as_deref())?;
+    let candidates = rt.block_on(discover::discover_quant_siblings(
+        repo_id,
+        owned_token.as_deref(),
+        &client,
+    ))?;
+
+    let repo_count = candidates.len();
+    let verified_count = candidates
+        .iter()
+        .filter(|c| matches!(c.verification, discover::QuantVerification::Verified))
+        .count();
+    eprintln!("{repo_count} repos found, {verified_count} verified via GGUF backlink");
+
+    let rows = build_quant_rows(candidates);
+    if rows.is_empty() {
+        // `--json` must still emit valid JSON on the empty-result path
+        // rather than this human-readable hint — the exact `--json`-safety
+        // pattern the v0.12.0 `diff --json` empty-repo fix established.
+        if json {
+            return print_quants_json(repo_id, &rows, None);
+        }
+        println!("No quant siblings found for {repo_id}.");
+        println!(
+            "Hint: quant repos are discovered by naming convention (<base>-<SCHEME>) — try `hf-fm search {repo_id}` for a broader view."
+        );
+        return Ok(());
+    }
+
+    let verdicts: Option<Vec<FitVerdict>> = if let Some(budget) = fits {
+        let reserve_bytes = reserve.unwrap_or(0);
+        let budget_after_reserve = budget.saturating_sub(reserve_bytes);
+        // EXPLICIT: sequential, not fanned out — each inspected row issues
+        // dozens of range requests (a full GGUF header parse); the ones that
+        // trivially fit under budget are skipped without any network call.
+        let mut computed = Vec::with_capacity(rows.len());
+        let mut inspected = 0usize;
+        for row in &rows {
+            if row.size > budget_after_reserve && row.is_gguf {
+                inspected += 1;
+            }
+            computed.push(rt.block_on(compute_fit_verdict(
+                row,
+                budget,
+                reserve_bytes,
+                owned_token.as_deref(),
+            )));
+        }
+        eprintln!("{inspected} inspected for offload plan");
+        Some(computed)
+    } else {
+        None
+    };
+
+    if json {
+        return print_quants_json(repo_id, &rows, verdicts.as_deref());
+    }
+    print_quants_table(&rows, verdicts.as_deref());
+    Ok(())
 }
 
 fn print_model_card(card: &discover::ModelCardMetadata) {
@@ -10320,6 +10877,148 @@ mod tests {
     fn compile_group_by_pattern_rejects_invalid_glob() {
         let err = compile_group_by_pattern("blk.[.weight").expect_err("malformed glob rejected");
         assert!(matches!(err, FetchError::InvalidPattern { .. }));
+    }
+
+    // ---------- quants / --fits ----------
+
+    #[test]
+    fn moe_expert_pattern_compiles() {
+        assert!(compile_group_by_pattern(MOE_EXPERT_PATTERN).is_ok());
+    }
+
+    #[test]
+    fn bits_for_artifact_recognizes_specific_gguf_scheme_over_generic_prefix() {
+        // "Q4_K_M" must win over the more general "Q4_K" / "Q4_0" fallbacks.
+        assert_eq!(bits_for_artifact("Laguna-XS-2.1-Q4_K_M.gguf"), Some(4.85));
+        assert_eq!(bits_for_artifact("Laguna-XS-2.1.i1-IQ3_XS.gguf"), Some(3.3));
+        assert_eq!(bits_for_artifact("model-Q8_0.gguf"), Some(8.5));
+    }
+
+    #[test]
+    fn bits_for_artifact_recognizes_safetensors_suffixes() {
+        assert_eq!(bits_for_artifact("Laguna-XS-2.1-NVFP4"), Some(4.0));
+        assert_eq!(bits_for_artifact("Laguna-XS-2.1-FP8"), Some(8.0));
+        assert_eq!(bits_for_artifact("Laguna-XS-2.1-INT4"), Some(4.0));
+    }
+
+    #[test]
+    fn bits_for_artifact_returns_none_for_unknown_scheme() {
+        assert_eq!(bits_for_artifact("Laguna-XS-2.1-custom-quant-v9"), None);
+    }
+
+    fn make_repo_file(filename: &str, size: u64) -> repo::RepoFile {
+        repo::RepoFile {
+            filename: filename.to_owned(),
+            size: Some(size),
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn build_quant_rows_emits_one_row_per_gguf_file() {
+        let candidates = vec![discover::QuantCandidate::new(
+            "bartowski/Laguna-XS-2.1-GGUF".to_owned(),
+            discover::QuantVerification::Verified,
+            vec![
+                make_repo_file("Laguna-XS-2.1-Q4_K_M.gguf", 20_000),
+                make_repo_file("Laguna-XS-2.1-Q3_K_S.gguf", 14_000),
+                make_repo_file("config.json", 500),
+            ],
+        )];
+        let rows = build_quant_rows(candidates);
+        assert_eq!(rows.len(), 2);
+        // Sorted by size ascending.
+        assert_eq!(rows[0].artifact, "Laguna-XS-2.1-Q3_K_S.gguf"); // INDEX: length checked above
+        assert_eq!(rows[0].size, 14_000); // INDEX: length checked above
+        assert!(rows[0].is_gguf); // INDEX: length checked above
+        assert_eq!(rows[1].artifact, "Laguna-XS-2.1-Q4_K_M.gguf"); // INDEX: length checked above
+    }
+
+    #[test]
+    fn build_quant_rows_aggregates_safetensors_only_candidate_into_one_row() {
+        let candidates = vec![discover::QuantCandidate::new(
+            "poolside/Laguna-XS-2.1-NVFP4".to_owned(),
+            discover::QuantVerification::Unverified,
+            vec![
+                make_repo_file("model-00001-of-00002.safetensors", 10_000),
+                make_repo_file("model-00002-of-00002.safetensors", 10_000),
+                make_repo_file("tokenizer.json", 100),
+            ],
+        )];
+        let rows = build_quant_rows(candidates);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].artifact, "Laguna-XS-2.1-NVFP4"); // INDEX: length checked above
+        assert_eq!(rows[0].size, 20_000); // INDEX: length checked above
+        assert!(!rows[0].is_gguf); // INDEX: length checked above
+        assert_eq!(rows[0].bits, Some(4.0)); // INDEX: length checked above
+    }
+
+    #[test]
+    fn build_quant_rows_skips_candidate_with_no_recognized_weight_files() {
+        let candidates = vec![discover::QuantCandidate::new(
+            "someone/not-actually-a-quant".to_owned(),
+            discover::QuantVerification::Unverified,
+            vec![make_repo_file("README.md", 100)],
+        )];
+        assert!(build_quant_rows(candidates).is_empty());
+    }
+
+    #[test]
+    fn compute_offload_plan_fits_after_partial_offload() {
+        // 1000 bytes total, 800 expert bytes over 8 layers (100/layer),
+        // budget 550 after reserve.
+        let verdict = compute_offload_plan(1_000, 800, 8, 100, 550);
+        match verdict {
+            FitVerdict::Offload {
+                n_cpu_moe,
+                moved_bytes,
+                resident_bytes,
+            } => {
+                assert_eq!(n_cpu_moe, 5); // ceil((1000-550)/100) = 5
+                assert_eq!(moved_bytes, 500);
+                assert_eq!(resident_bytes, 500);
+            }
+            FitVerdict::FullGpu => panic!("expected Offload, got FullGpu"),
+            FitVerdict::DoesNotFit { reason } => {
+                panic!("expected Offload, got DoesNotFit({reason})")
+            }
+        }
+    }
+
+    #[test]
+    fn compute_offload_plan_rounds_shortfall_up_to_next_whole_layer() {
+        // shortfall = 1000 - 555 = 445; 445 / 90 = 4.944.. -> ceil to 5
+        let verdict = compute_offload_plan(1_000, 900, 10, 90, 555);
+        match verdict {
+            FitVerdict::Offload {
+                n_cpu_moe,
+                moved_bytes,
+                ..
+            } => {
+                assert_eq!(n_cpu_moe, 5);
+                assert_eq!(moved_bytes, 450);
+            }
+            FitVerdict::FullGpu => panic!("expected Offload, got FullGpu"),
+            FitVerdict::DoesNotFit { reason } => {
+                panic!("expected Offload, got DoesNotFit({reason})")
+            }
+        }
+    }
+
+    #[test]
+    fn compute_offload_plan_clamps_to_layer_count_and_reports_does_not_fit() {
+        // Only 20% of the file is expert weight (4 layers, 1 byte/layer) —
+        // offloading every expert still leaves it far over budget.
+        let verdict = compute_offload_plan(20, 4, 4, 1, 10);
+        match verdict {
+            FitVerdict::DoesNotFit { reason } => {
+                assert!(reason.contains("full expert offload"), "got: {reason}");
+            }
+            FitVerdict::FullGpu => panic!("expected DoesNotFit, got FullGpu"),
+            FitVerdict::Offload { n_cpu_moe, .. } => {
+                panic!("expected DoesNotFit, got Offload(n_cpu_moe={n_cpu_moe})")
+            }
+        }
     }
 
     #[test]
