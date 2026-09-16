@@ -3623,6 +3623,48 @@ fn inspect_without_cache_headers_never_creates_the_sidecar_dir() {
 }
 
 #[test]
+fn cache_headers_only_repo_is_hidden_from_du_but_visible_to_status() {
+    // Regression pin: cache_summary() must not hide a repo whose directory
+    // exists solely because of a --cache-headers sidecar (no snapshots, no
+    // partial download) from *every* consumer — only du's own display
+    // filters it out (cosmetic: du reports disk usage, and such a repo uses
+    // none). `status` and `cache gc` both read the same underlying
+    // cache::cache_summary() list and must still be able to see it;
+    // otherwise repeated --cache-headers use grows the sidecar directory
+    // with no way to discover or bulk-reclaim it short of `cache delete` by
+    // exact repo ID guessed blind.
+    let dir = temp_hf_home();
+    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "inspect",
+        "hf-internal-testing/tiny-random-gpt2",
+        "model.safetensors",
+        "--cache-headers",
+    ]));
+    assert!(success, "--cache-headers call should succeed: {stderr}");
+
+    // du (whole-cache summary) should not list a repo contributing zero
+    // bytes and no partial download.
+    let (du_stdout, du_stderr, du_success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(du_success, "du should succeed: {du_stderr}");
+    assert!(
+        !du_stdout.contains("tiny-random-gpt2"),
+        "du should hide a header-cache-only repo from its summary, got:\n{du_stdout}"
+    );
+
+    // status (no REPO_ID, whole-cache summary) reads cache_summary()
+    // directly with no filtering — it must still see the repo, proving
+    // cache_summary() itself stayed complete rather than hiding the entry
+    // from every consumer.
+    let (status_stdout, status_stderr, status_success) =
+        run(hf_fm().env("HF_HOME", dir.path()).arg("status"));
+    assert!(status_success, "status should succeed: {status_stderr}");
+    assert!(
+        status_stdout.contains("tiny-random-gpt2"),
+        "status should still see a header-cache-only repo, got:\n{status_stdout}"
+    );
+}
+
+#[test]
 fn quants_help_shows_fits_and_reserve_flags() {
     let (stdout, stderr, success) = run(hf_fm().args(["quants", "--help"]));
     assert!(success, "quants --help failed: {stderr}");

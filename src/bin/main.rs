@@ -3293,6 +3293,13 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
 
     let mut summaries = cache::cache_summary()?;
+    // `du` reports disk usage — a repo contributing zero bytes and no
+    // partial download (e.g. a directory that exists solely because of an
+    // `inspect --cache-headers` sidecar, never downloaded) doesn't belong
+    // in this view. Filtered here, at the display layer, rather than in
+    // `cache::cache_summary()` itself, so `cache gc`/`status` — which read
+    // the same function — still see and can act on these repos.
+    summaries.retain(|s| s.total_size > 0 || s.file_count > 0 || s.has_partial);
     summaries.sort_by_key(|s| std::cmp::Reverse(s.total_size));
 
     if json {
@@ -3784,6 +3791,10 @@ struct CacheTreeFile {
 /// leaves come pre-sorted by size descending from [`cache::cache_repo_usage`].
 fn build_cache_tree() -> Result<Vec<CacheTreeRepo>, FetchError> {
     let mut summaries = cache::cache_summary()?;
+    // Same display-layer filter as `run_du` — see its comment. `du --tree`
+    // is a display-only consumer of `cache_summary()`, not read by `cache
+    // gc`, so filtering here has no effect on eviction reachability.
+    summaries.retain(|s| s.total_size > 0 || s.file_count > 0 || s.has_partial);
     summaries.sort_by_key(|s| std::cmp::Reverse(s.total_size));
 
     let mut repos: Vec<CacheTreeRepo> = Vec::with_capacity(summaries.len());
