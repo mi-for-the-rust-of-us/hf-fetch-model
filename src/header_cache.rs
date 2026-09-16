@@ -114,43 +114,23 @@ impl HeaderCacheEntry {
         }
     }
 
-    /// Writes this entry to `path` atomically (write-tmp + rename),
-    /// mirroring [`crate::chunked_state::ChunkedState::save_atomic`]'s
-    /// exact durability pattern. Creates the parent directory
-    /// (`.hf-fm-header-cache/`) if it does not exist yet — the first
-    /// `--cache-headers` call against a repo that was never downloaded.
+    /// Writes this entry to `path` atomically (write-tmp + rename), via the
+    /// shared [`crate::atomic_write::write_atomic`] helper — the same
+    /// durability pattern [`crate::chunked_state::ChunkedState::save_atomic`]
+    /// uses. Creates the parent directory (`.hf-fm-header-cache/`) if it
+    /// does not exist yet — the first `--cache-headers` call against a repo
+    /// that was never downloaded.
     ///
     /// # Errors
     ///
     /// Returns [`FetchError::Io`] on filesystem errors during the parent
     /// directory creation, the temp write, or the rename.
     pub async fn save_atomic(&self, path: &Path) -> Result<(), FetchError> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| FetchError::Io {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-        }
         let json = serde_json::to_string(self).map_err(|e| {
             FetchError::Http(format!("failed to serialize header-cache entry: {e}"))
         })?;
         let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, json.as_bytes())
-            .await
-            .map_err(|e| FetchError::Io {
-                // BORROW: explicit .clone() for owned PathBuf
-                path: tmp.clone(),
-                source: e,
-            })?;
-        tokio::fs::rename(&tmp, path)
-            .await
-            .map_err(|e| FetchError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        Ok(())
+        crate::atomic_write::write_atomic(path, &tmp, json.as_bytes()).await
     }
 }
 

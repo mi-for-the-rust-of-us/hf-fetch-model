@@ -154,7 +154,8 @@ impl ChunkedState {
         }
     }
 
-    /// Writes this state to `path` atomically (write-tmp + rename).
+    /// Writes this state to `path` atomically (write-tmp + rename), via the
+    /// shared [`crate::atomic_write::write_atomic`] helper.
     ///
     /// The rename is atomic on POSIX and effectively atomic on Windows
     /// (`MoveFileEx`), so a process crash mid-save leaves either the
@@ -175,20 +176,7 @@ impl ChunkedState {
             reason: format!("failed to serialize chunked-state sidecar: {e}"),
         })?;
         let tmp = path.with_extension("state.tmp");
-        tokio::fs::write(&tmp, json.as_bytes())
-            .await
-            .map_err(|e| FetchError::Io {
-                // BORROW: explicit .clone() for owned PathBuf
-                path: tmp.clone(),
-                source: e,
-            })?;
-        tokio::fs::rename(&tmp, path)
-            .await
-            .map_err(|e| FetchError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        Ok(())
+        crate::atomic_write::write_atomic(path, &tmp, json.as_bytes()).await
     }
 
     /// Removes the sidecar at `path`. Idempotent — a missing file is not

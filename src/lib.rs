@@ -226,6 +226,7 @@
 //! failures into the same gated-model diagnosis the download pre-flight
 //! emits (v0.10.5).
 
+mod atomic_write;
 pub mod cache;
 pub mod cache_layout;
 pub mod checksum;
