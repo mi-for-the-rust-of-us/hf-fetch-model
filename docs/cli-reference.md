@@ -181,6 +181,10 @@ hf-fm search fp4 --tag bitsandbytes
 
 # Enrich result rows with inline tag list (free) and total repo size (one extra HTTP request per row)
 hf-fm search fp4 --tag bitsandbytes --show tags,size
+
+# Find a private repo (or size a gated one) with an auth token
+# (or set HF_TOKEN instead of passing --token explicitly)
+hf-fm search my-private-model --token hf_xxxxxxxxxxxxxxxxxxxx --show size
 ```
 
 Common quantization synonyms are normalized automatically: `8bit`, `8-bit`, `int8`, and `INT8` all produce the same results. Same for `4bit`/`4-bit`/`int4` and `fp8`/`float8`.
@@ -641,6 +645,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--pipeline` | Filter by pipeline task (e.g., `text-generation`, `text-classification`) | — |
 | `--tag` | Filter by model tag (e.g., `gguf`, `conversational`, `imatrix`) | — |
 | `--show` | Comma-separated columns to add: `tags` (free; from the existing API payload), `size` (one extra HTTP request per result, bounded to 8 concurrent) — a repo whose `.gguf` files are mutually-exclusive quant alternatives renders a `min to max` range instead of a misleading sum. | — |
+| `--token` | Auth token (or set `HF_TOKEN` env var). A gated repo is typically still visible without one (gating restricts content downloads, not search visibility or file-size metadata) — mainly matters for finding a private repo the token has access to, and for sizing it under `--show size`. | — |
 
 ## Quants flags
 

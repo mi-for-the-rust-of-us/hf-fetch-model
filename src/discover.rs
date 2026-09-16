@@ -6,6 +6,7 @@
 //! compares against locally cached families, and fetches model card metadata.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
@@ -319,6 +320,10 @@ fn normalize_quantization_terms(query: &str) -> String {
 /// * `library` — Optional library filter (e.g., `"peft"`, `"transformers"`).
 /// * `pipeline` — Optional pipeline tag filter (e.g., `"text-generation"`).
 /// * `tag` — Optional tag filter (e.g., `"gguf"`, `"conversational"`).
+/// * `token` — Authentication token (or `None` for anonymous requests).
+///   Gated repos are typically still visible without one (gating restricts
+///   content downloads, not search visibility or metadata), but a private
+///   repo the token has access to is only ever found with it.
 ///
 /// # Errors
 ///
@@ -329,9 +334,10 @@ pub async fn search_models(
     library: Option<&str>,
     pipeline: Option<&str>,
     tag: Option<&str>,
+    token: Option<&str>,
 ) -> Result<Vec<SearchResult>, FetchError> {
     let normalized = normalize_quantization_terms(query);
-    let client = reqwest::Client::new();
+    let client = crate::chunked::build_client(token)?;
 
     // BORROW: explicit .as_str() instead of Deref coercion
     let mut query_params: Vec<(&str, &str)> = vec![
@@ -802,7 +808,7 @@ pub async fn discover_quant_siblings(
     client: &reqwest::Client,
 ) -> Result<Vec<QuantCandidate>, FetchError> {
     let short_name = base_repo_id.rsplit('/').next().unwrap_or(base_repo_id);
-    let results = search_models(short_name, 50, None, None, None).await?;
+    let results = search_models(short_name, 50, None, None, None, token).await?;
 
     // BORROW: explicit .to_lowercase() for case-insensitive substring match
     let short_name_lower = short_name.to_lowercase();
@@ -846,6 +852,50 @@ pub async fn discover_quant_siblings(
     Ok(candidates)
 }
 
+/// Fans out an async per-item operation through a bounded
+/// `tokio::sync::Semaphore`, collecting successful results into a map keyed
+/// by the item itself. Per-item failures (`f` returning `None`) are silently
+/// dropped — callers render a missing key with a placeholder (e.g. `—`).
+///
+/// Shared bounded-concurrency scaffold behind [`fetch_repo_sizes_concurrent`]
+/// and [`fetch_repo_size_summaries_concurrent`] — both fan out one per-repo
+/// network call at the same concurrency and the same drop-on-failure policy;
+/// a future change to either only needs to happen once here.
+///
+/// `f` is `Fn`, not `FnOnce`, since it is called once per item — shared
+/// state it needs (e.g. an HTTP client) should be cloned inside the closure
+/// body on each call, not moved out of the closure's own captured environment.
+async fn fan_out_bounded<T, R, F, Fut>(items: Vec<T>, concurrency: usize, f: F) -> HashMap<T, R>
+where
+    T: Eq + std::hash::Hash + Clone + Send + 'static,
+    R: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<R>> + Send + 'static,
+{
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let f = Arc::new(f);
+    let mut set: tokio::task::JoinSet<Option<(T, R)>> = tokio::task::JoinSet::new();
+
+    for item in items {
+        let limiter = Arc::clone(&semaphore);
+        let f = Arc::clone(&f);
+        let key = item.clone();
+        set.spawn(async move {
+            let _permit = limiter.acquire_owned().await.ok()?;
+            let result = f(item).await?;
+            Some((key, result))
+        });
+    }
+
+    let mut out: HashMap<T, R> = HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some((key, result))) = joined {
+            out.insert(key, result);
+        }
+    }
+    out
+}
+
 /// Fans out [`fetch_repo_total_size`] across the given repository IDs through
 /// a bounded `tokio::sync::Semaphore` (8 permits) to stay friendly to the HF
 /// Hub on `--limit 100`-style invocations.
@@ -861,37 +911,18 @@ pub async fn discover_quant_siblings(
 ///   the spawned tasks so each future is `'static`.
 #[must_use]
 pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<String, u64> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
     let client = reqwest::Client::new();
-    let mut set: tokio::task::JoinSet<Option<(String, u64)>> = tokio::task::JoinSet::new();
-
-    for repo_id in repo_ids {
-        let limiter = Arc::clone(&semaphore);
+    fan_out_bounded(repo_ids, 8, move |repo_id| {
         let client = client.clone();
-        set.spawn(async move {
-            let _permit = limiter.acquire_owned().await.ok()?;
-            // EXPLICIT: per-repo failure intentionally swallowed — the caller
-            // renders the row with "—" rather than aborting the search.
-            match fetch_repo_total_size(&repo_id, &client).await {
-                Ok(bytes) => Some((repo_id, bytes)),
-                Err(_) => None,
-            }
-        });
-    }
-
-    let mut by_repo: HashMap<String, u64> = HashMap::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok(Some((repo_id, bytes))) = joined {
-            by_repo.insert(repo_id, bytes);
-        }
-    }
-
-    by_repo
+        // EXPLICIT: per-repo failure intentionally swallowed — the caller
+        // renders the row with "—" rather than aborting the search.
+        async move { fetch_repo_total_size(&repo_id, &client).await.ok() }
+    })
+    .await
 }
 
 /// Fans out [`fetch_repo_size_summary`] across the given repository IDs
-/// through a bounded `tokio::sync::Semaphore` (8 permits), mirroring
-/// [`fetch_repo_sizes_concurrent`]'s pattern exactly — the quant-aware
+/// through a bounded `tokio::sync::Semaphore` (8 permits) — the quant-aware
 /// counterpart `hf-fm search --show size` uses.
 ///
 /// Per-repo failures are silently dropped from the returned map; callers
@@ -901,37 +932,25 @@ pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<Strin
 ///
 /// * `repo_ids` — Owned list of model identifiers. Ownership is moved into
 ///   the spawned tasks so each future is `'static`.
+/// * `token` — Authentication token (or `None` for anonymous requests),
+///   applied to every fanned-out request via [`crate::chunked::build_client`]
+///   — without this, a private or gated repo silently fails to size (the
+///   same per-repo failure path as a 404, indistinguishable to the caller).
 #[must_use]
 pub async fn fetch_repo_size_summaries_concurrent(
     repo_ids: Vec<String>,
+    token: Option<&str>,
 ) -> HashMap<String, RepoSizeSummary> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
-    let client = reqwest::Client::new();
-    let mut set: tokio::task::JoinSet<Option<(String, RepoSizeSummary)>> =
-        tokio::task::JoinSet::new();
-
-    for repo_id in repo_ids {
-        let limiter = Arc::clone(&semaphore);
+    let Ok(client) = crate::chunked::build_client(token) else {
+        return HashMap::new();
+    };
+    fan_out_bounded(repo_ids, 8, move |repo_id| {
         let client = client.clone();
-        set.spawn(async move {
-            let _permit = limiter.acquire_owned().await.ok()?;
-            // EXPLICIT: per-repo failure intentionally swallowed — the caller
-            // renders the row with "—" rather than aborting the search.
-            match fetch_repo_size_summary(&repo_id, &client).await {
-                Ok(summary) => Some((repo_id, summary)),
-                Err(_) => None,
-            }
-        });
-    }
-
-    let mut by_repo: HashMap<String, RepoSizeSummary> = HashMap::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok(Some((repo_id, summary))) = joined {
-            by_repo.insert(repo_id, summary);
-        }
-    }
-
-    by_repo
+        // EXPLICIT: per-repo failure intentionally swallowed — the caller
+        // renders the row with "—" rather than aborting the search.
+        async move { fetch_repo_size_summary(&repo_id, &client).await.ok() }
+    })
+    .await
 }
 
 /// Fans out [`fetch_model_card`] across the given repository IDs through a
@@ -1242,5 +1261,62 @@ mod tests {
             "README.md",
         ];
         assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
+    }
+
+    // ---------- fan_out_bounded ----------
+
+    #[tokio::test]
+    async fn fan_out_bounded_collects_all_successes() {
+        let items = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let out =
+            fan_out_bounded(items, 2, |item| async move { Some(format!("{item}-done")) }).await;
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.get("a").map(String::as_str), Some("a-done"));
+        assert_eq!(out.get("b").map(String::as_str), Some("b-done"));
+        assert_eq!(out.get("c").map(String::as_str), Some("c-done"));
+    }
+
+    #[tokio::test]
+    async fn fan_out_bounded_drops_per_item_failures() {
+        let items = vec!["keep".to_owned(), "drop".to_owned()];
+        let out = fan_out_bounded(items, 2, |item| async move {
+            if item == "drop" { None } else { Some(item) }
+        })
+        .await;
+
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("keep"));
+        assert!(!out.contains_key("drop"));
+    }
+
+    #[tokio::test]
+    async fn fan_out_bounded_respects_concurrency_limit() {
+        // 6 items, concurrency 2: an atomic counter of in-flight tasks must
+        // never exceed 2 at any point during the run.
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let items: Vec<u32> = (0..6).collect();
+
+        let in_flight_for_closure = Arc::clone(&in_flight);
+        let max_seen_for_closure = Arc::clone(&max_seen);
+        let out = fan_out_bounded(items, 2, move |item| {
+            let in_flight = Arc::clone(&in_flight_for_closure);
+            let max_seen = Arc::clone(&max_seen_for_closure);
+            async move {
+                let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Some(item)
+            }
+        })
+        .await;
+
+        assert_eq!(out.len(), 6);
+        assert!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst) <= 2,
+            "observed more than 2 tasks in flight at once"
+        );
     }
 }

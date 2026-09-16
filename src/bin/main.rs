@@ -225,6 +225,15 @@ See also: hf-fm list-families, hf-fm discover")]
         /// per result, fanned out through a bounded semaphore.
         #[arg(long, value_delimiter = ',', value_enum)]
         show: Vec<ShowColumn>,
+        /// Authentication token (or set `HF_TOKEN` env var).
+        ///
+        /// A gated repo is typically still visible in search without one
+        /// (gating restricts content downloads, not search visibility or
+        /// file-size metadata) — a token mainly matters for finding a
+        /// private repo it has access to, and for sizing it under `--show
+        /// size`.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Aggregate a base model's quant sibling repos into one sorted table.
     ///
@@ -974,6 +983,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             pipeline,
             tag,
             show,
+            token,
         }) => run_search(
             query.as_str(),
             limit,
@@ -982,6 +992,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             pipeline.as_deref(),
             tag.as_deref(),
             &show,
+            token.as_deref(),
         ),
         // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
         Some(Commands::Quants {
@@ -2138,7 +2149,7 @@ fn run_discover(limit: usize, tag: Option<&str>) -> Result<(), FetchError> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_search(
     query: &str,
     limit: usize,
@@ -2147,11 +2158,17 @@ fn run_search(
     pipeline: Option<&str>,
     tag: Option<&str>,
     show: &[ShowColumn],
+    token: Option<&str>,
 ) -> Result<(), FetchError> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
         source: e,
     })?;
+
+    // BORROW: explicit String::from for Option<&str> → Option<String>
+    let token = token
+        .map(String::from)
+        .or_else(|| std::env::var("HF_TOKEN").ok());
 
     let show_tags = show.contains(&ShowColumn::Tags);
     let show_size = show.contains(&ShowColumn::Size);
@@ -2189,8 +2206,14 @@ fn run_search(
         limit
     };
 
+    // BORROW: explicit .as_deref() for Option<String> → Option<&str>
     let results = rt.block_on(discover::search_models(
-        api_query, api_limit, library, pipeline, tag,
+        api_query,
+        api_limit,
+        library,
+        pipeline,
+        tag,
+        token.as_deref(),
     ))?;
 
     // Client-side filtering: only applied when there are multiple comma-separated
@@ -2238,7 +2261,11 @@ fn run_search(
             // BORROW: explicit .clone() — fetch_repo_size_summaries_concurrent takes
             // Vec<String> because each spawned task needs an owned `'static` String.
             let repo_ids: Vec<String> = filtered.iter().map(|r| r.model_id.clone()).collect();
-            rt.block_on(discover::fetch_repo_size_summaries_concurrent(repo_ids))
+            // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+            rt.block_on(discover::fetch_repo_size_summaries_concurrent(
+                repo_ids,
+                token.as_deref(),
+            ))
         } else {
             HashMap::new()
         };

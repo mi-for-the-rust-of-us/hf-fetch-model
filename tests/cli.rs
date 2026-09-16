@@ -405,6 +405,42 @@ fn search_show_size_renders_range_for_quant_repo() {
 }
 
 #[test]
+fn search_help_shows_token_flag() {
+    let (stdout, stderr, success) = run(hf_fm().args(["search", "--help"]));
+    assert!(success, "search --help failed: {stderr}");
+    assert!(
+        stdout.contains("--token"),
+        "search help should show the --token flag, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn search_show_size_with_explicit_token_still_succeeds() {
+    // Regression pin: search --show size's concurrent size fan-out used to
+    // build an unauthenticated client regardless of --token. This doesn't
+    // assert on auth actually taking effect (would need a real gated/private
+    // fixture), just that passing --token doesn't break the happy path for
+    // a public repo.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "search",
+        "bartowski/gemma-2-2b-it-GGUF",
+        "--exact",
+        "--show",
+        "size",
+        "--token",
+        "not-a-real-token-but-should-not-crash",
+    ]));
+    assert!(
+        success,
+        "search --show size --token should still succeed for a public repo: {stderr}"
+    );
+    assert!(
+        stdout.contains(" to "),
+        "expected a size range for a multi-quant repo, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn list_files_no_checksum_hides_sha256() {
     let (stdout, stderr, success) =
         run(hf_fm().args(["list-files", "julien-c/dummy-unknown", "--no-checksum"]));
