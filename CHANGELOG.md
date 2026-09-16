@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] — Quant-aware fit planning
+
 ### Added
 
 - **`inspect --group-by <PATTERN>`.** New rollup mode alongside `--dtypes`: buckets tensors into MATCHED (name matches the `globset` glob `PATTERN`) / OTHER, printing byte totals and percentages, plus a `per-MoE-layer expert cost` line when the matched tensor names carry a single, unambiguous numeric layer index (derived locally from the tensor names themselves — no extra `config.json` fetch — so the rollup stays "purely local to a single header parse", as the [v0.12.1 roadmap](docs/roadmaps/cache-management-roadmap.md) framed it). Composes with `--json` (`{ pattern, matched: {...}, other: {...}, total_tensors, total_params, total_bytes, layer_count, per_layer_bytes }`) and with `--filter`/`--limit` the same way `--dtypes` already does. Conflicts with `--dtypes` and `--tree` at clap parse time. First of the v0.12.1 quant-aware fit-planning line: closes Gap 3 of the [Laguna VRAM-fit dogfooding session](docs/dogfooding-feedbacks/hf-fm-dogfooding-vram-fit-laguna-session.md), which had to pipe `inspect` output through a hand-written `awk` script to compute the same MoE-expert-byte rollup. Sequenced first per the roadmap's own dependency note — `hf-fm quants --fits`'s offload-plan arithmetic (next) reads this rollup directly.
