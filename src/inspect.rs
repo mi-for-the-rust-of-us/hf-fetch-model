@@ -590,6 +590,8 @@ pub async fn inspect_safetensors(
 /// Returns [`FetchError::Http`] if a range request fails — including gated
 /// repos, which surface as `returned status 401/403` errors (the `hf-fm`
 /// CLI upgrades those into a gated-repo diagnosis).
+/// Returns [`FetchError::Http`] if the parse task itself fails to join (an
+/// internal panic; not expected in normal operation).
 /// Returns [`FetchError::SafetensorsHeader`] if the header is malformed.
 pub async fn inspect_safetensors_from_reader(
     reader: HttpRangeReader,
@@ -816,7 +818,7 @@ fn gguf_front_matter_to_header_info(
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
 /// diagnosis).
-/// Returns [`FetchError::SafetensorsHeader`] if the GGUF file is malformed
+/// Returns [`FetchError::SafetensorsHeader`] if the `GGUF` file is malformed
 /// (cached or remote).
 pub async fn inspect_gguf(
     repo_id: &str,
@@ -851,7 +853,9 @@ pub async fn inspect_gguf(
 /// Returns [`FetchError::Http`] if a range request fails — including gated
 /// repos, which surface as `returned status 401/403` errors (the `hf-fm`
 /// CLI upgrades those into a gated-repo diagnosis).
-/// Returns [`FetchError::SafetensorsHeader`] if the GGUF file is malformed.
+/// Returns [`FetchError::Http`] if the parse task itself fails to join (an
+/// internal panic; not expected in normal operation).
+/// Returns [`FetchError::SafetensorsHeader`] if the `GGUF` file is malformed.
 pub async fn inspect_gguf_from_reader(
     reader: HttpRangeReader,
     filename: &str,
@@ -1047,6 +1051,8 @@ pub async fn inspect_npz(
 /// Returns [`FetchError::Http`] if a range request fails — including gated
 /// repos, which surface as `returned status 401/403` errors (the `hf-fm`
 /// CLI upgrades those into a gated-repo diagnosis).
+/// Returns [`FetchError::Http`] if the parse task itself fails to join (an
+/// internal panic; not expected in normal operation).
 /// Returns [`FetchError::SafetensorsHeader`] if the `NPZ` archive is malformed.
 pub async fn inspect_npz_from_reader(
     reader: HttpRangeReader,
@@ -1217,7 +1223,7 @@ fn pth_tensor_info_to_header_info(
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
 /// diagnosis).
-/// Returns [`FetchError::SafetensorsHeader`] if the PTH file is malformed
+/// Returns [`FetchError::SafetensorsHeader`] if the `PTH` file is malformed
 /// (cached or remote).
 pub async fn inspect_pth(
     repo_id: &str,
@@ -1252,7 +1258,9 @@ pub async fn inspect_pth(
 /// Returns [`FetchError::Http`] if a range request fails — including gated
 /// repos, which surface as `returned status 401/403` errors (the `hf-fm`
 /// CLI upgrades those into a gated-repo diagnosis).
-/// Returns [`FetchError::SafetensorsHeader`] if the PTH file is malformed.
+/// Returns [`FetchError::Http`] if the parse task itself fails to join (an
+/// internal panic; not expected in normal operation).
+/// Returns [`FetchError::SafetensorsHeader`] if the `PTH` file is malformed.
 pub async fn inspect_pth_from_reader(
     reader: HttpRangeReader,
     filename: &str,

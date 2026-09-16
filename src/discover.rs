@@ -418,13 +418,22 @@ pub async fn search_models(
 }
 
 /// How a repo's (or a filtered listing's) `.gguf` files relate to each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GgufFileSetKind {
     /// A single logical file split via `llama.cpp`'s official
     /// `*-NNNNN-of-MMMMM.gguf` convention — summing sizes across the set is
-    /// correct (you need every shard).
-    Sharded,
+    /// correct (you need every shard). `first_shard` is the filename of the
+    /// split whose index is `1` — under `llama.cpp`'s own convention, the
+    /// *only* shard carrying the `GGUF` metadata `KV` table (and therefore
+    /// any backlink key); later shards' headers hold tensor info alone.
+    /// Carried here, rather than re-derived by [`pick_backlink_representative`]
+    /// via its own separate scan, so classification and "which file is
+    /// shard 1" can never drift apart.
+    Sharded {
+        /// The filename of the shard whose parsed index is `1`.
+        first_shard: String,
+    },
     /// Two or more mutually-exclusive quantization alternatives — summing
     /// sizes across the set is a category error, since nobody downloads more
     /// than one.
@@ -515,10 +524,26 @@ pub fn classify_gguf_files(filenames: &[&str]) -> GgufFileSetKind {
         index == expected
     });
 
-    if complete {
-        GgufFileSetKind::Sharded
-    } else {
-        GgufFileSetKind::QuantAlternatives
+    if !complete {
+        return GgufFileSetKind::QuantAlternatives;
+    }
+
+    // INDEX: `complete` just verified the indices cover `1..=total_usize`
+    // exactly, so exactly one entry in `parsed` (same order/length as
+    // `gguf`, both filtered from `filenames` together) has index `1`.
+    let Some((&first_shard, _)) = gguf
+        .iter()
+        .zip(parsed.iter())
+        .find(|&(_, &(_, index, _))| index == 1)
+    else {
+        // EXPLICIT: unreachable given `complete` above; degrade to
+        // QuantAlternatives instead of panicking if this invariant is ever
+        // violated by a future edit.
+        return GgufFileSetKind::QuantAlternatives;
+    };
+    GgufFileSetKind::Sharded {
+        // BORROW: explicit .to_owned() for &str → owned String field
+        first_shard: first_shard.to_owned(),
     }
 }
 
@@ -726,17 +751,19 @@ fn gguf_source_backlinks(metadata: &HashMap<String, String>) -> Vec<&str> {
 /// `.gguf` file), smallest-by-size stays the right choice: it is the
 /// cheapest header to fetch, and every alternative carries the same
 /// backlink (they are re-quantizations of the same source checkpoint).
+///
+/// Reads which file is shard 1 straight off [`GgufFileSetKind::Sharded`]'s
+/// own `first_shard` field rather than re-deriving it here, so this can
+/// never disagree with `classify_gguf_files`'s own notion of "sharded".
 fn pick_backlink_representative(
     gguf_files: &[crate::repo::RepoFile],
 ) -> Option<&crate::repo::RepoFile> {
+    // BORROW: explicit .as_str() instead of Deref coercion
     let filenames: Vec<&str> = gguf_files.iter().map(|f| f.filename.as_str()).collect();
-    if matches!(classify_gguf_files(&filenames), GgufFileSetKind::Sharded) {
-        let first_shard = gguf_files
-            .iter()
-            .find(|f| matches!(parse_gguf_split_name(&f.filename), Some((_, 1, _))));
-        if first_shard.is_some() {
-            return first_shard;
-        }
+    if let GgufFileSetKind::Sharded { first_shard } = classify_gguf_files(&filenames)
+        && let Some(file) = gguf_files.iter().find(|f| f.filename == first_shard)
+    {
+        return Some(file);
     }
     gguf_files.iter().min_by_key(|f| f.size.unwrap_or(u64::MAX))
 }
@@ -765,7 +792,7 @@ async fn build_quant_candidate(
 
     let gguf_files: Vec<_> = files
         .iter()
-        .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+        .filter(|f| is_gguf_filename(&f.filename))
         .cloned()
         .collect();
 
@@ -887,47 +914,81 @@ pub async fn discover_quant_siblings(
 }
 
 /// Fans out an async per-item operation through a bounded
-/// `tokio::sync::Semaphore`, collecting successful results into a map keyed
-/// by the item itself. Per-item failures (`f` returning `None`) are silently
-/// dropped — callers render a missing key with a placeholder (e.g. `—`).
+/// `tokio::sync::Semaphore`, running at most `concurrency` futures at once.
+/// Returns one `Option<R>` per input item, in the same order as `items` —
+/// regardless of which task finishes first. `None` marks a per-item outcome
+/// the caller should treat as absent: `f` returning `None`, or (defensively)
+/// a task whose permit was never acquired or that panicked. Neither case
+/// aborts the fan-out; every other item still runs to completion.
 ///
-/// Shared bounded-concurrency scaffold behind [`fetch_repo_sizes_concurrent`]
-/// and [`fetch_repo_size_summaries_concurrent`] — both fan out one per-repo
-/// network call at the same concurrency and the same drop-on-failure policy;
-/// a future change to either only needs to happen once here.
+/// The single bounded-concurrency scaffold behind every per-repo network
+/// fan-out in this crate — [`fetch_repo_sizes_concurrent`],
+/// [`fetch_repo_size_summaries_concurrent`], [`fetch_tags_concurrent`], and
+/// (through the `hf-fm` CLI, a separate crate that can only reach a `pub`
+/// item) `quants --fits`'s bounded offload-plan inspection — so a future
+/// change to permit-acquisition, panic-handling, or concurrency semantics
+/// only needs to happen once. Order-preserving (rather than the map-keyed
+/// shape an earlier version of this helper had) because `--fits` needs
+/// every row's verdict, in row order, even the ones that produced no
+/// result — a `HashMap` has no way to represent "present but absent",
+/// only "absent". Callers that want a `repo_id`-keyed map instead (every
+/// caller above except `--fits`) zip `items` back onto the result, which is
+/// why `T` does not need `Eq + Hash` here even though every current caller's
+/// `T` happens to satisfy it.
 ///
 /// `f` is `Fn`, not `FnOnce`, since it is called once per item — shared
 /// state it needs (e.g. an HTTP client) should be cloned inside the closure
 /// body on each call, not moved out of the closure's own captured environment.
-async fn fan_out_bounded<T, R, F, Fut>(items: Vec<T>, concurrency: usize, f: F) -> HashMap<T, R>
+pub async fn fan_out_bounded<T, R, F, Fut>(
+    items: Vec<T>,
+    concurrency: usize,
+    f: F,
+) -> Vec<Option<R>>
 where
-    T: Eq + std::hash::Hash + Clone + Send + 'static,
+    T: Send + 'static,
     R: Send + 'static,
     F: Fn(T) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<R>> + Send + 'static,
 {
+    let len = items.len();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let f = Arc::new(f);
-    let mut set: tokio::task::JoinSet<Option<(T, R)>> = tokio::task::JoinSet::new();
+    let mut set: tokio::task::JoinSet<(usize, Option<R>)> = tokio::task::JoinSet::new();
 
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
         let limiter = Arc::clone(&semaphore);
         let f = Arc::clone(&f);
-        let key = item.clone();
         set.spawn(async move {
-            let _permit = limiter.acquire_owned().await.ok()?;
-            let result = f(item).await?;
-            Some((key, result))
+            let Ok(_permit) = limiter.acquire_owned().await else {
+                return (index, None);
+            };
+            (index, f(item).await)
         });
     }
 
-    let mut out: HashMap<T, R> = HashMap::new();
+    let mut slots: Vec<Option<R>> = (0..len).map(|_| None).collect();
     while let Some(joined) = set.join_next().await {
-        if let Ok(Some((key, result))) = joined {
-            out.insert(key, result);
+        if let Ok((index, result)) = joined
+            && let Some(slot) = slots.get_mut(index)
+        {
+            *slot = result;
         }
     }
-    out
+    slots
+}
+
+/// Zips `keys` back onto `fan_out_bounded`'s order-aligned `Vec<Option<R>>`,
+/// dropping absent slots — the map-building step every `repo_id`-keyed
+/// fan-out caller in this module needs after switching to the order-
+/// preserving [`fan_out_bounded`].
+fn zip_into_map<T: Eq + std::hash::Hash, R>(
+    keys: Vec<T>,
+    results: Vec<Option<R>>,
+) -> HashMap<T, R> {
+    keys.into_iter()
+        .zip(results)
+        .filter_map(|(key, result)| result.map(|r| (key, r)))
+        .collect()
 }
 
 /// Fans out [`fetch_repo_total_size`] across the given repository IDs through
@@ -946,13 +1007,17 @@ where
 #[must_use]
 pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<String, u64> {
     let client = reqwest::Client::new();
-    fan_out_bounded(repo_ids, 8, move |repo_id| {
+    // BORROW: explicit .clone() — fan_out_bounded consumes `repo_ids`, but
+    // the original ids are still needed afterward to key the returned map.
+    let keys = repo_ids.clone();
+    let results = fan_out_bounded(repo_ids, 8, move |repo_id| {
         let client = client.clone();
         // EXPLICIT: per-repo failure intentionally swallowed — the caller
         // renders the row with "—" rather than aborting the search.
         async move { fetch_repo_total_size(&repo_id, &client).await.ok() }
     })
-    .await
+    .await;
+    zip_into_map(keys, results)
 }
 
 /// Fans out [`fetch_repo_size_summary`] across the given repository IDs
@@ -987,13 +1052,17 @@ pub async fn fetch_repo_size_summaries_concurrent(
     token: Option<&str>,
 ) -> Result<HashMap<String, RepoSizeSummary>, FetchError> {
     let client = crate::chunked::build_client(token)?;
-    Ok(fan_out_bounded(repo_ids, 8, move |repo_id| {
+    // BORROW: explicit .clone() — fan_out_bounded consumes `repo_ids`, but
+    // the original ids are still needed afterward to key the returned map.
+    let keys = repo_ids.clone();
+    let results = fan_out_bounded(repo_ids, 8, move |repo_id| {
         let client = client.clone();
         // EXPLICIT: per-repo failure intentionally swallowed — the caller
         // renders the row with "—" rather than aborting the search.
         async move { fetch_repo_size_summary(&repo_id, &client).await.ok() }
     })
-    .await)
+    .await;
+    Ok(zip_into_map(keys, results))
 }
 
 /// Fans out [`fetch_model_card`] across the given repository IDs through a
@@ -1002,8 +1071,8 @@ pub async fn fetch_repo_size_summaries_concurrent(
 ///
 /// Per-repo failures (network errors, 404s, missing models) are silently
 /// dropped from the returned map. Callers that want strict semantics should
-/// treat absence as "no tags known". Mirrors the same fan-out pattern used by
-/// [`fetch_repo_sizes_concurrent`] for `search --show size`.
+/// treat absence as "no tags known". Uses the same bounded fan-out
+/// scaffold as [`fetch_repo_sizes_concurrent`], [`fan_out_bounded`].
 ///
 /// # Arguments
 ///
@@ -1011,31 +1080,17 @@ pub async fn fetch_repo_size_summaries_concurrent(
 ///   the spawned tasks so each future is `'static`.
 #[must_use]
 pub async fn fetch_tags_concurrent(repo_ids: Vec<String>) -> HashMap<String, Vec<String>> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
-    let mut set: tokio::task::JoinSet<Option<(String, Vec<String>)>> = tokio::task::JoinSet::new();
-
-    for repo_id in repo_ids {
-        let limiter = Arc::clone(&semaphore);
-        set.spawn(async move {
-            let _permit = limiter.acquire_owned().await.ok()?;
-            // EXPLICIT: per-repo failure intentionally swallowed — missing
-            // tags mean the row simply doesn't match any --tag filter (the
-            // user's listing is not aborted on a single 404 / network blip).
-            match fetch_model_card(&repo_id).await {
-                Ok(card) => Some((repo_id, card.tags)),
-                Err(_) => None,
-            }
-        });
-    }
-
-    let mut by_repo: HashMap<String, Vec<String>> = HashMap::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok(Some((repo_id, tags))) = joined {
-            by_repo.insert(repo_id, tags);
-        }
-    }
-
-    by_repo
+    // BORROW: explicit .clone() — fan_out_bounded consumes `repo_ids`, but
+    // the original ids are still needed afterward to key the returned map.
+    let keys = repo_ids.clone();
+    let results = fan_out_bounded(repo_ids, 8, move |repo_id| async move {
+        // EXPLICIT: per-repo failure intentionally swallowed — missing
+        // tags mean the row simply doesn't match any --tag filter (the
+        // user's listing is not aborted on a single 404 / network blip).
+        fetch_model_card(&repo_id).await.ok().map(|card| card.tags)
+    })
+    .await;
+    zip_into_map(keys, results)
 }
 
 /// Fetches model card metadata for a specific model from the `HuggingFace` Hub.
@@ -1241,7 +1296,12 @@ mod tests {
             "model-00002-of-00003.gguf",
             "model-00003-of-00003.gguf",
         ];
-        assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
+        assert_eq!(
+            classify_gguf_files(&files),
+            GgufFileSetKind::Sharded {
+                first_shard: "model-00001-of-00003.gguf".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1251,7 +1311,14 @@ mod tests {
             "model-00001-of-00003.gguf",
             "model-00002-of-00003.gguf",
         ];
-        assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
+        // `first_shard` must always be the index-1 filename, not simply the
+        // first one encountered in `files`.
+        assert_eq!(
+            classify_gguf_files(&files),
+            GgufFileSetKind::Sharded {
+                first_shard: "model-00001-of-00003.gguf".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1303,7 +1370,12 @@ mod tests {
             "config.json",
             "README.md",
         ];
-        assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
+        assert_eq!(
+            classify_gguf_files(&files),
+            GgufFileSetKind::Sharded {
+                first_shard: "model-00001-of-00002.gguf".to_owned()
+            }
+        );
     }
 
     // ---------- gguf_size_range ----------
@@ -1416,28 +1488,46 @@ mod tests {
     // ---------- fan_out_bounded ----------
 
     #[tokio::test]
-    async fn fan_out_bounded_collects_all_successes() {
+    async fn fan_out_bounded_preserves_item_order() {
         let items = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
         let out =
             fan_out_bounded(items, 2, |item| async move { Some(format!("{item}-done")) }).await;
 
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.get("a").map(String::as_str), Some("a-done"));
-        assert_eq!(out.get("b").map(String::as_str), Some("b-done"));
-        assert_eq!(out.get("c").map(String::as_str), Some("c-done"));
+        assert_eq!(
+            out,
+            vec![
+                Some("a-done".to_owned()),
+                Some("b-done".to_owned()),
+                Some("c-done".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn fan_out_bounded_drops_per_item_failures() {
-        let items = vec!["keep".to_owned(), "drop".to_owned()];
+    async fn fan_out_bounded_keeps_a_none_slot_for_per_item_failures() {
+        let items = vec!["keep".to_owned(), "drop".to_owned(), "keep2".to_owned()];
         let out = fan_out_bounded(items, 2, |item| async move {
             if item == "drop" { None } else { Some(item) }
         })
         .await;
 
-        assert_eq!(out.len(), 1);
-        assert!(out.contains_key("keep"));
-        assert!(!out.contains_key("drop"));
+        assert_eq!(
+            out,
+            vec![Some("keep".to_owned()), None, Some("keep2".to_owned()),]
+        );
+    }
+
+    #[tokio::test]
+    async fn zip_into_map_drops_none_slots_and_keys_by_item() {
+        let keys = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let results = vec![Some(1), None, Some(3)];
+
+        let map = zip_into_map(keys, results);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a"), Some(&1));
+        assert!(!map.contains_key("b"));
+        assert_eq!(map.get("c"), Some(&3));
     }
 
     #[tokio::test]

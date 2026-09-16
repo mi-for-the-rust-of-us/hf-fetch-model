@@ -84,30 +84,33 @@ pub fn read_snapshot(repo_dir: &Path) -> Result<Option<Snapshot>, FetchError> {
 }
 
 /// Writes the [`Snapshot`] sidecar for a repository, atomically (write to a
-/// `.tmp` sibling, then rename).
+/// `.tmp` sibling, then rename), via the shared
+/// [`crate::atomic_write::write_atomic_sync`] helper — the same durability
+/// pattern [`crate::chunked_state::ChunkedState::save_atomic`] and
+/// [`crate::header_cache::HeaderCacheEntry::save_atomic`] use, synchronous
+/// here since this call site has no `tokio` runtime handy.
 ///
 /// Overwrites any previously-written sidecar — the design is intentionally
-/// last-download-wins.
+/// last-download-wins. `repo_dir`'s parent directory is created first (a
+/// no-op if it already exists), matching the other two sidecars' behavior.
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Io`] on any filesystem
-/// failure (parent directory missing, no write permission, rename across
-/// filesystems, etc.).
+/// Returns [`FetchError::InvalidArgument`] if `snapshot` fails to
+/// serialize (would indicate a programmer bug — every field of
+/// [`Snapshot`] is plain-old-data).
+/// Returns [`FetchError::Io`] if `repo_dir`'s parent directory cannot be
+/// created.
+/// Returns [`FetchError::Io`] if the temp write fails (no write
+/// permission, disk full, etc.).
+/// Returns [`FetchError::Io`] if the rename fails (e.g. across
+/// filesystems).
 pub fn write_snapshot(repo_dir: &Path, snapshot: &Snapshot) -> Result<(), FetchError> {
     let path = snapshot_path(repo_dir);
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(snapshot)
         .map_err(|e| FetchError::InvalidArgument(format!("failed to serialize snapshot: {e}")))?;
-    std::fs::write(&tmp, bytes).map_err(|e| FetchError::Io {
-        path: tmp.clone(),
-        source: e,
-    })?;
-    std::fs::rename(&tmp, &path).map_err(|e| FetchError::Io {
-        path: path.clone(),
-        source: e,
-    })?;
-    Ok(())
+    crate::atomic_write::write_atomic_sync(&path, &tmp, &bytes)
 }
 
 /// Reconstructs a repo ID from a `models--org--name` directory name.
@@ -591,15 +594,16 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
 
         let repo_dir = entry.path();
 
-        // Count files and total size in snapshots.
-        let (file_count, total_size, last_modified) = count_snapshot_files(&repo_dir);
-
-        // A second, lightweight walk to classify `.gguf` quant alternatives
-        // — kept separate from `count_snapshot_files` above (which tracks
-        // last-modified time that `CacheFileUsage` doesn't carry) rather
-        // than unifying the two, to avoid changing that struct's public
-        // shape for every caller.
-        let cached_files = collect_repo_files(&repo_dir);
+        // Single walk over the snapshot tree for file_count/total_size/
+        // last_modified and the raw filenames needed to classify `.gguf`
+        // quant alternatives — previously two separate recursive walks
+        // over the identical directory tree.
+        let RepoFileWalk {
+            files: cached_files,
+            total_size,
+            last_modified,
+        } = walk_repo_files(&repo_dir);
+        let file_count = cached_files.len();
         // BORROW: explicit .as_str() instead of Deref coercion
         let sized: Vec<(&str, Option<u64>)> = cached_files
             .iter()
@@ -646,8 +650,8 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
 pub fn repo_disk_usage(repo_id: &str) -> Result<(usize, u64), FetchError> {
     let cache_dir = hf_cache_dir()?;
     let repo_dir = crate::cache_layout::repo_dir(&cache_dir, repo_id);
-    let (file_count, total_size, _) = count_snapshot_files(&repo_dir);
-    Ok((file_count, total_size))
+    let walk = walk_repo_files(&repo_dir);
+    Ok((walk.files.len(), walk.total_size))
 }
 
 /// Checks whether a single cached repo has `.chunked.part` temp files.
@@ -663,62 +667,6 @@ pub fn repo_has_partial(repo_id: &str) -> Result<bool, FetchError> {
     let repo_dir = crate::cache_layout::repo_dir(&cache_dir, repo_id);
     let blobs_dir = crate::cache_layout::blobs_dir(&repo_dir);
     Ok(find_partial_blob_size(&blobs_dir) > 0)
-}
-
-/// Counts files, total size, and most recent modification time across all
-/// snapshot directories for a repo.
-fn count_snapshot_files(repo_dir: &Path) -> (usize, u64, Option<std::time::SystemTime>) {
-    let snapshots_dir = crate::cache_layout::snapshots_dir(repo_dir);
-    let Ok(snapshots) = std::fs::read_dir(snapshots_dir) else {
-        return (0, 0, None);
-    };
-
-    let mut file_count: usize = 0;
-    let mut total_size: u64 = 0;
-    let mut latest: Option<std::time::SystemTime> = None;
-
-    for snap_entry in snapshots {
-        let Ok(snap_entry) = snap_entry else { continue };
-        let snap_path = snap_entry.path();
-        if !snap_path.is_dir() {
-            continue;
-        }
-        count_files_recursive(&snap_path, &mut file_count, &mut total_size, &mut latest);
-    }
-
-    (file_count, total_size, latest)
-}
-
-/// Recursively counts files, accumulates sizes, and tracks the most recent
-/// modification time in a directory.
-fn count_files_recursive(
-    dir: &Path,
-    count: &mut usize,
-    total: &mut u64,
-    latest: &mut Option<std::time::SystemTime>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.is_dir() {
-            count_files_recursive(&path, count, total, latest);
-        } else if let Ok(meta) = entry.metadata() {
-            *count += 1;
-            *total += meta.len();
-            if let Ok(modified) = meta.modified() {
-                match *latest {
-                    Some(current) if modified <= current => {} // EXPLICIT: current mtime is more recent, keep it
-                    _ => *latest = Some(modified),
-                }
-            }
-        } else {
-            *count += 1;
-        }
-    }
 }
 
 /// Reads the commit hash from a refs file, if it exists.
@@ -926,39 +874,81 @@ pub fn cache_repo_usage(repo_id: &str) -> Result<Vec<CacheFileUsage>, FetchError
         return Ok(Vec::new());
     }
 
-    let mut files = collect_repo_files(&repo_dir);
+    let mut files = walk_repo_files(&repo_dir).files;
     files.sort_by_key(|f| std::cmp::Reverse(f.size));
     Ok(files)
 }
 
-/// Collects every file (relative path + size) across `repo_dir`'s snapshot
-/// directories. Shared walking logic behind [`cache_repo_usage`] (which
-/// additionally resolves `repo_id` → `repo_dir` and sorts by size) and
-/// [`cache_summary`] (which needs the raw filenames to classify `.gguf`
-/// quant alternatives via [`crate::discover::gguf_size_range`]).
-fn collect_repo_files(repo_dir: &Path) -> Vec<CacheFileUsage> {
+/// One cached repo's on-disk file walk: every file's usage, the running
+/// total size, and the most recent modification time seen — everything
+/// both [`cache_repo_usage`] and [`cache_summary`] need, from a single pass
+/// over the snapshot tree.
+struct RepoFileWalk {
+    /// Every file's relative path + size (see [`CacheFileUsage`]).
+    files: Vec<CacheFileUsage>,
+    /// Sum of every file's size.
+    total_size: u64,
+    /// The newest modification time across every file, if any were found.
+    last_modified: Option<std::time::SystemTime>,
+}
+
+/// Walks every file (relative path, size, mtime) across `repo_dir`'s
+/// snapshot directories in one pass. Shared walking logic behind
+/// [`cache_repo_usage`] (which additionally resolves `repo_id` → `repo_dir`
+/// and sorts by size) and [`cache_summary`] (which needs `file_count` /
+/// `total_size` / `last_modified` for the summary row, plus the same file
+/// list to classify `.gguf` quant alternatives via
+/// [`crate::discover::gguf_size_range`]) — previously two separate
+/// recursive walks over the identical directory tree, one counting/summing
+/// without filenames, the other collecting filenames without mtime.
+fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     let snapshots_dir = crate::cache_layout::snapshots_dir(repo_dir);
     let Ok(snapshots) = std::fs::read_dir(snapshots_dir) else {
-        return Vec::new();
+        return RepoFileWalk {
+            files: Vec::new(),
+            total_size: 0,
+            last_modified: None,
+        };
     };
 
     let mut files: Vec<CacheFileUsage> = Vec::new();
+    let mut total_size: u64 = 0;
+    let mut last_modified: Option<std::time::SystemTime> = None;
     for snap_entry in snapshots {
         let Ok(snap_entry) = snap_entry else { continue };
         let snap_path = snap_entry.path();
         if !snap_path.is_dir() {
             continue;
         }
-        collect_snapshot_files(&snap_path, "", &mut files);
+        walk_snapshot_files(
+            &snap_path,
+            "",
+            &mut files,
+            &mut total_size,
+            &mut last_modified,
+        );
     }
-    files
+    RepoFileWalk {
+        files,
+        total_size,
+        last_modified,
+    }
 }
 
-/// Recursively collects files from a snapshot directory into `CacheFileUsage` entries.
+/// Recursively walks a snapshot directory, collecting `CacheFileUsage`
+/// entries while accumulating `total_size` and `last_modified` alongside —
+/// the single-pass counterpart to what used to be two separate recursive
+/// walks (see [`walk_repo_files`]).
 ///
 /// The `prefix` parameter tracks the relative path from the snapshot root,
 /// so that files in subdirectories get paths like `"tokenizer/vocab.json"`.
-fn collect_snapshot_files(dir: &Path, prefix: &str, files: &mut Vec<CacheFileUsage>) {
+fn walk_snapshot_files(
+    dir: &Path,
+    prefix: &str,
+    files: &mut Vec<CacheFileUsage>,
+    total_size: &mut u64,
+    last_modified: &mut Option<std::time::SystemTime>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -975,14 +965,24 @@ fn collect_snapshot_files(dir: &Path, prefix: &str, files: &mut Vec<CacheFileUsa
             } else {
                 format!("{prefix}/{name}")
             };
-            collect_snapshot_files(&path, &child_prefix, files);
+            walk_snapshot_files(&path, &child_prefix, files, total_size, last_modified);
         } else {
             let filename = if prefix.is_empty() {
                 name
             } else {
                 format!("{prefix}/{name}")
             };
-            let size = entry.metadata().map_or(0, |m| m.len());
+            // One `metadata()` call feeds both size and mtime — the two
+            // separate walks this replaces each paid for their own call.
+            let metadata = entry.metadata().ok();
+            let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+            *total_size = total_size.saturating_add(size);
+            if let Some(modified) = metadata.as_ref().and_then(|m| m.modified().ok()) {
+                match *last_modified {
+                    Some(current) if modified <= current => {} // EXPLICIT: current mtime is more recent, keep it
+                    _ => *last_modified = Some(modified),
+                }
+            }
             files.push(CacheFileUsage { filename, size });
         }
     }

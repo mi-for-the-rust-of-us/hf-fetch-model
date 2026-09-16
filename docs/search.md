@@ -173,15 +173,19 @@ The search functionality is also available as a library:
 use hf_fetch_model::discover;
 
 // Search
-let results = discover::search_models("llama 3", 20, None, None, None).await?;
+let results = discover::search_models("llama 3", 20, None, None, None, None).await?;
 for r in &results {
     println!("{} ({:?}, {:?})", r.model_id, r.library_name, r.pipeline_tag);
 }
 
 // Search with library/pipeline filters (client-side)
-let peft_results = discover::search_models("llama", 20, Some("peft"), None, None).await?;
-let gen_results = discover::search_models("mistral", 10, None, Some("text-generation"), None).await?;
-let gguf_results = discover::search_models("llama", 20, None, None, Some("gguf")).await?;
+let peft_results = discover::search_models("llama", 20, Some("peft"), None, None, None).await?;
+let gen_results = discover::search_models("mistral", 10, None, Some("text-generation"), None, None).await?;
+let gguf_results = discover::search_models("llama", 20, None, None, Some("gguf"), None).await?;
+
+// Search with an auth token (needed to find private repos; gated repos are
+// already visible without one)
+let auth_results = discover::search_models("llama", 20, None, None, None, Some("hf_...")).await?;
 
 // Fetch model card
 let card = discover::fetch_model_card("meta-llama/Llama-3.2-1B-Instruct").await?;

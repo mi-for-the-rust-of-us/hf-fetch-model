@@ -2469,11 +2469,10 @@ struct QuantArtifactRow {
 fn build_quant_rows(candidates: Vec<discover::QuantCandidate>) -> Vec<QuantArtifactRow> {
     let mut rows = Vec::new();
     for candidate in candidates {
-        // BORROW: explicit .to_ascii_lowercase() for case-insensitive extension match
         let gguf_files: Vec<&repo::RepoFile> = candidate
             .files
             .iter()
-            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+            .filter(|f| discover::is_gguf_filename(&f.filename))
             .collect();
 
         if gguf_files.is_empty() {
@@ -2542,71 +2541,90 @@ enum FitVerdict {
 /// (`discover::discover_quant_siblings`, `discover::fan_out_bounded`).
 const FITS_INSPECT_CONCURRENCY: usize = 8;
 
-/// Computes the `--fits` verdict for every row in `rows`, through a bounded
-/// [`tokio::sync::Semaphore`] ([`FITS_INSPECT_CONCURRENCY`] permits) rather
-/// than one at a time.
+/// Computes the `--fits` verdict for a row that needs no header inspection
+/// at all — already under `budget - reserve`, or a non-`.gguf` format with
+/// no offload mechanism to plan around. `None` means the row's fate
+/// genuinely depends on a header fetch.
 ///
-/// Rows that trivially fit under budget never reach a header fetch at all
-/// (see [`compute_fit_verdict`]), so this only actually bounds concurrency
-/// for the rows where the answer is in doubt — the cost bound `--fits` was
-/// designed around still applies; this only changes how the *inspected*
-/// rows overlap in time. Returns verdicts in the same order as `rows`
-/// (index-aligned), regardless of completion order.
+/// Factored out of [`compute_fit_verdict`] so [`compute_fit_verdicts_concurrent`]
+/// can resolve these rows synchronously, before ever spawning a fan-out task
+/// for them — the cost bound `--fits` was designed around (only rows where
+/// the answer is in doubt trigger a header fetch) applies just as much to
+/// task-spawn overhead as it does to network requests.
+fn trivial_fit_verdict(row: &QuantArtifactRow, budget: u64, reserve: u64) -> Option<FitVerdict> {
+    let budget_after_reserve = budget.saturating_sub(reserve);
+    if row.size <= budget_after_reserve {
+        return Some(FitVerdict::FullGpu);
+    }
+    if !row.is_gguf {
+        // BORROW: explicit .to_owned() for &str → owned String field
+        return Some(FitVerdict::DoesNotFit {
+            reason: "no offload mechanism for this format".to_owned(),
+        });
+    }
+    None
+}
+
+/// Computes the `--fits` verdict for every row in `rows`, through the shared
+/// [`discover::fan_out_bounded`] scaffold ([`FITS_INSPECT_CONCURRENCY`]
+/// permits) rather than one at a time.
+///
+/// Rows [`trivial_fit_verdict`] already resolves never reach the fan-out at
+/// all — only rows where the answer is in doubt spawn a task. Returns
+/// verdicts in the same order as `rows` (index-aligned), regardless of
+/// completion order.
 async fn compute_fit_verdicts_concurrent(
     rows: &[QuantArtifactRow],
     budget: u64,
     reserve_bytes: u64,
     token: Option<&str>,
 ) -> Vec<FitVerdict> {
-    // BORROW: explicit .to_vec() so each spawned task owns its row; rows
-    // are cheap (one small struct per candidate artifact) and each task
-    // only ever touches its own row, so per-task cloning from a shared
-    // `Arc<[QuantArtifactRow]>` would cost the same without the indirection.
-    let rows_owned = rows.to_vec();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(FITS_INSPECT_CONCURRENCY));
+    let mut verdicts: Vec<Option<FitVerdict>> = Vec::with_capacity(rows.len());
+    let mut needs_inspection: Vec<(usize, QuantArtifactRow)> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(verdict) = trivial_fit_verdict(row, budget, reserve_bytes) {
+            verdicts.push(Some(verdict));
+        } else {
+            verdicts.push(None);
+            // BORROW: explicit .clone() so each spawned task owns its row;
+            // rows are cheap (one small struct per candidate artifact) and
+            // each task only ever touches its own row, so per-task cloning
+            // from a shared `Arc<[QuantArtifactRow]>` would cost the same
+            // without the indirection.
+            needs_inspection.push((index, row.clone()));
+        }
+    }
+
     // BORROW: explicit String::from for Option<&str> -> Option<String>, so
     // each spawned task can own a copy of the token independently of the
     // caller's borrow, which does not outlive this function.
     let token_owned = token.map(String::from);
-    let mut set: tokio::task::JoinSet<(usize, FitVerdict)> = tokio::task::JoinSet::new();
+    let results = discover::fan_out_bounded(
+        needs_inspection,
+        FITS_INSPECT_CONCURRENCY,
+        move |(index, row)| {
+            let token_owned = token_owned.clone();
+            async move {
+                let verdict =
+                    compute_fit_verdict(&row, budget, reserve_bytes, token_owned.as_deref()).await;
+                Some((index, verdict))
+            }
+        },
+    )
+    .await;
 
-    for (index, row) in rows_owned.into_iter().enumerate() {
-        let limiter = Arc::clone(&semaphore);
-        let token_owned = token_owned.clone();
-        set.spawn(async move {
-            let Ok(_permit) = limiter.acquire_owned().await else {
-                return (
-                    index,
-                    FitVerdict::DoesNotFit {
-                        reason: "offload check task did not run".to_owned(),
-                    },
-                );
-            };
-            let verdict =
-                compute_fit_verdict(&row, budget, reserve_bytes, token_owned.as_deref()).await;
-            (index, verdict)
-        });
-    }
-
-    // Pre-sized `Option<FitVerdict>` slots so a joined result can land at its
-    // original index regardless of completion order; filled defensively (a
-    // spawned task can only be missing here if it panicked, which none of
-    // `compute_fit_verdict`'s code paths do).
-    let mut slots: Vec<Option<FitVerdict>> = (0..rows.len()).map(|_| None).collect();
-    while let Some(joined) = set.join_next().await {
-        if let Ok((index, verdict)) = joined
-            && let Some(slot) = slots.get_mut(index)
-        {
+    for (index, verdict) in results.into_iter().flatten() {
+        if let Some(slot) = verdicts.get_mut(index) {
             *slot = Some(verdict);
         }
     }
 
-    slots
+    verdicts
         .into_iter()
         .map(|slot| {
             slot.unwrap_or_else(|| FitVerdict::DoesNotFit {
                 // BORROW: explicit .to_owned() for &str -> owned String field
-                reason: "offload check task panicked".to_owned(),
+                reason: "offload check task did not run".to_owned(),
             })
         })
         .collect()
@@ -2614,7 +2632,7 @@ async fn compute_fit_verdicts_concurrent(
 
 /// Computes the `--fits` verdict for one row.
 ///
-/// Rows already under `budget - reserve` are never inspected — this is the
+/// Rows [`trivial_fit_verdict`] resolves are never inspected — this is the
 /// cost bound `--fits` was designed around: only the rows where the answer
 /// is actually in doubt trigger a header fetch. Offload planning applies the
 /// fixed internal [`MOE_EXPERT_PATTERN`] (`llama.cpp`'s own `MoE`
@@ -2625,16 +2643,10 @@ async fn compute_fit_verdict(
     reserve: u64,
     token: Option<&str>,
 ) -> FitVerdict {
+    if let Some(verdict) = trivial_fit_verdict(row, budget, reserve) {
+        return verdict;
+    }
     let budget_after_reserve = budget.saturating_sub(reserve);
-    if row.size <= budget_after_reserve {
-        return FitVerdict::FullGpu;
-    }
-    if !row.is_gguf {
-        // BORROW: explicit .to_owned() for &str → owned String field
-        return FitVerdict::DoesNotFit {
-            reason: "no offload mechanism for this format".to_owned(),
-        };
-    }
 
     let (info, _source, _stats) =
         match inspect::inspect_gguf(&row.repo, &row.artifact, token, None).await {
@@ -2946,10 +2958,12 @@ fn run_quants(
 
     let verdicts: Option<Vec<FitVerdict>> = if let Some(budget) = fits {
         let reserve_bytes = reserve.unwrap_or(0);
-        let budget_after_reserve = budget.saturating_sub(reserve_bytes);
+        // Same predicate `compute_fit_verdicts_concurrent` partitions rows
+        // on — a row `trivial_fit_verdict` resolves never reaches the
+        // bounded fan-out, so this count is exactly what gets inspected.
         let inspected = rows
             .iter()
-            .filter(|r| r.size > budget_after_reserve && r.is_gguf)
+            .filter(|r| trivial_fit_verdict(r, budget, reserve_bytes).is_none())
             .count();
         eprintln!("{inspected} inspected for offload plan");
         Some(rt.block_on(compute_fit_verdicts_concurrent(
