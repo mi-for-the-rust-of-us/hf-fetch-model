@@ -58,6 +58,7 @@ A living list of the questions we and our early users have actually run into. If
   - [Which quant of a model fits my GPU?](#which-quant-of-a-model-fits-my-gpu)
   - [How reliable is `quants`'s sibling-repo discovery?](#how-reliable-is-quantss-sibling-repo-discovery)
   - [How do I list only the weight files in a repo, not the tokenizer and README?](#how-do-i-list-only-the-weight-files-in-a-repo-not-the-tokenizer-and-readme)
+  - [Why did `list-files` say "509 GiB total" for a repo I'd never download in full?](#why-did-list-files-say-509-gib-total-for-a-repo-id-never-download-in-full)
   - [How do I see what is already cached locally?](#how-do-i-see-what-is-already-cached-locally)
 - [Cache location and management](#cache-location-and-management)
   - [Where does hf-fm store downloaded files? Is the layout compatible with Python `huggingface_hub`?](#where-does-hf-fm-store-downloaded-files-is-the-layout-compatible-with-python-huggingface_hub)
@@ -351,6 +352,17 @@ hf-fm list-files google/gemma-scope-2b-pt-transcoders --preset npz
 ```
 
 The presets bundle the weight extension plus the common config files (`*.json`, `*.txt`, and for `npz` the `config.yaml` GemmaScope uses). Available presets are `safetensors`, `gguf`, `npz`, `pth`, and `config-only` — `hf-fm list-files --help` shows the full list.
+
+### Why did `list-files` say "509 GiB total" for a repo I'd never download in full?
+
+Some `.gguf` repos hold N *mutually-exclusive* quantizations of the same model (`Q4_K_M.gguf`, `Q5_K_M.gguf`, `Q8_0.gguf`, ...) rather than N shards of one file — summing their sizes implied a single download nobody would make. `list-files`, `du <repo>`, and `search --show size` now detect this shape (versus a genuinely sharded file, where the total is correct because every shard is needed) and show a `min to max (mutually exclusive quants)` range instead:
+
+```
+hf-fm list-files bartowski/gemma-2-2b-it-GGUF --preset gguf
+#   11 files, 1.30 GiB to 9.74 GiB (mutually exclusive quants)
+```
+
+`list-files --json` and `du <repo> --json` keep `total_bytes` as the plain sum (still well-defined, just not the useful number here) and add `quant_alternatives`/`size_min`/`size_max` alongside it — an additive schema change, so existing consumers reading only `total_bytes` are unaffected.
 
 ### How do I see what is already cached locally?
 

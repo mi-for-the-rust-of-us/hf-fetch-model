@@ -411,6 +411,171 @@ pub async fn search_models(
     Ok(results)
 }
 
+/// How a repo's (or a filtered listing's) `.gguf` files relate to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GgufFileSetKind {
+    /// A single logical file split via `llama.cpp`'s official
+    /// `*-NNNNN-of-MMMMM.gguf` convention — summing sizes across the set is
+    /// correct (you need every shard).
+    Sharded,
+    /// Two or more mutually-exclusive quantization alternatives — summing
+    /// sizes across the set is a category error, since nobody downloads more
+    /// than one.
+    QuantAlternatives,
+    /// Zero or one `.gguf` file present — nothing to disambiguate; today's
+    /// summing behavior is already correct.
+    NotApplicable,
+}
+
+/// Parses `filename` against `llama.cpp`'s split-file convention
+/// (`<prefix>-<index>-of-<total>.gguf`, `index`/`total` equal-width,
+/// zero-padded digit strings). Returns `(prefix, index, total)` on a match.
+fn parse_gguf_split_name(filename: &str) -> Option<(&str, u32, u32)> {
+    if !filename.to_ascii_lowercase().ends_with(".gguf") {
+        return None;
+    }
+    // `.gguf` is 5 ASCII bytes, so this length is always a valid boundary.
+    let stem = filename.get(..filename.len().checked_sub(5)?)?;
+    let (before, total_str) = stem.split_once("-of-")?;
+    let (prefix, index_str) = before.rsplit_once('-')?;
+    if index_str.is_empty()
+        || total_str.is_empty()
+        || index_str.len() != total_str.len()
+        || !index_str.bytes().all(|b| b.is_ascii_digit())
+        || !total_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let index: u32 = index_str.parse().ok()?;
+    let total: u32 = total_str.parse().ok()?;
+    Some((prefix, index, total))
+}
+
+/// Classifies a repo's `.gguf` files as a sharded single file or a set of
+/// mutually-exclusive quant alternatives.
+///
+/// `Sharded` requires **every** `.gguf` file in `filenames` to match
+/// [`parse_gguf_split_name`] with the same prefix and total, the file count
+/// to equal that total, and the indices to cover `1..=total` exactly.
+/// Anything else with two or more `.gguf` files — a mismatched prefix, a
+/// file outside the split convention entirely, a missing or duplicate index
+/// — is `QuantAlternatives`.
+#[must_use]
+pub fn classify_gguf_files(filenames: &[&str]) -> GgufFileSetKind {
+    let gguf: Vec<&str> = filenames
+        .iter()
+        .copied()
+        .filter(|f| f.to_ascii_lowercase().ends_with(".gguf"))
+        .collect();
+    if gguf.len() <= 1 {
+        return GgufFileSetKind::NotApplicable;
+    }
+
+    let Some(parsed): Option<Vec<(&str, u32, u32)>> =
+        gguf.iter().map(|f| parse_gguf_split_name(f)).collect()
+    else {
+        return GgufFileSetKind::QuantAlternatives;
+    };
+    // INDEX: gguf.len() > 1 checked above, so parsed (same length) is non-empty
+    let Some(&(first_prefix, _, first_total)) = parsed.first() else {
+        return GgufFileSetKind::QuantAlternatives;
+    };
+    let same_group = parsed
+        .iter()
+        .all(|&(prefix, _, total)| prefix == first_prefix && total == first_total);
+    if !same_group {
+        return GgufFileSetKind::QuantAlternatives;
+    }
+    // CAST: u32 -> usize, total is a small shard count from a zero-padded filename token
+    #[allow(clippy::as_conversions)]
+    let total_usize = first_total as usize;
+    if gguf.len() != total_usize {
+        return GgufFileSetKind::QuantAlternatives;
+    }
+
+    let mut indices: Vec<u32> = parsed.iter().map(|&(_, index, _)| index).collect();
+    indices.sort_unstable();
+    let complete = indices.iter().enumerate().all(|(i, &index)| {
+        // CAST: usize -> u32, i is bounded by total_usize which came from a u32
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let expected = i as u32 + 1;
+        index == expected
+    });
+
+    if complete {
+        GgufFileSetKind::Sharded
+    } else {
+        GgufFileSetKind::QuantAlternatives
+    }
+}
+
+/// A repo's aggregate size, aware of the `.gguf` quant-alternatives case.
+///
+/// `total` is always the raw sum of every listed file's size — well-defined,
+/// if not always the most useful number. When `quant_alternatives` is `true`,
+/// `size_min`/`size_max` give the more honest range: the smallest and
+/// largest `.gguf` file, since the repo's files are mutually-exclusive
+/// choices rather than parts of a whole.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RepoSizeSummary {
+    /// Sum of every listed file's size.
+    pub total: u64,
+    /// Whether this repo's `.gguf` files are quant alternatives (see [`GgufFileSetKind`]).
+    pub quant_alternatives: bool,
+    /// Smallest `.gguf` file's size, when `quant_alternatives` is `true`.
+    pub size_min: Option<u64>,
+    /// Largest `.gguf` file's size, when `quant_alternatives` is `true`.
+    pub size_max: Option<u64>,
+}
+
+/// Fetches a repo's file listing and summarizes its size, detecting the
+/// `.gguf` quant-alternatives case via [`classify_gguf_files`].
+///
+/// Additive alongside [`fetch_repo_total_size`] (kept unchanged for existing
+/// callers/downstream consumers) rather than replacing it — this is the
+/// quant-aware variant `hf-fm search --show size` uses.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the API request fails or returns a
+/// non-success status. Returns [`FetchError::RepoNotFound`] if the
+/// repository does not exist on the Hub.
+pub async fn fetch_repo_size_summary(
+    repo_id: &str,
+    client: &reqwest::Client,
+) -> Result<RepoSizeSummary, FetchError> {
+    let files = crate::repo::list_repo_files_with_metadata(repo_id, None, None, client).await?;
+    let total: u64 = files.iter().filter_map(|f| f.size).sum();
+
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+    if !matches!(
+        classify_gguf_files(&filenames),
+        GgufFileSetKind::QuantAlternatives
+    ) {
+        return Ok(RepoSizeSummary {
+            total,
+            quant_alternatives: false,
+            size_min: None,
+            size_max: None,
+        });
+    }
+
+    let gguf_sizes: Vec<u64> = files
+        .iter()
+        .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+        .filter_map(|f| f.size)
+        .collect();
+    Ok(RepoSizeSummary {
+        total,
+        quant_alternatives: true,
+        size_min: gguf_sizes.iter().copied().min(),
+        size_max: gguf_sizes.iter().copied().max(),
+    })
+}
+
 /// Returns the total size in bytes of all files in the given repository's
 /// `main` revision, summed across `siblings[].size` from the
 /// `/api/models/{repo_id}?blobs=true` endpoint.
@@ -695,6 +860,51 @@ pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<Strin
     by_repo
 }
 
+/// Fans out [`fetch_repo_size_summary`] across the given repository IDs
+/// through a bounded `tokio::sync::Semaphore` (8 permits), mirroring
+/// [`fetch_repo_sizes_concurrent`]'s pattern exactly — the quant-aware
+/// counterpart `hf-fm search --show size` uses.
+///
+/// Per-repo failures are silently dropped from the returned map; callers
+/// should render rows whose `repo_id` is absent with a placeholder (`—`).
+///
+/// # Arguments
+///
+/// * `repo_ids` — Owned list of model identifiers. Ownership is moved into
+///   the spawned tasks so each future is `'static`.
+#[must_use]
+pub async fn fetch_repo_size_summaries_concurrent(
+    repo_ids: Vec<String>,
+) -> HashMap<String, RepoSizeSummary> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+    let client = reqwest::Client::new();
+    let mut set: tokio::task::JoinSet<Option<(String, RepoSizeSummary)>> =
+        tokio::task::JoinSet::new();
+
+    for repo_id in repo_ids {
+        let limiter = Arc::clone(&semaphore);
+        let client = client.clone();
+        set.spawn(async move {
+            let _permit = limiter.acquire_owned().await.ok()?;
+            // EXPLICIT: per-repo failure intentionally swallowed — the caller
+            // renders the row with "—" rather than aborting the search.
+            match fetch_repo_size_summary(&repo_id, &client).await {
+                Ok(summary) => Some((repo_id, summary)),
+                Err(_) => None,
+            }
+        });
+    }
+
+    let mut by_repo: HashMap<String, RepoSizeSummary> = HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some((repo_id, summary))) = joined {
+            by_repo.insert(repo_id, summary);
+        }
+    }
+
+    by_repo
+}
+
 /// Fans out [`fetch_model_card`] across the given repository IDs through a
 /// bounded `tokio::sync::Semaphore` (8 permits) and returns a map from
 /// `repo_id` to the model card's tag list.
@@ -920,5 +1130,88 @@ mod tests {
         metadata.insert("general.architecture".to_owned(), "llama".to_owned());
         metadata.insert("general.name".to_owned(), "Laguna-XS-2.1-GGUF".to_owned());
         assert!(gguf_source_backlinks(&metadata).is_empty());
+    }
+
+    // ---------- classify_gguf_files ----------
+
+    #[test]
+    fn classify_gguf_files_not_applicable_for_zero_or_one_file() {
+        assert_eq!(classify_gguf_files(&[]), GgufFileSetKind::NotApplicable);
+        assert_eq!(
+            classify_gguf_files(&["model-Q4_K_M.gguf"]),
+            GgufFileSetKind::NotApplicable
+        );
+    }
+
+    #[test]
+    fn classify_gguf_files_recognizes_a_complete_shard_set() {
+        let files = [
+            "model-00001-of-00003.gguf",
+            "model-00002-of-00003.gguf",
+            "model-00003-of-00003.gguf",
+        ];
+        assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
+    }
+
+    #[test]
+    fn classify_gguf_files_recognizes_a_shard_set_regardless_of_listing_order() {
+        let files = [
+            "model-00003-of-00003.gguf",
+            "model-00001-of-00003.gguf",
+            "model-00002-of-00003.gguf",
+        ];
+        assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
+    }
+
+    #[test]
+    fn classify_gguf_files_flags_quant_alternatives() {
+        let files = ["model-Q4_K_M.gguf", "model-Q5_K_M.gguf", "model-Q8_0.gguf"];
+        assert_eq!(
+            classify_gguf_files(&files),
+            GgufFileSetKind::QuantAlternatives
+        );
+    }
+
+    #[test]
+    fn classify_gguf_files_flags_a_missing_shard_index() {
+        // Claims 3-of-3 but only two files are present — incomplete.
+        let files = ["model-00001-of-00003.gguf", "model-00003-of-00003.gguf"];
+        assert_eq!(
+            classify_gguf_files(&files),
+            GgufFileSetKind::QuantAlternatives
+        );
+    }
+
+    #[test]
+    fn classify_gguf_files_flags_a_duplicate_shard_index() {
+        let files = [
+            "model-00001-of-00003.gguf",
+            "model-00001-of-00003.gguf",
+            "model-00003-of-00003.gguf",
+        ];
+        assert_eq!(
+            classify_gguf_files(&files),
+            GgufFileSetKind::QuantAlternatives
+        );
+    }
+
+    #[test]
+    fn classify_gguf_files_flags_mismatched_prefixes() {
+        let files = ["model-a-00001-of-00002.gguf", "model-b-00002-of-00002.gguf"];
+        assert_eq!(
+            classify_gguf_files(&files),
+            GgufFileSetKind::QuantAlternatives
+        );
+    }
+
+    #[test]
+    fn classify_gguf_files_ignores_non_gguf_files() {
+        let files = [
+            "model-00001-of-00002.gguf",
+            "model-00002-of-00002.gguf",
+            "config.json",
+            "README.md",
+        ];
+        assert_eq!(classify_gguf_files(&files), GgufFileSetKind::Sharded);
     }
 }

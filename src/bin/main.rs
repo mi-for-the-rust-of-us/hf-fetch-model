@@ -2210,14 +2210,18 @@ fn run_search(
     // Fan out repo-size lookups (one HTTP request per result) when
     // `--show size` is set. Per-repo failures are silently dropped from the
     // map; rows whose `model_id` is absent render with "—" in the size cell.
-    let size_by_repo: HashMap<String, u64> = if show_size && !filtered.is_empty() {
-        // BORROW: explicit .clone() — fetch_repo_sizes_concurrent takes Vec<String>
-        // because each spawned task needs an owned `'static` String.
-        let repo_ids: Vec<String> = filtered.iter().map(|r| r.model_id.clone()).collect();
-        rt.block_on(discover::fetch_repo_sizes_concurrent(repo_ids))
-    } else {
-        HashMap::new()
-    };
+    // `RepoSizeSummary` (not the plain `fetch_repo_sizes_concurrent`/u64
+    // form) so a multi-quant repo renders a size range instead of a
+    // meaningless total — see `discover::classify_gguf_files`.
+    let size_by_repo: HashMap<String, discover::RepoSizeSummary> =
+        if show_size && !filtered.is_empty() {
+            // BORROW: explicit .clone() — fetch_repo_size_summaries_concurrent takes
+            // Vec<String> because each spawned task needs an owned `'static` String.
+            let repo_ids: Vec<String> = filtered.iter().map(|r| r.model_id.clone()).collect();
+            rt.block_on(discover::fetch_repo_size_summaries_concurrent(repo_ids))
+        } else {
+            HashMap::new()
+        };
 
     if exact {
         // Exact match: compare against the original query (not normalized)
@@ -2227,13 +2231,13 @@ fn run_search(
 
         if let Some(matched) = exact_match {
             println!("Exact match:\n");
-            let size_bytes = size_by_repo.get(matched.model_id.as_str()).copied(); // BORROW: explicit .as_str()
+            let size_summary = size_by_repo.get(matched.model_id.as_str()).copied(); // BORROW: explicit .as_str()
             print_search_result(
                 matched,
                 matched.model_id.len(),
                 show_tags,
                 show_size,
-                size_bytes,
+                size_summary,
             );
 
             // Fetch and display model card metadata
@@ -2253,8 +2257,8 @@ fn run_search(
                 println!("\nDid you mean:\n");
                 let nw = filtered.iter().map(|r| r.model_id.len()).max().unwrap_or(0);
                 for result in &filtered {
-                    let size_bytes = size_by_repo.get(result.model_id.as_str()).copied(); // BORROW: explicit .as_str()
-                    print_search_result(result, nw, show_tags, show_size, size_bytes);
+                    let size_summary = size_by_repo.get(result.model_id.as_str()).copied(); // BORROW: explicit .as_str()
+                    print_search_result(result, nw, show_tags, show_size, size_summary);
                 }
             }
         }
@@ -2266,8 +2270,8 @@ fn run_search(
             let nw = filtered.iter().map(|r| r.model_id.len()).max().unwrap_or(0);
             println!("Models matching \"{query}\" (by downloads):\n");
             for result in &filtered {
-                let size_bytes = size_by_repo.get(result.model_id.as_str()).copied(); // BORROW: explicit .as_str()
-                print_search_result(result, nw, show_tags, show_size, size_bytes);
+                let size_summary = size_by_repo.get(result.model_id.as_str()).copied(); // BORROW: explicit .as_str()
+                print_search_result(result, nw, show_tags, show_size, size_summary);
             }
         }
     }
@@ -2280,7 +2284,7 @@ fn print_search_result(
     name_width: usize,
     show_tags: bool,
     show_size: bool,
-    size_bytes: Option<u64>,
+    size_summary: Option<discover::RepoSizeSummary>,
 ) {
     let suffix = match (&result.library_name, &result.pipeline_tag) {
         (Some(lib), Some(pipe)) => format!("  [{lib}, {pipe}]"),
@@ -2297,11 +2301,19 @@ fn print_search_result(
         "downloads"
     };
     // Size column: predictable width, placed before the variable-width tag list.
-    // Renders the formatted size when known, "—" when --show size was requested
-    // but the per-repo lookup failed, and nothing at all when --show size is off.
+    // Renders the formatted size when known, a min-to-max range for a
+    // multi-quant repo (summing would imply a single download nobody would
+    // make), "—" when --show size was requested but the per-repo lookup
+    // failed, and nothing at all when --show size is off.
     let size_col = if show_size {
-        match size_bytes {
-            Some(bytes) => format!("  {}", format_size(bytes)),
+        match size_summary {
+            Some(discover::RepoSizeSummary {
+                quant_alternatives: true,
+                size_min: Some(min),
+                size_max: Some(max),
+                ..
+            }) => format!("  {} to {}", format_size(min), format_size(max)),
+            Some(summary) => format!("  {}", format_size(summary.total)),
             None => "  \u{2014}".to_owned(), // BORROW: explicit .to_owned() — em-dash placeholder
         }
     } else {
@@ -3397,12 +3409,38 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     }
 
     println!("  {}", "\u{2500}".repeat(row_width));
-    println!(
-        "  {:>10}  total ({} {})",
-        format_size(total_size),
-        files.len(),
-        pluralize(files.len(), "file", "files"),
+    // A repo holding N mutually-exclusive `.gguf` quant alternatives gets a
+    // min/max range instead of a total — see `list-files`' identical fix and
+    // `discover::classify_gguf_files`.
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let cached_filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+    let quant_alternatives = matches!(
+        discover::classify_gguf_files(&cached_filenames),
+        discover::GgufFileSetKind::QuantAlternatives
     );
+    if quant_alternatives {
+        let gguf_sizes: Vec<u64> = files
+            .iter()
+            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+            .map(|f| f.size)
+            .collect();
+        let min = gguf_sizes.iter().copied().min().unwrap_or(0);
+        let max = gguf_sizes.iter().copied().max().unwrap_or(0);
+        println!(
+            "  {} to {}  (mutually exclusive quants, {} {})",
+            format_size(min),
+            format_size(max),
+            files.len(),
+            pluralize(files.len(), "file", "files"),
+        );
+    } else {
+        println!(
+            "  {:>10}  total ({} {})",
+            format_size(total_size),
+            files.len(),
+            pluralize(files.len(), "file", "files"),
+        );
+    }
 
     // Hint the user when this repo has partial downloads (computed above).
     if has_partial {
@@ -3490,6 +3528,16 @@ struct DuRepoDetailJson {
     file_count: usize,
     /// Whether the repo has incomplete `.chunked.part` downloads.
     has_partial: bool,
+    /// `true` when this repo's `.gguf` files are mutually-exclusive quant
+    /// alternatives rather than shards of one logical file (see
+    /// `list-files --json`'s identical field). A new, additive field.
+    quant_alternatives: bool,
+    /// Smallest cached `.gguf` file's size, present only when `quant_alternatives` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_min: Option<u64>,
+    /// Largest cached `.gguf` file's size, present only when `quant_alternatives` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_max: Option<u64>,
 }
 
 /// Prints the `du` all-repos summary as JSON (flat — no per-file leaves).
@@ -3585,6 +3633,26 @@ fn print_du_repo_json(
             size: f.size,
         });
     }
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let cached_filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+    let quant_alternatives = matches!(
+        discover::classify_gguf_files(&cached_filenames),
+        discover::GgufFileSetKind::QuantAlternatives
+    );
+    let (size_min, size_max) = if quant_alternatives {
+        let gguf_sizes: Vec<u64> = files
+            .iter()
+            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+            .map(|f| f.size)
+            .collect();
+        (
+            gguf_sizes.iter().copied().min(),
+            gguf_sizes.iter().copied().max(),
+        )
+    } else {
+        (None, None)
+    };
+
     let result = DuRepoDetailJson {
         // BORROW: explicit .to_string()/.to_owned() for owned fields
         cache_dir: cache_dir.display().to_string(),
@@ -3593,6 +3661,9 @@ fn print_du_repo_json(
         files: entries,
         total_bytes,
         has_partial,
+        quant_alternatives,
+        size_min,
+        size_max,
     };
     emit_json(&result)
 }
@@ -9670,12 +9741,40 @@ fn run_list_files(
         }
     }
 
-    // Summary line.
+    // Summary line. A repo holding N mutually-exclusive `.gguf` quant
+    // alternatives gets a min/max range instead of a total — summing them
+    // implies a single download nobody would make (unlike a genuinely
+    // sharded file, where the total is correct because every shard is
+    // needed). See `discover::classify_gguf_files`.
     let count = filtered.len();
     let file_label = pluralize(count, "file", "files");
     let row_width = fw + 2 + 10 + 2 + 12;
     println!("  {:\u{2500}<row_width$}", "");
-    if show_cached {
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let listed_filenames: Vec<&str> = filtered.iter().map(|f| f.filename.as_str()).collect();
+    let quant_alternatives = matches!(
+        discover::classify_gguf_files(&listed_filenames),
+        discover::GgufFileSetKind::QuantAlternatives
+    );
+    if quant_alternatives {
+        let gguf_sizes: Vec<u64> = filtered
+            .iter()
+            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+            .filter_map(|f| f.size)
+            .collect();
+        let min = gguf_sizes.iter().copied().min().unwrap_or(0);
+        let max = gguf_sizes.iter().copied().max().unwrap_or(0);
+        let cached_suffix = if show_cached {
+            format!(" ({cached_count} cached)")
+        } else {
+            String::new()
+        };
+        println!(
+            "  {count} {file_label}, {} to {} (mutually exclusive quants){cached_suffix}",
+            format_size(min),
+            format_size(max),
+        );
+    } else if show_cached {
         println!(
             "  {count} {file_label}, {} total ({cached_count} cached)",
             format_size(total_bytes)
@@ -9720,6 +9819,18 @@ struct ListFilesResult {
     /// Number of fully-cached files; present only with `--show-cached`.
     #[serde(skip_serializing_if = "Option::is_none")]
     cached_count: Option<usize>,
+    /// `true` when the listed `.gguf` files are mutually-exclusive quant
+    /// alternatives rather than shards of one logical file — `total_bytes`
+    /// stays a well-defined sum either way, but is misleading in this case;
+    /// prefer `size_min`/`size_max`. A new, additive field — existing
+    /// consumers reading only `total_bytes` are unaffected either way.
+    quant_alternatives: bool,
+    /// Smallest listed `.gguf` file's size, present only when `quant_alternatives` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_min: Option<u64>,
+    /// Largest listed `.gguf` file's size, present only when `quant_alternatives` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_max: Option<u64>,
 }
 
 /// Prints the `list-files` result as JSON.
@@ -9763,6 +9874,26 @@ fn print_list_files_json(
         });
     }
 
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let listed_filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+    let quant_alternatives = matches!(
+        discover::classify_gguf_files(&listed_filenames),
+        discover::GgufFileSetKind::QuantAlternatives
+    );
+    let (size_min, size_max) = if quant_alternatives {
+        let gguf_sizes: Vec<u64> = files
+            .iter()
+            .filter(|f| f.filename.to_ascii_lowercase().ends_with(".gguf"))
+            .filter_map(|f| f.size)
+            .collect();
+        (
+            gguf_sizes.iter().copied().min(),
+            gguf_sizes.iter().copied().max(),
+        )
+    } else {
+        (None, None)
+    };
+
     let result = ListFilesResult {
         // BORROW: explicit .to_owned() for &str → owned String
         repo_id: repo_id.to_owned(),
@@ -9774,6 +9905,9 @@ fn print_list_files_json(
         } else {
             None
         },
+        quant_alternatives,
+        size_min,
+        size_max,
     };
 
     emit_json(&result)

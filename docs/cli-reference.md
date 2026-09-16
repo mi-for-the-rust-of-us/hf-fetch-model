@@ -146,6 +146,11 @@ hf-fm list-files google/gemma-2-2b-it --show-cached
 
 # Emit JSON for scripting (size budgeting, checksum manifests)
 hf-fm list-files google/gemma-2-2b-it --json | jq '.total_bytes'
+
+# A repo holding N mutually-exclusive .gguf quant files shows a size range,
+# not a misleading sum of files nobody would download together
+hf-fm list-files bartowski/gemma-2-2b-it-GGUF --preset gguf
+#   11 files, 1.30 GiB to 9.74 GiB (mutually exclusive quants)
 ```
 
 ## Search examples
@@ -413,7 +418,7 @@ hf-fm du --tree --age
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--age` | Show a last-modified age column (e.g., `2 days ago`, `3 months ago`) | off |
-| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,size,file_count,has_partial,last_modified}],total_bytes,total_files,repo_count}` (`last_modified` is Unix epoch seconds, regardless of `--age`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down. | off |
+| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,size,file_count,has_partial,last_modified}],total_bytes,total_files,repo_count}` (`last_modified` is Unix epoch seconds, regardless of `--age`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down, gaining `quant_alternatives`/`size_min`/`size_max` (same shape as `list-files --json`) when the repo's cached `.gguf` files are mutually-exclusive quant alternatives. | off |
 | `--tree` | Hierarchical tree view: repos as branches, files as leaves, using box-drawing connectors. Composes with `--age` and `--json`; conflicts with the positional repo argument (the per-repo view is already covered by `du <REPO_ID>`). | off |
 
 A repo with an in-progress or interrupted download carries a leading `●` marker in the `du` listing (`● = partial downloads`); run `hf-fm status <REPO_ID>` for the per-file breakdown.
@@ -615,7 +620,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 |------|-------------|---------|
 | `--exclude` | Exclude glob pattern (repeatable) | none |
 | `--filter` | Include glob pattern (repeatable) | all files |
-| `--json` | Output the file list as JSON: `{repo_id, files[{filename, size, sha256}], total_bytes, file_count}` — full (untruncated) SHA256 regardless of `--no-checksum`; adds per-file `cached` and a `cached_count` with `--show-cached` | off |
+| `--json` | Output the file list as JSON: `{repo_id, files[{filename, size, sha256}], total_bytes, file_count, quant_alternatives, size_min, size_max}` — full (untruncated) SHA256 regardless of `--no-checksum`; adds per-file `cached` and a `cached_count` with `--show-cached`. `total_bytes` stays a well-defined sum always; when the listed `.gguf` files are mutually-exclusive quant alternatives rather than shards of one file, `quant_alternatives` is `true` and `size_min`/`size_max` give the honest range (both `null`/absent otherwise) | off |
 | `--no-checksum` | Suppress the SHA256 column (human table only; `--json` always carries the full digest) | off |
 | `--preset` | Filter preset: `safetensors`, `gguf`, `npz`, `pth`, `config-only` | — |
 | `--revision` | Git revision (branch, tag, SHA) | main |
@@ -631,7 +636,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--limit` | Maximum number of results | 20 |
 | `--pipeline` | Filter by pipeline task (e.g., `text-generation`, `text-classification`) | — |
 | `--tag` | Filter by model tag (e.g., `gguf`, `conversational`, `imatrix`) | — |
-| `--show` | Comma-separated columns to add: `tags` (free; from the existing API payload), `size` (one extra HTTP request per result, bounded to 8 concurrent). | — |
+| `--show` | Comma-separated columns to add: `tags` (free; from the existing API payload), `size` (one extra HTTP request per result, bounded to 8 concurrent) — a repo whose `.gguf` files are mutually-exclusive quant alternatives renders a `min to max` range instead of a misleading sum. | — |
 
 ## Quants flags
 

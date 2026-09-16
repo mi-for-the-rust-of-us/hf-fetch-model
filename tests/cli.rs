@@ -309,6 +309,102 @@ fn list_files_default_output() {
 }
 
 #[test]
+fn list_files_quant_repo_shows_range_not_misleading_total() {
+    // bartowski/gemma-2-2b-it-GGUF holds ~11 mutually-exclusive .gguf quant
+    // files, not shards of one logical file — the footer must show a
+    // min-to-max range, not a "31 files, 509 GiB total"-style sum nobody
+    // would ever download.
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "list-files",
+        "bartowski/gemma-2-2b-it-GGUF",
+        "--preset",
+        "gguf",
+    ]));
+    assert!(
+        success,
+        "list-files on a quant repo should succeed: {stderr}"
+    );
+    assert!(
+        stdout.contains("mutually exclusive quants"),
+        "got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(" to "),
+        "expected a size range, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(" total"),
+        "a quant repo's footer should not claim a misleading total, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn list_files_quant_repo_json_has_range_fields() {
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "list-files",
+        "bartowski/gemma-2-2b-it-GGUF",
+        "--preset",
+        "gguf",
+        "--json",
+    ]));
+    assert!(
+        success,
+        "list-files --json on a quant repo should succeed: {stderr}"
+    );
+    let v = parse_json(&stdout);
+    assert_eq!(
+        v.get("quant_alternatives").and_then(Value::as_bool),
+        Some(true),
+        "got:\n{stdout}"
+    );
+    assert!(
+        v.get("size_min").and_then(Value::as_u64).is_some(),
+        "got:\n{stdout}"
+    );
+    assert!(
+        v.get("size_max").and_then(Value::as_u64).is_some(),
+        "got:\n{stdout}"
+    );
+    // `total_bytes` stays present and well-defined even though it's not the
+    // useful number for this repo shape — additive schema change.
+    assert!(v.get("total_bytes").and_then(Value::as_u64).is_some());
+}
+
+#[test]
+fn list_files_non_quant_repo_json_omits_range_fields() {
+    let (stdout, stderr, success) =
+        run(hf_fm().args(["list-files", "julien-c/dummy-unknown", "--json"]));
+    assert!(success, "list-files --json failed: {stderr}");
+    let v = parse_json(&stdout);
+    assert_eq!(
+        v.get("quant_alternatives").and_then(Value::as_bool),
+        Some(false),
+        "got:\n{stdout}"
+    );
+    assert!(v.get("size_min").is_none(), "got:\n{stdout}");
+    assert!(v.get("size_max").is_none(), "got:\n{stdout}");
+}
+
+#[test]
+fn search_show_size_renders_range_for_quant_repo() {
+    let (stdout, stderr, success) = run(hf_fm().args([
+        "search",
+        "bartowski/gemma-2-2b-it-GGUF",
+        "--exact",
+        "--show",
+        "size",
+    ]));
+    assert!(
+        success,
+        "search --exact --show size on a quant repo should succeed: {stderr}"
+    );
+    assert!(
+        stdout.contains(" to "),
+        "expected a size range for a multi-quant repo, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn list_files_no_checksum_hides_sha256() {
     let (stdout, stderr, success) =
         run(hf_fm().args(["list-files", "julien-c/dummy-unknown", "--no-checksum"]));
