@@ -1,6 +1,6 @@
 # Issue replies archive
 
-This folder archives comments drafted or posted on upstream issues (primarily [huggingface/candle](https://github.com/huggingface/candle/issues) and related repos) where `hf-fetch-model`'s inspection features helped diagnose a problem. The dual purpose is:
+This folder archives comments drafted or posted on upstream issues (primarily [huggingface/candle](https://github.com/huggingface/candle/issues), [unslothai/unsloth](https://github.com/unslothai/unsloth/issues), and related repos) where `hf-fetch-model`'s inspection features helped diagnose a problem. The dual purpose is:
 
 1. **Reference**: keep a searchable trail of which issues we engaged with, what we said, and what happened.
 2. **Case-study source material**: the v0.10.0 roadmap includes a first-batch of `docs/case-studies/` written from these replies (see [cache-management-roadmap.md](../roadmaps/cache-management-roadmap.md)). The archive is the raw material; case studies synthesize them into narrative form. First two shipped in v0.10.5: [per-layer shape variation in Gemma 4](../case-studies/gemma4-per-layer-shape-variation.md) (from the #3448 thread) and [reconstructing an OOM from a crash log](../case-studies/qwen3-next-memory-forensics.md) (from #3530), both written to be honest about how far the threads actually got.
@@ -80,3 +80,6 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [candle-3821-p1.md](candle-3821-p1.md) | candle PR #3821 — `qwen3_5` vs. real `qwen35`/`qwen35moe` string mismatch, live-verified | Posted, confirmed by astorise |
 | [candle-2875-p1.md](candle-2875-p1.md) | candle #2875 — FP8 `tensor-tools quantize` error; correct dtype breakdown, stale conclusion | Posted (2026-04-15), superseded by p2 |
 | [candle-2875-p2.md](candle-2875-p2.md) | candle #2875 — corrected: fixed by #2989/0.10.0; per-tensor FP8, upcast faithful | Posted (2026-08-24) |
+| [unsloth-6071-p1.md](unsloth-6071-p1.md) | unsloth #6071 — Qwen3.5/3.6 GGUF "truncated SSM tensor" claim, refuted across 4 files via remote GGUF header inspection | Posted |
+| [unsloth-6071-p2.md](unsloth-6071-p2.md) | unsloth #6071 — cross-repo evidence (OpenWhispr#939) refines root cause toward a `llama.cpp` NextN-layer issue | Posted, partially inaccurate (see p3) |
+| [unsloth-6071-p3.md](unsloth-6071-p3.md) | unsloth #6071 — bisected to a stale `llama.cpp` build (fixed 2026-05-16, `b9180`); confirms p2's hypothesis in source and corrects p2's framing | Posted (2026-09-16) |
