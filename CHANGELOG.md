@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Release pipeline hardened against registry-token theft**, the root cause
+  of the 2026-03-24 LiteLLM supply-chain compromise. Releases now publish
+  through crates.io Trusted Publishing (OIDC), so no long-lived
+  `CARGO_REGISTRY_TOKEN` exists to steal. The publish job needs maintainer
+  approval through a `release` environment and runs only from a `v*` tag. Every
+  third-party GitHub Action is pinned to a full commit SHA, which the existing
+  Dependabot config keeps current. A new `deny` CI job runs `cargo-deny`
+  against `deny.toml` (permissive licences plus per-crate exceptions for
+  `colored` / `option-ext` (MPL-2.0) and `webpki-root-certs`
+  (CDLA-Permissive-2.0), crates.io as the only source; advisories stay with
+  the `audit` job).
+
 ## [0.12.1] — Quant-aware fit planning
 
 ### Added
