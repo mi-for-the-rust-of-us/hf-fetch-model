@@ -1048,7 +1048,11 @@ mod tests {
     fn tail_lines_empty_file() {
         let mut r = Cursor::new(Vec::<u8>::new());
         let out = stream_tail_lines(&mut r, 1024, 3).unwrap();
-        assert!(out.content.is_empty());
+        assert!(
+            out.content.is_empty(),
+            "empty input must yield empty content, got {:?}",
+            out.content
+        );
         assert!(out.truncated.is_none());
     }
 

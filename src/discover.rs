@@ -1275,7 +1275,11 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("general.architecture".to_owned(), "llama".to_owned());
         metadata.insert("general.name".to_owned(), "Laguna-XS-2.1-GGUF".to_owned());
-        assert!(gguf_source_backlinks(&metadata).is_empty());
+        let backlinks = gguf_source_backlinks(&metadata);
+        assert!(
+            backlinks.is_empty(),
+            "unrelated keys must yield no backlinks, got {backlinks:?}"
+        );
     }
 
     // ---------- classify_gguf_files ----------

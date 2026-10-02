@@ -10711,7 +10711,11 @@ mod tests {
     #[test]
     fn narrow_pick_candidates_no_match_is_empty() {
         let entries = sample_listing();
-        assert!(narrow_pick_candidates(&entries, Some("gguf")).is_empty());
+        let hits = narrow_pick_candidates(&entries, Some("gguf"));
+        assert!(
+            hits.is_empty(),
+            "no listing entry is a .gguf, so the filter must match nothing, got {hits:?}"
+        );
     }
 
     #[test]

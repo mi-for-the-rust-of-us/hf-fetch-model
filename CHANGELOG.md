@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`clippy::assert_is_empty`, new in Rust 1.99, failed the `-D warnings`
+  gate in three places.** The lint's point is sound: `assert!(x.is_empty())`
+  prints only "assertion failed" when it trips, saying nothing about what the
+  value actually held. All three are test assertions, in `discover.rs`,
+  `peek.rs` and `src/bin/main.rs`. Rather than take clippy's suggested
+  `assert_eq!(x, [] as [T; 0])` or silence the lint, each now passes the
+  failure message the lint is asking for, which satisfies it while keeping the
+  `is_empty()` reading and giving a useful diagnostic on failure. Taking the
+  `#[allow]` route would also have cost an `unknown lint` warning on the MSRV
+  1.91 lane, where `assert_is_empty` does not exist yet, the way
+  `clippy::duration_suboptimal_units` already does.
+
+  Worth recording how the third one surfaced: `discover.rs` and `peek.rs` fail
+  the plain `cargo clippy --all-targets` pass, but the `src/bin/main.rs` site
+  is behind the `cli` feature and appears **only** under
+  `--all-targets --all-features`. That is exactly the split `CLAUDE.md`'s
+  pre-commit item 2 exists for, and running one pass would have shipped it.
+
 ### Security
 
 - **Release pipeline hardened against registry-token theft**, the root cause
