@@ -29,7 +29,7 @@ cli = ["dep:clap", "dep:tracing-subscriber", "indicatif"]
 # lines fire on cached BnB / GPTQ / AWQ safetensors (without them the
 # tensors classify as `Passthrough` and `detect_scheme` returns
 # `Unquantized` — silently no-op for the families the feature targets).
-anamnesis = { version = "0.7.7", features = ["gguf", "npz", "pth", "bnb", "gptq", "awq"] }
+anamnesis = { version = "0.7.10", features = ["gguf", "npz", "pth", "bnb", "gptq", "awq"] }
 clap = { version = "4", features = ["derive"], optional = true }
 dirs = "6"
 fs2 = "0.4"
@@ -46,7 +46,7 @@ hf-hub = "1.0"
 # until v0.13.0's `--check-gpu --processes`: it is Windows-only and
 # shares the `windows` crate that `dxgi` already pulls, so it costs
 # nothing here.
-hypomnesis = { version = "0.2.11", default-features = false, features = [
+hypomnesis = { version = "0.2.12", default-features = false, features = [
     "nvml",
     "nvidia-smi-fallback",
     "dxgi",
@@ -93,7 +93,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 # `test-helpers`): dev-dependencies unify with normal ones in the test build,
 # so a bare entry here would re-introduce the `cli` union this crate just
 # opted out of.
-hypomnesis = { version = "0.2.11", default-features = false, features = [
+hypomnesis = { version = "0.2.12", default-features = false, features = [
     "nvml",
     "nvidia-smi-fallback",
     "dxgi",

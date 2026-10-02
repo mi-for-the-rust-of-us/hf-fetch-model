@@ -1456,12 +1456,23 @@ mod tests {
 
     #[test]
     fn pth_front_matter_over_range_reader_reads_metadata_not_data() {
-        // The real `data.pkl` plus a 600 KiB dummy storage entry the
-        // front-matter parse must never fetch — same magnitude as the
-        // NPZ/GGUF fixtures above, for an apples-to-apples comparison.
+        // The real `data.pkl` plus dummy storage entries the front-matter
+        // parse must never fetch — `data/0` at 600 KiB, the same magnitude as
+        // the NPZ/GGUF fixtures above, for an apples-to-apples comparison.
+        //
+        // The entry NAMES are load-bearing: this pickle's three tensors view
+        // storages `0` (`rnn.weight_ih_l0`, `rnn.weight_hh_l0`) and `1`
+        // (`linear.weight`), and since anamnesis 0.7.9 a `.pth` naming a
+        // storage the archive lacks is rejected at parse time rather than on
+        // the first `tensors()` call. A single `archive/data/bulk` entry used
+        // to satisfy this test because nothing cross-checked the pickle's
+        // storage keys against the archive's entries. Sizes are an upper
+        // bound only (a view must fit inside its storage), so both are
+        // comfortably larger than the ~24 and 16 bytes the views need.
         let pth = stored_zip(&[
             ("archive/data.pkl", ALGZOO_RNN_SMALL_DATA_PKL.to_vec()),
-            ("archive/data/bulk", vec![0u8; 600 * 1024]),
+            ("archive/data/0", vec![0u8; 600 * 1024]),
+            ("archive/data/1", vec![0u8; 64]),
         ]);
         let total = u64::try_from(pth.len()).unwrap();
         let mut reader = RangeReader::new(InMemoryFetcher::new(pth));

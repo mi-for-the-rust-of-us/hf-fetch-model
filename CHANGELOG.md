@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`anamnesis` bumped `0.7.7` → `0.7.10`.** Three releases, and not a routine
+  refresh: 0.7.9 is the Phase 7.9 security-audit remediation and 0.7.10 adds
+  three `GGUF` block types plus NVIDIA `NVFP4`. Two items change the numbers
+  this crate prints, and one changes which files it can read at all.
+  - **`inspect`'s dequantised size for `GPTQ` / `AWQ` was 8x too small** at
+    4-bit (4x at 8-bit). Upstream counted the `I32` elements of `.qweight`
+    rather than the `32 / bits` weights packed into each. `QuantInfo`'s
+    `dequantized_bytes` reads that figure straight through
+    (`inspect.rs:491`), so `inspect`'s `Size:` line, and any budget a user
+    sized from it, understated every 4-bit `GPTQ` / `AWQ` checkpoint by 8x.
+    The figure is now correct, and upstream holds it equal to the bytes
+    `remember` actually writes for every reference fixture. **Anyone who
+    recorded a `Size:` figure for a 4-bit model from an earlier hf-fm should
+    re-read it.**
+  - **safetensors tensors merely *named* like a scale are no longer dropped.**
+    A tensor ending `_scale` (or `.scales`, `.weight.absmax`, `.SCB` under
+    their features) was treated as a quantisation companion by name alone, and
+    companions are consumed by dequantisation rather than reported, so a
+    model's own `logit_scale` or `layer_scale` vanished from `inspect`'s
+    tensor list and its size. `google/siglip-base-patch16-224` lost its
+    `logit_scale` this way. A scale now counts as a companion only when a
+    quantised tensor exists for it under a name its scheme uses, so tensor
+    counts and sizes rise slightly for affected models. Real `FP8` / `GPTQ` /
+    `AWQ` / `BnB` checkpoints are unaffected.
+  - **`GGUF` `NVFP4`, `Q1_0` and `Q2_0` (`ggml_type` 40, 41, 42) now parse.**
+    Before, any file holding one was refused while reading the tensor-info
+    table (`unknown ggml_type discriminant 40`), so `inspect` could not run on
+    it at all, remote or cached. `NVFP4` is already on 100+ Hub repositories,
+    this cache among them. Upstream cross-validated all three against
+    `ggml-quants.c` itself at 0 `ULP`, and now has a weekly job diffing its
+    type table against llama.cpp `master`, which is the drift that caused this.
+  - **NVIDIA `ModelOpt` `NVFP4` safetensors are no longer misread.** With the
+    `bnb` feature this crate enables, they reported as fine-grained `FP8` at
+    half their real size. 0.7.10 adds a zero-dependency `nvfp4` feature for
+    them; **this crate does not enable it yet**, so such a checkpoint is now
+    recognised and refused by name instead. A clear refusal beats a confident
+    wrong number, and enabling the feature is a candidate for this release
+    (see the `bnb` / `gptq` / `awq` rationale in `Cargo.toml`, which applies
+    unchanged).
+
+  The 0.7.9 hardening lands on every path this crate drives, at no cost here
+  because all of it is validation: `GGUF` overlapping tensor ranges and a
+  non-power-of-two `general.alignment` are refused; a `.pth` zero-stride view
+  that materialised 4 EiB from a 380-byte file, an uncapped tensor rank, an
+  uncharged pickle `MARK` stack and a tied-storage materialisation ratio are
+  all bounded; an `NPZ` `STORED` entry must declare equal compressed and
+  uncompressed sizes, and a declared size is no longer allocated before the
+  bytes exist. Two further items are outright wins: every `AnamnesisError`
+  now renders through one helper that escapes control and bidi characters and
+  cuts at 2048 characters, which closes the same terminal-rewriting and
+  log-forging vector in **this** crate's output, since `hf-fm` prints those
+  messages; and safetensors header processing is no longer quadratic in the
+  tensor count (40 000 tensors go from 1.85 s to 80 ms), which the repo-level
+  `inspect` aggregation pays per shard.
+
+  Inert here: the `ParseLimits` materialisation bounds and
+  `max_item_count` now counting safetensors tensors, because this crate calls
+  the limit-free entry points and `ParseLimits::default()` is unbounded on
+  every axis; and the `amn` CLI's `--force`, atomic writes, `0600` output
+  modes, input-as-output refusal and thread-pool changes, because this crate
+  never writes through anamnesis. `QuantScheme::Nvfp4` is additive and cannot
+  reach us: `QuantInfo.scheme` deliberately stores `QuantScheme`'s `Display`
+  string rather than matching variants.
+
+  One local fix was required. 0.7.9 cross-checks a `.pth`'s pickle storage
+  keys against the archive's entries at parse time, which the offline
+  `pth_front_matter_over_range_reader_reads_metadata_not_data` fixture did not
+  satisfy: its synthetic `ZIP` carried one `archive/data/bulk` entry while the
+  real `data.pkl` inside it views storages `0` and `1`. The fixture now
+  declares `archive/data/0` and `archive/data/1`, with a comment recording
+  that the names are load-bearing. The test's actual property, that
+  front-matter parsing transfers metadata and not tensor data, is unchanged
+  and still asserted.
+
+- **`hypomnesis` bumped `0.2.11` → `0.2.12`.** Largely the remediation of
+  upstream's 2026-09-26 duplicate-code audit, verified behaviour-preserving
+  there (outputs byte-identical, `DXGI` / `NVML` debug traces identical to the
+  previous commit), plus `hmn watch --filter` / `--min` and a `start` record on
+  `hmn watch --json`, all of which are `hmn` CLI surface that this crate's
+  `default-features = false` pin excludes and never compiles. One item is a
+  genuine fix for `hf-fm`: the `DXGI` per-index lookups (`query`,
+  `adapter_name`, `adapter_luid`, `adapter_dedicated_video_memory`) no longer
+  abort the whole adapter walk when one adapter earlier in the raw enumeration
+  order fails its `IDXGIAdapter` cast or `GetDesc`. v0.2.10 had fixed that for
+  two other walks and missed these four, so on a Windows machine with, say, an
+  iGPU carrying a half-installed driver ahead of a healthy NVIDIA card,
+  `inspect --check-gpu` could silently lose the reading, the friendlier adapter
+  name and the dedicated-capacity figure for the card it should have found.
+  `HypomnesisError::Pdh`'s `Display` text also changes to the `<noun>
+  <problem> (<context>)` form; nothing here matches on it (checked).
+  `Snapshot::ram_mb` becoming a `const fn` is additive and uncalled here, and
+  `test-helpers` still exposes the `GpuDeviceInfo::builder()` that this crate's
+  fit / miss `JSON` fixtures use. Both the runtime and the dev-dependency
+  entries move together, as the `test-helpers` comment in `Cargo.toml`
+  requires.
+
+  `cargo update` touched exactly the named packages and nothing else, in both
+  steps. Full local CI is green for the bumps together on **rustc 1.99.0**:
+  `cargo fmt --check`, `cargo clippy --all-targets` and
+  `--all-targets --all-features`, `cargo test` and `cargo test --all-features`
+  (641 results over nine suites, of which 485 distinct: the dual-bin
+  `src/bin/main.rs` runs its 156 once per binary target), `cargo +1.91 clippy`
+  in both feature sets, and the two release-time gates run early because new
+  dependency versions are what they exist for: `cargo audit` clean, and
+  `cargo deny check` reporting advisories, bans, licences and sources all ok.
+
 ### Fixed
 
 - **`clippy::assert_is_empty`, new in Rust 1.99, failed the `-D warnings`
