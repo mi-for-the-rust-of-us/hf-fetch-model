@@ -854,7 +854,7 @@ pub fn find_partial_files(repo_filter: Option<&str>) -> Result<Vec<PartialFile>,
             // BORROW: explicit .to_string_lossy() for OsString → str conversion
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".chunked.part") {
-                // Real file, never a pointer - same reasoning as
+                // Real file, never a pointer: same reasoning as
                 // `find_partial_blob_size` above.
                 let size = blob_entry.metadata().map_or(0, |m| m.len());
                 partials.push(PartialFile {
@@ -955,12 +955,19 @@ pub fn resolved_file_size(path: &Path) -> Option<u64> {
 /// one inaccuracy left here; revisit alongside any change that starts
 /// creating hard links.
 #[cfg(unix)]
+// This arm always returns `Some`, so `unnecessary_wraps` fires on it. The
+// `Option` is still required: the signature is shared with the
+// `#[cfg(not(unix))]` arm below, which can only ever return `None`, and
+// unwrapping it here would push the platform split out into every call site.
+// The lint cannot fire on Windows, where that arm compiles instead, which is
+// how this reached CI unseen.
+#[allow(clippy::unnecessary_wraps)]
 fn physical_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     Some((meta.dev(), meta.ino()))
 }
 
-/// Non-Unix counterpart of [`physical_id`] - see its docs for why this is
+/// Non-Unix counterpart of [`physical_id`]; see its docs for why this is
 /// always `None`.
 #[cfg(not(unix))]
 fn physical_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
@@ -969,7 +976,7 @@ fn physical_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
 
 /// One cached repo's on-disk file walk: the snapshot's logical file list,
 /// the repo's physical byte total, and the most recent modification time
-/// seen - everything both [`cache_repo_usage`] and [`cache_summary`] need,
+/// seen — everything both [`cache_repo_usage`] and [`cache_summary`] need,
 /// from a single pass over the repo directory.
 struct RepoFileWalk {
     /// Every snapshot file's relative path + size (see [`CacheFileUsage`]),
@@ -1009,7 +1016,7 @@ struct RepoFileWalk {
 /// - Where the pointer is a **symlink**, it was worse. The size came from
 ///   `DirEntry::metadata`, which `std` documents as equivalent to
 ///   `symlink_metadata`, so it reported the length of the link's *target
-///   path* - tens of bytes - rather than the file's size, and the blob
+///   path* (tens of bytes) rather than the file's size, and the blob
 ///   holding the real bytes went uncounted as well.
 ///
 /// So this walks `blobs/` first, recording each blob's identity, then
@@ -1153,7 +1160,7 @@ fn walk_snapshot_files(
                     _ => *last_modified = Some(modified),
                 }
             }
-            // A symlink holds none of its own bytes - they were counted under
+            // A symlink holds none of its own bytes; they were counted under
             // `blobs/`. A real file is charged unless it is a hard link to
             // something already counted.
             if !is_link {

@@ -237,6 +237,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases fail on the old code, with `walk_dir_size` returning 7 where 1 000 000
   was on disk.
 
+  What that harness could not do was *lint* the Unix code, and CI found the
+  one thing it missed: `clippy::unnecessary_wraps` on the `#[cfg(unix)]` arm
+  of `physical_id`. That arm always returns `Some`, so clippy reads its
+  `Option` as an unnecessary wrap, while the Windows arm, always `None`, is
+  never linted for it. It failed the `Clippy` and `MSRV (1.91)` jobs on
+  `ubuntu-latest` and nothing else. The `Option` is required by the signature
+  the two cfg arms share, so it is now allowed, with a comment saying why. The
+  failure also stopped cargo before it checked either binary, so CI's report
+  could not be trusted to be complete. The fix was therefore verified by
+  running every `ci.yml` step on Linux itself, through WSL2 on the same rustc
+  1.99.0 and 1.91.1 builds CI resolves: first at the failing commit, where it
+  reproduced CI's error exactly at the same line, then on the fix, where all
+  seven steps passed with the binaries included and the eight Unix tests ran
+  inside the real crate.
+
 - **`clippy::assert_is_empty`, new in Rust 1.99, failed the `-D warnings`
   gate in three places.** The lint's point is sound: `assert!(x.is_empty())`
   prints only "assertion failed" when it trips, saying nothing about what the
