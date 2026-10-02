@@ -10,7 +10,7 @@
 //! [`verify_cache()`] re-checks `SHA256` digests of cached files against
 //! `HuggingFace` LFS metadata.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -545,7 +545,16 @@ pub struct CachedModelSummary {
     pub repo_id: String,
     /// Number of files in the snapshot directory.
     pub file_count: usize,
-    /// Total size on disk in bytes.
+    /// Physical bytes this repo occupies on disk, across `blobs/` and
+    /// `snapshots/`, counting each physical file once.
+    ///
+    /// This is what `cache delete` frees, not the sum of the snapshot's
+    /// logical file sizes: where the platform cannot create pointer
+    /// symlinks (Windows without `SeCreateSymbolicLinkPrivilege`) each
+    /// snapshot entry is a full copy of its blob and the repo holds the same
+    /// bytes twice, so this figure is about double the snapshot's own size.
+    /// Where the pointers are symlinks or hard links, only the blob's bytes
+    /// count. See `walk_repo_files` for why both directories are walked.
     pub total_size: u64,
     /// Whether there are incomplete `.chunked.part` temp files.
     pub has_partial: bool,
@@ -594,10 +603,12 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
 
         let repo_dir = entry.path();
 
-        // Single walk over the snapshot tree for file_count/total_size/
+        // Single walk over the repo directory for file_count/total_size/
         // last_modified and the raw filenames needed to classify `.gguf`
-        // quant alternatives — previously two separate recursive walks
-        // over the identical directory tree.
+        // quant alternatives. `total_size` is physical bytes across `blobs/`
+        // and `snapshots/`; `file_count` and the filenames stay the
+        // snapshot's own, which is what a user means by "N files" and what
+        // `gguf_size_range` needs to see extensions on.
         let RepoFileWalk {
             files: cached_files,
             total_size,
@@ -639,10 +650,20 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
     Ok(summaries)
 }
 
-/// Returns the file count and total size for a single cached repo.
+/// Returns the snapshot file count and the physical bytes on disk for a
+/// single cached repo.
 ///
 /// Avoids scanning the entire cache when only one repo's metrics are needed
 /// (e.g., for the `cache delete` preview).
+///
+/// The size is [`CachedModelSummary::total_size`]'s figure: every physical
+/// file under `blobs/` and `snapshots/`, counted once. That is what
+/// `cache delete`'s `remove_dir_all` goes on to free, so its preview and its
+/// `Freed ...` line agree with what leaves the disk. Before the fix for
+/// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)
+/// this counted snapshot entries only and so under-reported every repo whose
+/// pointers are copies, and nearly all of every repo whose pointers are
+/// symlinks.
 ///
 /// # Errors
 ///
@@ -730,6 +751,9 @@ fn find_partial_blob_size(blobs_dir: &Path) -> u64 {
         let name = entry.file_name();
         // BORROW: explicit .to_string_lossy() for OsString → str conversion
         if name.to_string_lossy().ends_with(".chunked.part") {
+            // `DirEntry::metadata` is correct here, unlike in a snapshot walk
+            // (see `resolved_file_size`): a `.chunked.part` temp blob is
+            // always a real file this crate wrote itself, never a pointer.
             return entry.metadata().map_or(0, |m| m.len());
         }
     }
@@ -830,6 +854,8 @@ pub fn find_partial_files(repo_filter: Option<&str>) -> Result<Vec<PartialFile>,
             // BORROW: explicit .to_string_lossy() for OsString → str conversion
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".chunked.part") {
+                // Real file, never a pointer - same reasoning as
+                // `find_partial_blob_size` above.
                 let size = blob_entry.metadata().map_or(0, |m| m.len());
                 partials.push(PartialFile {
                     // BORROW: explicit .clone() for owned String
@@ -851,7 +877,8 @@ pub fn find_partial_files(repo_filter: Option<&str>) -> Result<Vec<PartialFile>,
 pub struct CacheFileUsage {
     /// Filename relative to the snapshot directory.
     pub filename: String,
-    /// File size in bytes.
+    /// File size in bytes, resolved through a pointer symlink to the bytes
+    /// the file actually holds rather than the length of the link itself.
     pub size: u64,
 }
 
@@ -859,7 +886,13 @@ pub struct CacheFileUsage {
 ///
 /// Walks the snapshot directories under
 /// `<cache_dir>/models--<org>--<name>/snapshots/` and collects each file's
-/// relative path and size. Results are sorted by size descending.
+/// relative path and size, each size resolved through a pointer symlink to
+/// the bytes the file actually holds. Results are sorted by size
+/// descending.
+///
+/// These are the repo's *logical* files. They do not sum to
+/// [`CachedModelSummary::total_size`] wherever snapshot entries are copies
+/// of their blobs rather than links to them.
 ///
 /// Returns an empty `Vec` if the repository is not cached.
 ///
@@ -879,55 +912,146 @@ pub fn cache_repo_usage(repo_id: &str) -> Result<Vec<CacheFileUsage>, FetchError
     Ok(files)
 }
 
-/// One cached repo's on-disk file walk: every file's usage, the running
-/// total size, and the most recent modification time seen — everything
-/// both [`cache_repo_usage`] and [`cache_summary`] need, from a single pass
-/// over the snapshot tree.
+/// Size of the file at `path`, resolved through a pointer symlink.
+///
+/// `None` for a directory, a dangling pointer, or an unreadable path.
+///
+/// Prefer this to `DirEntry::metadata().len()` anywhere a `HuggingFace`
+/// snapshot tree is walked. `DirEntry::metadata` is documented as equivalent
+/// to `symlink_metadata`, so on the usual Unix layout, where a snapshot entry
+/// is a symlink into `blobs/`, it yields the length of the link's *target
+/// path* (tens of bytes) instead of the file's size. Reading sizes that way
+/// is what made disk-usage reporting a rounding error on a symlinked cache:
+/// see [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)
+/// and [`CachedModelSummary::total_size`].
+///
+/// This answers "how big is this file", which is what a listing wants. It
+/// deliberately says nothing about how many bytes the file *occupies*: a
+/// symlink and its blob are one set of bytes under two names, so the repo
+/// walk behind [`cache_summary`] keeps its own richer logic for that, needing
+/// each entry's link status, mtime and physical identity as well as its size.
+#[must_use]
+pub fn resolved_file_size(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.is_file() {
+        Some(meta.len())
+    } else {
+        None
+    }
+}
+
+/// Physical-file identity, used to count one file once however many
+/// directory entries name it.
+///
+/// `Some` on Unix, where `(st_dev, st_ino)` is stable and free. `None`
+/// everywhere else: Windows exposes `nFileIndex` only behind the unstable
+/// `windows_by_handle` feature, and reaching it directly takes an `unsafe`
+/// Win32 call that this crate's `unsafe_code = "forbid"` rules out
+/// absolutely (`forbid`, unlike `deny`, cannot be lifted by an inner
+/// `allow`). Nothing in the stack creates a hard link, so no layout that
+/// actually occurs needs this: [`crate::chunked`]'s `symlink_or_copy` and
+/// `hf-hub`'s own pointer writer each only ever symlink or copy. A hard
+/// link made by hand on Windows is therefore counted twice, which is the
+/// one inaccuracy left here; revisit alongside any change that starts
+/// creating hard links.
+#[cfg(unix)]
+fn physical_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Non-Unix counterpart of [`physical_id`] - see its docs for why this is
+/// always `None`.
+#[cfg(not(unix))]
+fn physical_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// One cached repo's on-disk file walk: the snapshot's logical file list,
+/// the repo's physical byte total, and the most recent modification time
+/// seen - everything both [`cache_repo_usage`] and [`cache_summary`] need,
+/// from a single pass over the repo directory.
 struct RepoFileWalk {
-    /// Every file's relative path + size (see [`CacheFileUsage`]).
+    /// Every snapshot file's relative path + size (see [`CacheFileUsage`]),
+    /// each size resolved through a pointer symlink to the bytes the file
+    /// actually holds.
     files: Vec<CacheFileUsage>,
-    /// Sum of every file's size.
+    /// Distinct physical bytes the repo occupies, across `blobs/` and
+    /// `snapshots/`. Deliberately not the sum of `files`: where a snapshot
+    /// entry is a *copy* of its blob (the Windows layout) both occupy their
+    /// own bytes and both are counted, and where it is a symlink or a hard
+    /// link only the blob is.
     total_size: u64,
-    /// The newest modification time across every file, if any were found.
+    /// The newest modification time across every snapshot file, if any.
     last_modified: Option<std::time::SystemTime>,
 }
 
-/// Walks every file (relative path, size, mtime) across `repo_dir`'s
-/// snapshot directories in one pass. Shared walking logic behind
-/// [`cache_repo_usage`] (which additionally resolves `repo_id` → `repo_dir`
-/// and sorts by size) and [`cache_summary`] (which needs `file_count` /
-/// `total_size` / `last_modified` for the summary row, plus the same file
-/// list to classify `.gguf` quant alternatives via
-/// [`crate::discover::gguf_size_range`]) — previously two separate
-/// recursive walks over the identical directory tree, one counting/summing
-/// without filenames, the other collecting filenames without mtime.
+/// Walks one cached repo, returning its snapshot file list, its physical
+/// byte total and its newest mtime in a single pass.
+///
+/// # Why both `blobs/` and `snapshots/`
+///
+/// The `HuggingFace` layout stores each file's bytes once, under
+/// `blobs/<etag>`, and puts a *pointer* at `snapshots/<commit>/<filename>`.
+/// That pointer is a symlink where the platform allows one and a full copy
+/// otherwise: on Windows, creating a symlink needs
+/// `SeCreateSymbolicLinkPrivilege`, so both [`crate::chunked`]'s
+/// `symlink_or_copy` and `hf-hub` fall back to `std::fs::copy`, and the
+/// repo then holds the same bytes twice.
+///
+/// Walking `snapshots/` alone, as this did until the fix for
+/// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16),
+/// gets *both* layouts wrong, in opposite directions and by different
+/// amounts:
+///
+/// - Where the pointer is a **copy**, the blob is never counted, so the
+///   repo reports about half the bytes it occupies.
+/// - Where the pointer is a **symlink**, it was worse. The size came from
+///   `DirEntry::metadata`, which `std` documents as equivalent to
+///   `symlink_metadata`, so it reported the length of the link's *target
+///   path* - tens of bytes - rather than the file's size, and the blob
+///   holding the real bytes went uncounted as well.
+///
+/// So this walks `blobs/` first, recording each blob's identity, then
+/// `snapshots/`, where a symlink contributes no bytes of its own and a hard
+/// link to an already-counted blob contributes none either. The result is
+/// what `cache delete`'s `remove_dir_all` actually frees.
 fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
-    let snapshots_dir = crate::cache_layout::snapshots_dir(repo_dir);
-    let Ok(snapshots) = std::fs::read_dir(snapshots_dir) else {
-        return RepoFileWalk {
-            files: Vec::new(),
-            total_size: 0,
-            last_modified: None,
-        };
-    };
-
     let mut files: Vec<CacheFileUsage> = Vec::new();
     let mut total_size: u64 = 0;
     let mut last_modified: Option<std::time::SystemTime> = None;
-    for snap_entry in snapshots {
-        let Ok(snap_entry) = snap_entry else { continue };
-        let snap_path = snap_entry.path();
-        if !snap_path.is_dir() {
-            continue;
+    // Identities of the physical files already charged to `total_size`.
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+
+    // Blobs first, so a snapshot entry that hard-links to one is recognised
+    // as already counted rather than charged a second time.
+    walk_blob_files(
+        &crate::cache_layout::blobs_dir(repo_dir),
+        &mut total_size,
+        &mut seen,
+    );
+
+    // A repo can legitimately hold blobs with no readable `snapshots/` (an
+    // interrupted download), so an unreadable snapshots directory leaves the
+    // blob bytes counted above rather than discarding them.
+    if let Ok(snapshots) = std::fs::read_dir(crate::cache_layout::snapshots_dir(repo_dir)) {
+        for snap_entry in snapshots {
+            let Ok(snap_entry) = snap_entry else { continue };
+            let snap_path = snap_entry.path();
+            if !snap_path.is_dir() {
+                continue;
+            }
+            walk_snapshot_files(
+                &snap_path,
+                "",
+                &mut files,
+                &mut total_size,
+                &mut last_modified,
+                &mut seen,
+            );
         }
-        walk_snapshot_files(
-            &snap_path,
-            "",
-            &mut files,
-            &mut total_size,
-            &mut last_modified,
-        );
     }
+
     RepoFileWalk {
         files,
         total_size,
@@ -935,19 +1059,53 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     }
 }
 
-/// Recursively walks a snapshot directory, collecting `CacheFileUsage`
-/// entries while accumulating `total_size` and `last_modified` alongside —
-/// the single-pass counterpart to what used to be two separate recursive
-/// walks (see [`walk_repo_files`]).
+/// Charges every regular file directly under `blobs/` to `total_size`,
+/// recording each one's [`physical_id`] in `seen`.
+///
+/// `blobs/` is flat in the `HuggingFace` layout, so this does not recurse.
+/// Symlinks are skipped rather than followed: a blob is always a real file,
+/// and following one would let a crafted cache charge this repo for bytes
+/// that live outside it.
+fn walk_blob_files(blobs_dir: &Path, total_size: &mut u64, seen: &mut HashSet<(u64, u64)>) {
+    let Ok(entries) = std::fs::read_dir(blobs_dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        // `is_file()` on `symlink_metadata` is false for a symlink, which is
+        // what skips one here.
+        if !meta.is_file() {
+            continue;
+        }
+        if let Some(id) = physical_id(&meta)
+            && !seen.insert(id)
+        {
+            continue;
+        }
+        *total_size = total_size.saturating_add(meta.len());
+    }
+}
+
+/// Recursively walks a snapshot directory, collecting [`CacheFileUsage`]
+/// entries while accumulating `total_size` and `last_modified` alongside.
 ///
 /// The `prefix` parameter tracks the relative path from the snapshot root,
 /// so that files in subdirectories get paths like `"tokenizer/vocab.json"`.
+///
+/// Each entry contributes its resolved size to the listing (so a pointer
+/// symlink reports the bytes it points at, not the length of its target
+/// path) but contributes to `total_size` only when it holds bytes of its
+/// own: see [`walk_repo_files`] for the layouts this distinguishes.
 fn walk_snapshot_files(
     dir: &Path,
     prefix: &str,
     files: &mut Vec<CacheFileUsage>,
     total_size: &mut u64,
     last_modified: &mut Option<std::time::SystemTime>,
+    seen: &mut HashSet<(u64, u64)>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -956,7 +1114,7 @@ fn walk_snapshot_files(
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        // BORROW: explicit .to_string_lossy() for OsString → str conversion
+        // BORROW: explicit .to_string_lossy() for OsString -> str conversion
         let name = entry.file_name().to_string_lossy().to_string();
 
         if path.is_dir() {
@@ -965,22 +1123,46 @@ fn walk_snapshot_files(
             } else {
                 format!("{prefix}/{name}")
             };
-            walk_snapshot_files(&path, &child_prefix, files, total_size, last_modified);
+            walk_snapshot_files(&path, &child_prefix, files, total_size, last_modified, seen);
         } else {
             let filename = if prefix.is_empty() {
                 name
             } else {
                 format!("{prefix}/{name}")
             };
-            // One `metadata()` call feeds both size and mtime — the two
-            // separate walks this replaces each paid for their own call.
-            let metadata = entry.metadata().ok();
+            // `symlink_metadata` classifies the entry without following it;
+            // only a symlink then costs the second, following call. This does
+            // not use [`resolved_file_size`] because it needs the entry's
+            // link status and mtime too, and must charge bytes by physical
+            // identity rather than by name.
+            let Ok(link_meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let is_link = link_meta.file_type().is_symlink();
+            let metadata = if is_link {
+                // A broken pointer resolves to nothing: it is listed at zero
+                // bytes and charged nothing.
+                std::fs::metadata(&path).ok()
+            } else {
+                Some(link_meta)
+            };
             let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-            *total_size = total_size.saturating_add(size);
             if let Some(modified) = metadata.as_ref().and_then(|m| m.modified().ok()) {
                 match *last_modified {
                     Some(current) if modified <= current => {} // EXPLICIT: current mtime is more recent, keep it
                     _ => *last_modified = Some(modified),
+                }
+            }
+            // A symlink holds none of its own bytes - they were counted under
+            // `blobs/`. A real file is charged unless it is a hard link to
+            // something already counted.
+            if !is_link {
+                let first_sighting = match metadata.as_ref().and_then(physical_id) {
+                    Some(id) => seen.insert(id),
+                    None => true,
+                };
+                if first_sighting {
+                    *total_size = total_size.saturating_add(size);
                 }
             }
             files.push(CacheFileUsage { filename, size });
@@ -1234,6 +1416,236 @@ mod tests {
     )]
 
     use super::*;
+
+    /// `resolved_file_size` on an ordinary file is just its length.
+    #[test]
+    fn resolved_file_size_reports_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("f.bin");
+        std::fs::write(&f, vec![b'x'; 777]).unwrap();
+
+        assert_eq!(resolved_file_size(&f), Some(777));
+    }
+
+    #[test]
+    fn resolved_file_size_is_none_for_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert_eq!(resolved_file_size(tmp.path()), None);
+    }
+
+    #[test]
+    fn resolved_file_size_is_none_for_a_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert_eq!(resolved_file_size(&tmp.path().join("nope")), None);
+    }
+
+    /// The case the helper exists for: a pointer symlink must report the
+    /// bytes it points at, not the length of its own target path.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_file_size_follows_a_pointer_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = tmp.path().join("blob");
+        std::fs::write(&blob, vec![b'x'; 5000]).unwrap();
+        let pointer = tmp.path().join("pointer");
+        std::os::unix::fs::symlink("blob", &pointer).unwrap();
+
+        assert_eq!(
+            resolved_file_size(&pointer),
+            Some(5000),
+            "must resolve to the target's size, not the link's"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_file_size_is_none_for_a_dangling_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pointer = tmp.path().join("pointer");
+        std::os::unix::fs::symlink("gone", &pointer).unwrap();
+
+        assert_eq!(resolved_file_size(&pointer), None);
+    }
+
+    /// Builds a `models--org--model` repo directory holding one blob, and
+    /// returns `(tempdir, repo_dir, blob_path, snapshot_dir)`.
+    ///
+    /// The pointer at `snapshots/<commit>/<filename>` is left for the caller
+    /// to create, because *how* that pointer is made is the whole subject of
+    /// the tests below: a copy, a symlink or a hard link are three real
+    /// layouts that `walk_repo_files` has to account for differently.
+    fn repo_with_blob(bytes: usize) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        let snap = crate::cache_layout::snapshot_dir(&repo_dir, "c0ffee");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        let blob = blobs.join("deadbeef");
+        std::fs::write(&blob, vec![b'x'; bytes]).unwrap();
+        (tmp, repo_dir, blob, snap)
+    }
+
+    /// The Windows layout: no symlink privilege, so the pointer is a full
+    /// copy and the repo genuinely holds the same bytes twice.
+    ///
+    /// This is the case [issue #16] reported. Counting `snapshots/` alone
+    /// reported 1000 bytes for a repo occupying 2000.
+    ///
+    /// [issue #16]: https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16
+    #[test]
+    fn walk_counts_both_a_snapshot_copy_and_its_blob() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        std::fs::copy(&blob, snap.join("model.bin")).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(
+            walk.total_size, 2000,
+            "a blob plus a separate copy of it occupies both sets of bytes"
+        );
+        assert_eq!(walk.files.len(), 1, "but it is still one logical file");
+        assert_eq!(walk.files[0].filename, "model.bin");
+        assert_eq!(walk.files[0].size, 1000);
+    }
+
+    /// A repo with blobs but no readable `snapshots/` (an interrupted
+    /// download) still occupies its blob bytes.
+    #[test]
+    fn walk_counts_blobs_when_there_is_no_snapshot() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(4096);
+        std::fs::remove_dir_all(crate::cache_layout::snapshots_dir(&repo_dir)).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.total_size, 4096);
+        assert!(
+            walk.files.is_empty(),
+            "no snapshot means no logical files, got {:?}",
+            walk.files
+        );
+    }
+
+    /// An empty repo directory is zero bytes, not an error.
+    #[test]
+    fn walk_of_an_empty_repo_dir_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.total_size, 0);
+        assert!(walk.files.is_empty());
+        assert!(walk.last_modified.is_none());
+    }
+
+    /// Nested snapshot files keep their relative path and resolved size.
+    #[test]
+    fn walk_counts_nested_snapshot_files() {
+        let (_tmp, repo_dir, _blob, snap) = repo_with_blob(100);
+        std::fs::create_dir_all(snap.join("tokenizer")).unwrap();
+        std::fs::write(snap.join("tokenizer/vocab.json"), vec![b'v'; 50]).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        // 100 (blob) + 50 (the nested file, which has no blob of its own).
+        assert_eq!(walk.total_size, 150);
+        assert_eq!(walk.files.len(), 1);
+        assert_eq!(walk.files[0].filename, "tokenizer/vocab.json");
+        assert_eq!(walk.files[0].size, 50);
+    }
+
+    /// The usual Unix layout: the pointer is a symlink into `blobs/`, so the
+    /// bytes exist once.
+    ///
+    /// Two separate regressions are pinned here. The total must not
+    /// double-count (the blob's bytes are the file's bytes), and the
+    /// per-file size must be the *target's* size. Before the fix the size
+    /// came from `DirEntry::metadata`, which `std` documents as equivalent
+    /// to `symlink_metadata`, so this file was reported at the length of the
+    /// string `../../blobs/deadbeef` instead of 1000 bytes, and the blob was
+    /// never counted at all.
+    #[cfg(unix)]
+    #[test]
+    fn walk_counts_a_symlinked_pointer_once_and_resolves_its_size() {
+        let (_tmp, repo_dir, _blob, snap) = repo_with_blob(1000);
+        std::os::unix::fs::symlink("../../blobs/deadbeef", snap.join("model.bin")).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(
+            walk.total_size, 1000,
+            "a symlink holds no bytes of its own; only the blob counts"
+        );
+        assert_eq!(walk.files.len(), 1);
+        assert_eq!(
+            walk.files[0].size, 1000,
+            "the listing must show the target's size, not the link's"
+        );
+    }
+
+    /// A hard-linked pointer is the same physical file as its blob, so it is
+    /// counted once. Nothing in the stack creates these today; this guards
+    /// the `(st_dev, st_ino)` dedup for the day something does.
+    #[cfg(unix)]
+    #[test]
+    fn walk_counts_a_hard_linked_pointer_once() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(2048);
+        std::fs::hard_link(&blob, snap.join("model.bin")).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(
+            walk.total_size, 2048,
+            "a hard link and its blob are one physical file"
+        );
+        assert_eq!(walk.files.len(), 1);
+        assert_eq!(walk.files[0].size, 2048);
+    }
+
+    /// A pointer whose blob is gone resolves to nothing: listed at zero
+    /// bytes, charged nothing, and no panic.
+    #[cfg(unix)]
+    #[test]
+    fn walk_tolerates_a_broken_pointer() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        std::os::unix::fs::symlink("../../blobs/deadbeef", snap.join("model.bin")).unwrap();
+        std::fs::remove_file(&blob).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(
+            walk.total_size, 0,
+            "the blob is gone, so nothing is on disk"
+        );
+        assert_eq!(walk.files.len(), 1, "the dangling pointer is still listed");
+        assert_eq!(walk.files[0].size, 0);
+    }
+
+    /// A symlink *under* `blobs/` is not followed: a crafted cache must not
+    /// be able to charge this repo for bytes living outside it.
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_a_symlink_inside_blobs() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(10);
+        let outside = repo_dir.parent().unwrap().join("outside.bin");
+        std::fs::write(&outside, vec![b'o'; 999_999]).unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            crate::cache_layout::blobs_dir(&repo_dir).join("sneaky"),
+        )
+        .unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(
+            walk.total_size, 10,
+            "only the real blob counts, not the 999999 bytes outside the repo"
+        );
+    }
 
     fn sample_partial(filename: &str) -> PartialFile {
         PartialFile {

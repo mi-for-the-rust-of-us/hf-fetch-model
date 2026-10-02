@@ -10536,13 +10536,22 @@ fn walk_dir_size(dir: &Path) -> u64 {
     };
     let mut total: u64 = 0;
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+        let path = entry.path();
+        // Classify without following, so a symlinked directory cannot send
+        // this into a loop; file sizes are resolved through the link below.
+        let Ok(link_meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if meta.is_dir() {
-            total = total.saturating_add(walk_dir_size(&entry.path()));
+        if link_meta.is_dir() {
+            total = total.saturating_add(walk_dir_size(&path));
         } else {
-            total = total.saturating_add(meta.len());
+            // `cache::resolved_file_size`, not `metadata().len()`: a freshly
+            // downloaded snapshot is symlinks into `blobs/` on the usual Unix
+            // layout, and reading each link's own length made this summary
+            // report a few dozen bytes for a multi-GiB download (or print
+            // nothing, being guarded on `total_bytes > 0`). Same root cause
+            // as issue #16.
+            total = total.saturating_add(cache::resolved_file_size(&path).unwrap_or(0));
         }
     }
     total
@@ -10592,6 +10601,39 @@ fn format_downloads(n: u64) -> String {
 )]
 mod tests {
     use super::*;
+
+    // ---------- walk_dir_size ----------
+
+    #[test]
+    fn walk_dir_size_sums_nested_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.bin"), vec![b'a'; 100]).unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/b.bin"), vec![b'b'; 50]).unwrap();
+
+        assert_eq!(walk_dir_size(tmp.path()), 150);
+    }
+
+    /// A freshly downloaded snapshot is symlinks into `blobs/` on the usual
+    /// Unix layout. Reading each link's own length made the post-download
+    /// summary report a few dozen bytes for a multi-GiB download, or print
+    /// nothing at all, being guarded on `total_bytes > 0`. Same root cause as
+    /// issue #16.
+    #[cfg(unix)]
+    #[test]
+    fn walk_dir_size_resolves_pointer_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("blob"), vec![b'x'; 1_000_000]).unwrap();
+        let snap = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::os::unix::fs::symlink("../blob", snap.join("model.bin")).unwrap();
+
+        assert_eq!(
+            walk_dir_size(&snap),
+            1_000_000,
+            "must resolve to the target's size, not the link's"
+        );
+    }
 
     // ---------- is_auth_status_error / enrich_gated_content_error ----------
 

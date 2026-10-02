@@ -1565,7 +1565,12 @@ fn collect_matching_names_sizes(
             } else {
                 format!("{prefix}/{name}")
             };
-            let size = entry.metadata().map_or(0, |m| m.len());
+            // `resolved_file_size`, not `entry.metadata().len()`: these
+            // sizes come from a snapshot tree, where an entry is a symlink
+            // into `blobs/` on the usual Unix layout. Reading the link's own
+            // length listed every tensor file at a few dozen bytes, the same
+            // root cause as issue #16's disk-usage under-report.
+            let size = crate::cache::resolved_file_size(&path).unwrap_or(0);
             results.push((filename, size));
         }
     }
@@ -2128,7 +2133,46 @@ mod tests {
 
     use std::io::Write as _;
 
+    use super::collect_matching_names_sizes;
     use super::is_supported_tensor_file;
+
+    /// `collect_matching_names_sizes` reports a plain file's own length.
+    #[test]
+    fn collect_sizes_reports_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.safetensors"), vec![b'x'; 321]).unwrap();
+
+        let mut out: Vec<(String, u64)> = Vec::new();
+        collect_matching_names_sizes(tmp.path(), "", |n| n.ends_with(".safetensors"), &mut out)
+            .unwrap();
+
+        let (name, size) = out.first().unwrap();
+        assert_eq!(name, "a.safetensors");
+        assert_eq!(*size, 321);
+    }
+
+    /// These sizes come from a snapshot tree, so on the usual Unix layout the
+    /// entry is a symlink into `blobs/`. Reading the link's own length listed
+    /// every tensor file at a few dozen bytes: the same root cause as issue
+    /// #16's disk-usage under-report, in the `inspect --list` path.
+    #[cfg(unix)]
+    #[test]
+    fn collect_sizes_resolves_a_pointer_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("blob"), vec![b'x'; 4096]).unwrap();
+        let snap = tmp.path().join("snap");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::os::unix::fs::symlink("../blob", snap.join("model.safetensors")).unwrap();
+
+        let mut out: Vec<(String, u64)> = Vec::new();
+        collect_matching_names_sizes(&snap, "", |n| n.ends_with(".safetensors"), &mut out).unwrap();
+
+        let (_, size) = out.first().unwrap();
+        assert_eq!(
+            *size, 4096,
+            "must resolve to the target's size, not the link's"
+        );
+    }
 
     /// Builds a minimal `.npy` v1.0 header + data blob (`NumPy`'s on-disk
     /// array format), matching the exact byte layout `anamnesis`'s own

@@ -117,6 +117,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`du`, `status`, `cache gc` and `cache delete` all under-reported disk
+  usage, because the walk behind them counted `snapshots/` and never
+  `blobs/`** ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)).
+  The `HuggingFace` layout stores each file's bytes once under
+  `blobs/<etag>` and puts a pointer at `snapshots/<commit>/<filename>`;
+  `walk_repo_files` opened the snapshots directory alone, so the bytes the
+  blobs hold were invisible to every surface built on it. On the reporting
+  machine, a 76-repo cache read as **636.16 GiB against 825.41 GiB actually
+  on disk**, with 189.25 GiB uncounted. The error always made the cache look
+  smaller than it is, which is the wrong direction for a number people use to
+  decide what to delete.
+
+  It was wrong in **two different ways**, by different amounts, depending on
+  what the pointer is:
+  - Where the pointer is a **copy** of its blob (Windows without
+    `SeCreateSymbolicLinkPrivilege`, where both this crate's `symlink_or_copy`
+    and `hf-hub` fall back to `std::fs::copy`), the repo holds the same bytes
+    twice and only one copy was counted, so it reported about half. A 5.18 GiB
+    model in a directory holding 10.36 GiB read as 5.18 GiB.
+  - Where the pointer is a **symlink**, the usual Unix layout, it was far
+    worse and the issue did not catch this half. The size came from
+    `DirEntry::metadata`, which `std` documents as "equivalent to calling
+    `symlink_metadata`", so it returned the length of the link's *target
+    path* rather than the file's size, and the blob holding the real bytes
+    went uncounted as well. Measured on Linux: a 1 MB file reported **20
+    bytes**, the length of `../../blobs/deadbeef`. A symlinked cache
+    therefore reported a rounding error, not half.
+
+  `walk_repo_files` now walks `blobs/` first, recording each blob's identity,
+  then `snapshots/`, where a symlink contributes none of its own bytes and a
+  hard link to an already-counted blob contributes none either. The result is
+  what `cache delete`'s `remove_dir_all` actually frees, so its preview and
+  its `Freed ...` line finally agree with what leaves the disk — previously
+  it would free 10.36 GiB and print `Freed 5.18 GiB`.
+
+  **No public API changed.** `CachedModelSummary::total_size` was already
+  documented as "Total size on disk in bytes" and `repo_disk_usage` is already
+  named for it; the fix makes both true rather than altering either
+  signature. `du`'s own footer already promised that "the total above still
+  reflects real bytes on disk across every cached file", which now holds.
+  Note that the per-file listing and the total no longer sum to each other on
+  a copy layout, deliberately: the listing shows the repo's *logical* files
+  and the total shows *physical* bytes, and on Windows those genuinely differ
+  by the duplication. Both docs say so.
+
+  Fixed alongside, from the same root cause: the per-file sizes
+  `cache_repo_usage` reports are now resolved through the pointer, so on a
+  symlinked cache `du <repo>` listed every file at a few dozen bytes and now
+  lists what they hold. That also fed `discover::gguf_size_range`, whose
+  `min to max` quant-alternative ranges were computed from symlink lengths on
+  those caches and are now computed from real sizes.
+
+  **One documented limitation.** Hard links are deduplicated on Unix via
+  `(st_dev, st_ino)`, and not on Windows, where `nFileIndex` is reachable only
+  behind the unstable `windows_by_handle` feature or through an `unsafe` Win32
+  call that this crate's `unsafe_code = "forbid"` rules out absolutely
+  (`forbid` cannot be lifted by an inner `allow`). This costs nothing today:
+  nothing in the stack creates a hard link, since `symlink_or_copy` here and
+  `hf-hub`'s own pointer writer each only ever symlink or copy, so a hard link
+  can exist only if someone made one by hand, and it would then be counted
+  twice. `physical_id`'s docs say so, and say to revisit this
+  alongside any change that starts creating hard links (such as #16's own
+  suggestion of hard-linking pointers to halve this cache's footprint).
+
+  **Eight new tests, verified to discriminate.** Four run everywhere (a
+  snapshot copy plus its blob; blobs with no snapshot, the interrupted-download
+  case; an empty repo; nested snapshot paths) and four are `#[cfg(unix)]` (a
+  symlinked pointer counted once at its resolved size; a hard-linked pointer
+  counted once; a dangling pointer tolerated at zero; a symlink *inside*
+  `blobs/` not followed, so a crafted cache cannot charge a repo for bytes
+  outside it). The existing cache tests missed all of this because every
+  fixture was built with plain `File::create` writes (regular files, usually
+  no `blobs/` at all), so they encoded the same assumption the code made
+  instead of the layouts the filesystem actually produces.
+
+  Because the dev machine is Windows and `CLAUDE.md`'s *Known CI Blind Spots*
+  notes that `#[cfg(unix)]` code cannot even be type-checked there, the four
+  Unix tests were not left to CI: the four walk functions were extracted
+  verbatim into a dependency-free harness and **compiled and run on real
+  Linux (ext4) through WSL2**, where all eight pass. The same harness built
+  against the pre-fix code from `git HEAD` fails **7 of the 8**, which is what
+  shows the tests discriminate rather than decorate. The eighth, the
+  hard-link case, passes on the old code by coincidence: counting the
+  snapshot entry and ignoring the blob happens to give the right answer there.
+  That is a fair illustration of why the set matters and no single case would
+  have done.
+
+  **Found by a consistency pass over this same fix: the root cause had two
+  more expressions, both user-visible, neither in the issue.** Reading a
+  file's size with `DirEntry::metadata().len()` is wrong anywhere a snapshot
+  tree is walked, and three places did it:
+  - `inspect::collect_matching_names_sizes`, behind the **public**
+    `list_cached_tensor_files` / `list_cached_safetensors` and so behind
+    `inspect --list`, its numeric-index and `--pick` flows, and any downstream
+    consumer of those two functions. On a symlinked cache every tensor file
+    was listed at the length of its pointer's target path.
+  - `walk_dir_size`, behind the post-download summary line at three call
+    sites. Measured on Linux: a 1 MB download reported **7 bytes**, the length
+    of `../blob`. In practice the line usually printed nothing at all, being
+    guarded on `total_bytes > 0`, which is presumably why it went unnoticed.
+
+  Both now go through one documented primitive, `cache::resolved_file_size`
+  (new, `pub` so the binary can reach it, the same reason
+  `discover::fan_out_bounded` and `inspect::resolve_cached_path` are public).
+  Its docs carry the reason, so the next snapshot walk does not repeat this.
+  `walk_repo_files` deliberately keeps its own richer logic and says why it
+  does: it needs each entry's link status, mtime and physical identity, not
+  just its size. The two remaining `DirEntry::metadata()` size reads are
+  correct and now say so, both being `.chunked.part` temp blobs this crate
+  wrote itself, which are never pointers.
+
+  Nine more tests came with that, bringing the fix to **seventeen** (nine
+  portable, eight `#[cfg(unix)]`): five pinning `resolved_file_size` itself
+  (regular file, directory, missing path, followed symlink, dangling symlink),
+  two for the `inspect --list` path and two for the download summary. The
+  Unix half was again compiled and run on real Linux through WSL2, and again
+  checked against `git HEAD` to confirm it discriminates: the two new Unix
+  cases fail on the old code, with `walk_dir_size` returning 7 where 1 000 000
+  was on disk.
+
 - **`clippy::assert_is_empty`, new in Rust 1.99, failed the `-D warnings`
   gate in three places.** The lint's point is sound: `assert!(x.is_empty())`
   prints only "assertion failed" when it trips, saying nothing about what the
