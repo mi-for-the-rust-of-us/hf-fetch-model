@@ -117,7 +117,7 @@ From crates.io, in one command:
 cargo install hf-fetch-model --features cli
 ```
 
-That installs both `hf-fetch-model` and `hf-fm` into `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin\` on Windows). The Minimum Rust Version (MSRV) is **1.88**, declared via the `rust-version` field in `Cargo.toml` — Cargo warns if your active toolchain is older. If `cargo install` fails complaining about the Rust version, run `rustup update stable`.
+That installs both `hf-fetch-model` and `hf-fm` into `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin\` on Windows). The Minimum Rust Version (MSRV) is **1.91**, declared via the `rust-version` field in `Cargo.toml` — Cargo warns if your active toolchain is older. If `cargo install` fails complaining about the Rust version, run `rustup update stable`.
 
 ### How do I upgrade hf-fm? Why does `cargo install` silently keep the old version?
 
