@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   front-matter parsing transfers metadata and not tensor data, is unchanged
   and still asserted.
 
-- **`hypomnesis` bumped `0.2.11` → `0.2.12`.** Largely the remediation of
+- **`hypomnesis` bumped `0.2.11` → `0.2.14`.** 0.2.12 is largely the remediation of
   upstream's 2026-09-26 duplicate-code audit, verified behaviour-preserving
   there (outputs byte-identical, `DXGI` / `NVML` debug traces identical to the
   previous commit), plus `hmn watch --filter` / `--min` and a `start` record on
@@ -104,6 +104,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fit / miss `JSON` fixtures use. Both the runtime and the dev-dependency
   entries move together, as the `test-helpers` comment in `Cargo.toml`
   requires.
+
+  **The floor moves to 0.2.14, and this time it must.** 0.2.14 adds a known
+  variant, `ProcessListDenied`, to the `#[non_exhaustive]` `HypomnesisError`.
+  This crate denies `clippy::wildcard_enum_match_arm`, so the `_` arm in
+  `gpu_check.rs`'s `friendly_error` now caught a known variant, and
+  `--all-features` clippy failed on stable and on 1.91 alike. The default
+  pass cannot see it, since `gpu_check.rs` compiles only into the `cli`
+  binaries. It was never a user-facing break, being a lint: `cargo install`
+  already resolves 0.2.14 and builds and runs correctly. `ProcessListDenied`
+  now joins `Ram` / `Io` / `Pdh` in the arm for errors that should not
+  surface from `device_info`; hypomnesis returns it only from
+  `gpu_processes` / `gpu_process_listing`, only on macOS, and this crate
+  calls neither. Naming the variant is what makes the floor raise mandatory
+  rather than tidy: against 0.2.13 or 0.2.12, both admitted by the old
+  floor, this crate no longer compiles (`E0599`, checked), so a downstream
+  lockfile holding either would have broken on the next release instead of
+  being moved up to 0.2.14.
+
+  Otherwise 0.2.13 and 0.2.14 are additive here, checked against the library
+  diff between their tags rather than their changelogs. 0.2.13 adds
+  `process_exists`; 0.2.14 adds `gpu_process_listing` /
+  `GpuProcessListing`, a sandbox-aware macOS process walk (a new `kinfo.rs`,
+  with no `unsafe`) and a Metal arm in `bounds_check`, while its `nvml.rs`,
+  `pdh.rs` and `spill.rs` changes are test-only. That Metal arm reaches
+  `inspect --check-gpu` on Apple Silicon: an out-of-range index now reads
+  `index 1 out of range (have 1 device)` where it fell through to
+  `NoGpuSource`. On Windows and Linux every path this crate calls is
+  unchanged after `cfg` removal, and measured on an RTX 5060 Ti,
+  `--check-gpu` reports the same name, total, device count and
+  `spill_measurable` before and after, the total matching `hmn` 0.2.14's own
+  reading to the MiB.
+
+  One gap remains, and it predates this bump: `friendly_error` renders
+  `NoGpuSource` with its own `"no NVIDIA device detected (NVML / DXGI not
+  usable)"`, which names backends a Mac does not have, so 0.2.14's
+  platform-correct `NoGpuSource` text does not reach `hf-fm` users.
 
   `cargo update` touched exactly the named packages and nothing else, in both
   steps. Full local CI is green for the bumps together on **rustc 1.99.0**:

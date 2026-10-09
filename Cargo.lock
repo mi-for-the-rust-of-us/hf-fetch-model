@@ -1140,9 +1140,9 @@ dependencies = [
 
 [[package]]
 name = "hypomnesis"
-version = "0.2.12"
+version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c79d13266cfec610b23ba4000ae415f66fd3fcb3501f83c42697b52117039ab"
+checksum = "1fae3b3ea03f1c1a6b1945775c7b6c40a070ff4dda1f1a7e900a1069fc19d918"
 dependencies = [
  "libloading",
  "objc2",
@@ -2548,9 +2548,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
 dependencies = [
  "bytes",
  "libc",

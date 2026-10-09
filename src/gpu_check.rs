@@ -79,7 +79,7 @@ pub fn query_gpu(index: u32) -> GpuCheckResult {
 /// | `DeviceIndexOutOfRange { index, count }` | `"index {N} out of range (have {M} device(s))"` (with singular/plural agreement) |
 /// | `NoGpuSource` | `"no NVIDIA device detected (NVML / DXGI not usable)"` |
 /// | `Nvml(s)` / `Dxgi(s)` / `NvidiaSmi(s)` | `"{backend} backend reported: {s}"` |
-/// | `Ram(_)` / `Io(_)` / `Pdh(_)` | `"unexpected error: {err}"` (should not occur for `device_info`) |
+/// | `Ram(_)` / `Io(_)` / `Pdh(_)` / `ProcessListDenied { .. }` | `"unexpected error: {err}"` (should not occur for `device_info`) |
 /// | future variants (`HypomnesisError` is `#[non_exhaustive]`) | `"hypomnesis error: {err}"` (generic fallthrough) |
 fn friendly_error(err: &hypomnesis::HypomnesisError) -> String {
     use hypomnesis::HypomnesisError as E;
@@ -92,11 +92,15 @@ fn friendly_error(err: &hypomnesis::HypomnesisError) -> String {
         E::Nvml(s) => format!("NVML backend reported: {s}"),
         E::Dxgi(s) => format!("DXGI backend reported: {s}"),
         E::NvidiaSmi(s) => format!("nvidia-smi backend reported: {s}"),
-        // EXPLICIT: Ram / Io / Pdh should not surface for device_info (Pdh is a
-        // per-process backend used only by gpu_processes, added in hypomnesis
-        // 0.2.2), but format defensively so a future revision that routes them
+        // EXPLICIT: Ram / Io / Pdh / ProcessListDenied should not surface for
+        // device_info (Pdh is a per-process backend used only by gpu_processes,
+        // added in hypomnesis 0.2.2; ProcessListDenied, added in 0.2.14, is
+        // returned only by gpu_processes / gpu_process_listing, and only on
+        // macOS), but format defensively so a future revision that routes them
         // through device_info doesn't break our rendering.
-        E::Ram(_) | E::Io(_) | E::Pdh(_) => format!("unexpected error: {err}"),
+        E::Ram(_) | E::Io(_) | E::Pdh(_) | E::ProcessListDenied { .. } => {
+            format!("unexpected error: {err}")
+        }
         // EXHAUSTIVE: HypomnesisError is `#[non_exhaustive]`; cover future variants generically
         _ => format!("hypomnesis error: {err}"),
     }
