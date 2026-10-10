@@ -2,9 +2,9 @@
 
 *Aggregate a model's quant sibling repos into one table, then plan CPU-expert offload before choosing — without downloading a single candidate.*
 
-*~1,250 words · about 5 min read*
+*~1,540 words · about 6 min read*
 
-<!-- Last updated: 2026-09-16, hf-fm v0.12.1 -->
+<!-- Last updated: 2026-10-10, hf-fm v0.12.2 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -23,7 +23,10 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    example from the dogfooding report this feature originated from,
    reused here as illustration and labeled as such, since reproducing a
    12+ GiB MoE GGUF download-free capture is impractical to redo on
-   every doc refresh.
+   every doc refresh. The `--cache-headers` section's blocks are real
+   captures from 2026-10-10 (v0.12.2), made without a token on an isolated
+   cache: the two `quants` runs 15 minutes apart, inside the header
+   cache's one-hour window, and the two `inspect` calls back to back.
 3. Output blocks: paste exact output, do not paraphrase. Trim a long
    table with `…` and note the trim.
 4. Length budget: under 300 lines total, including embedded outputs.
@@ -44,6 +47,7 @@ The third tutorial in the docs effort, and the first one built from a single dog
 - [Where discovery can be wrong](#where-discovery-can-be-wrong)
 - [`--fits`: a plan, not a boolean](#--fits-a-plan-not-a-boolean)
 - [The case this feature was built for](#the-case-this-feature-was-built-for)
+- [Running `--fits` again: `--cache-headers`](#running---fits-again---cache-headers)
 - [Going deeper: `inspect --group-by`](#going-deeper-inspect---group-by)
 - [What you've learned](#what-youve-learned)
 
@@ -121,6 +125,52 @@ ARTIFACT                  SIZE       RESIDENT   PLAN
 
 *(Illustrative — the exact numbers above are from the dogfooding report, not a fresh capture; see the style note at the top of this file.)* A naive size comparison rejects `Q4_K_M` outright at 18.88 GiB against a 16 GiB card. `--fits` doesn't: it inspects the file's `MoE` expert-tensor rollup, computes that offloading 14 of 39 layers' experts to system RAM brings the resident footprint to 12.54 GiB, and reports the exact `--n-cpu-moe` flag to hand `llama.cpp`. That's the difference between a scalar filter and a plan.
 
+## Running `--fits` again: `--cache-headers`
+
+Choosing is rarely one run: you change `--reserve`, try another budget, and run `--fits` again. Each run re-reads the header of every over-budget `.gguf` candidate, and for a popular `MoE` model that adds up fast. `poolside/Laguna-XS-2.1` has 48 sibling repos; at a 16 GiB budget with 2.5 GiB reserved, 76 of their files are over it, and one of those headers alone took 59 range requests and 3.56 MiB to read. Without a token, a second run a few minutes after the first, still contacting the Hub for every one of those headers, was refused with `429 Too Many Requests` on every row.
+
+`--cache-headers` keeps each header it reads in a `.hf-fm-header-cache/` sidecar inside that candidate's cache directory, so a rerun reads it back instead:
+
+```sh
+hf-fm quants poolside/Laguna-XS-2.1 --fits 16GiB --reserve 2.5GiB --cache-headers
+```
+
+```
+Searching for quant siblings of poolside/Laguna-XS-2.1...
+48 repos found, 4 verified via GGUF backlink
+76 inspected for offload plan
+0 of 76 read from the header cache
+```
+
+Run the same command again and the table comes back identical, with one stderr line changed:
+
+```
+Searching for quant siblings of poolside/Laguna-XS-2.1...
+48 repos found, 4 verified via GGUF backlink
+76 inspected for offload plan
+76 of 76 read from the header cache
+```
+
+An entry less than an hour old is used without a single request, so those 76 header reads cost nothing; only discovery's search and repo listings ran again. Past the hour, an entry is first checked against its file's current etag (2 requests instead of dozens) and, if it still matches, trusted for another hour. A file that changed upstream is read afresh, and its old entry removed. What the hour costs you is that a quant re-uploaded within it is planned from its old header until the hour ends.
+
+The same flag works one file at a time with `inspect`, where the `Source:` line shows what each call cost. The first call:
+
+```sh
+hf-fm inspect bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q2_K.gguf --cache-headers
+```
+
+```
+  Source:   remote (30 range requests, 1.75 MiB fetched)
+```
+
+And the `Source:` line of the next one:
+
+```
+  Source:   cached header (age: 0s, not rechecked)
+```
+
+The two commands share their entries, so a header `quants --fits` read is already cached for `inspect`, and the other way round. Entries do take disk: those 76 came to 5.77 MiB. `du` counts them like everything else in a repo's directory, so the 12 Laguna repos you only ever inspected show up there, with 0 files, and `cache delete` or `cache gc` removes them once you have chosen.
+
 ## Going deeper: `inspect --group-by`
 
 `--fits` computes its rollup against a fixed internal pattern (`blk.*.*_exps.weight`, `llama.cpp`'s own `MoE` expert-tensor convention) so you never have to supply one. To see the same rollup directly — a different pattern, or just to understand one specific file before comparing it to siblings — reach for `inspect --group-by` on that file alone:
@@ -137,6 +187,7 @@ This is the same building block `--fits` uses internally, exposed as its own com
 |----------|---------|
 | What quants exist for this model? | `quants <repo>` |
 | Which one fits my card? | `quants <repo> --fits <SIZE> [--reserve <SIZE>]` |
+| How do I rerun that without re-reading every header? | `quants <repo> --fits <SIZE> --cache-headers` |
 | Can I trust a row's naming match? | Check `BITS` (`?` = unrecognized scheme) and the stderr verified count |
 | What fraction of one file is `MoE` expert weight? | `inspect <repo> <file> --group-by 'blk.*.ffn_*_exps.weight'` |
 | For scripting | `quants <repo> --json` / `quants <repo> --fits <SIZE> --json` |

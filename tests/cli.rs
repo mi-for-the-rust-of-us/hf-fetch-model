@@ -3775,17 +3775,18 @@ fn cache_headers_only_repo_is_listed_by_du_and_status_with_its_bytes() {
         "status should list the repo too, got:\n{status_stdout}"
     );
 
+    // An immediate repeat is inside the trust window: the entry is used
+    // with no request at all.
     let (hit_stdout, hit_stderr, hit_success) = run(hf_fm().env("HF_HOME", dir.path()).args(args));
     assert!(hit_success, "the repeat call should succeed: {hit_stderr}");
     assert!(
         hit_stdout.contains("Source:   cached header (age: ")
-            && hit_stdout.contains(" to check it is current)"),
-        "a hit should report the etag check's requests, got:\n{hit_stdout}"
+            && hit_stdout.contains(", not rechecked)"),
+        "a hit inside the window should make no request, got:\n{hit_stdout}"
     );
 
-    // Pruning: plant an entry for an older etag of the same file and
-    // revision, remove the current one to force a miss, and inspect again.
-    // Saving the fresh entry must remove the superseded one.
+    // Past the window, the etag probe confirms the entry first, and the
+    // confirmed entry is trusted for another window.
     let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&sidecar)
         .expect("read sidecar dir")
         .map(|e| e.expect("dir entry").path())
@@ -3794,6 +3795,36 @@ fn cache_headers_only_repo_is_listed_by_du_and_status_with_its_bytes() {
     let Some(current) = entries.first() else {
         panic!("no header cache entry");
     };
+    let mut entry: Value =
+        serde_json::from_str(&std::fs::read_to_string(current).expect("read entry"))
+            .expect("parse entry");
+    age_header_cache_entry(&mut entry, 2 * 3600);
+    std::fs::write(current, entry.to_string()).expect("write aged entry");
+    let (probed_stdout, probed_stderr, probed_success) =
+        run(hf_fm().env("HF_HOME", dir.path()).args(args));
+    assert!(
+        probed_success,
+        "the probed call should succeed: {probed_stderr}"
+    );
+    assert!(
+        probed_stdout.contains(" to check it is current)"),
+        "a hit past the window should report the etag check, got:\n{probed_stdout}"
+    );
+    let (again_stdout, again_stderr, again_success) =
+        run(hf_fm().env("HF_HOME", dir.path()).args(args));
+    assert!(
+        again_success,
+        "the next call should succeed: {again_stderr}"
+    );
+    assert!(
+        again_stdout.contains(", not rechecked)"),
+        "a confirmed entry should be trusted again, got:\n{again_stdout}"
+    );
+
+    // Pruning: plant an older etag of the same file and revision, aged past
+    // the window so it is not simply trusted, remove the current entry to
+    // force a miss, and inspect again. Saving the fresh entry must remove
+    // the superseded one.
     let mut old: Value =
         serde_json::from_str(&std::fs::read_to_string(current).expect("read entry"))
             .expect("parse entry");
@@ -3801,6 +3832,7 @@ fn cache_headers_only_repo_is_listed_by_du_and_status_with_its_bytes() {
         panic!("the entry should carry an etag");
     };
     *etag = Value::from("superseded");
+    age_header_cache_entry(&mut old, 2 * 3600);
     let old_path = sidecar.join("model.safetensors.superseded.json");
     std::fs::write(&old_path, old.to_string()).expect("write superseded entry");
     std::fs::remove_file(current).expect("remove current entry");
@@ -3815,6 +3847,21 @@ fn cache_headers_only_repo_is_listed_by_du_and_status_with_its_bytes() {
         "saving the fresh entry should remove the superseded one"
     );
     assert!(current.exists(), "the fresh entry should be saved");
+}
+
+/// Moves a header-cache entry's `cached_at` back by `secs`, so it falls
+/// outside the trust window.
+fn age_header_cache_entry(entry: &mut Value, secs: u64) {
+    let Some(stamp) = entry
+        .get_mut("cached_at")
+        .and_then(|c| c.get_mut("secs_since_epoch"))
+    else {
+        panic!("the entry should carry cached_at.secs_since_epoch, got {entry}");
+    };
+    let Some(now) = stamp.as_u64() else {
+        panic!("secs_since_epoch should be a u64, got {stamp}");
+    };
+    *stamp = Value::from(now - secs);
 }
 
 #[test]
@@ -4587,7 +4634,13 @@ fn du_number_column_widens_past_999_repos() {
 fn quants_help_shows_fits_and_reserve_flags() {
     let (stdout, stderr, success) = run(hf_fm().args(["quants", "--help"]));
     assert!(success, "quants --help failed: {stderr}");
-    for flag in ["--fits", "--reserve", "--token", "--json"] {
+    for flag in [
+        "--fits",
+        "--reserve",
+        "--cache-headers",
+        "--token",
+        "--json",
+    ] {
         assert!(
             stdout.contains(flag),
             "quants help should contain {flag}, got:\n{stdout}"
@@ -4606,6 +4659,23 @@ fn quants_reserve_without_fits_is_rejected() {
     assert!(
         stderr.contains("--fits") || stderr.contains("required"),
         "error should mention the --fits requirement, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn quants_cache_headers_without_fits_is_rejected() {
+    // Only `--fits` fetches headers, so caching them means nothing without
+    // it; clap rejects the combination before any network access.
+    let (_stdout, stderr, success) =
+        run(hf_fm().args(["quants", "julien-c/dummy-unknown", "--cache-headers"]));
+    assert!(
+        !success,
+        "quants --cache-headers without --fits should be a clap parse error"
+    );
+    assert!(
+        stderr.contains("--fits"),
+        "error should mention the --fits requirement, got:
+{stderr}"
     );
 }
 

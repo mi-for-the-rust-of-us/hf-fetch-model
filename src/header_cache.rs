@@ -8,11 +8,11 @@
 //! keyed on `(repo, revision, filename, etag)`, so repeat inspection of the
 //! same remote file across invocations (the natural pattern of iterative
 //! narrowing over a handful of quant candidates) skips the header's own
-//! range requests. It is not free: every call, hit or miss, first spends
-//! the 2-request probe that reads the file's current etag, so a hit still
-//! needs the network. Saving an entry removes the ones it supersedes (see
-//! [`prune_superseded`]), so an upstream change does not leave the old one
-//! behind.
+//! range requests. An entry younger than [`TRUST_WINDOW`] is used without
+//! any request at all (see [`find_recent`]); an older one is used after the
+//! reader's 2-request probe confirms the file's etag is unchanged. Saving
+//! an entry removes the ones it supersedes (see [`prune_superseded`]), so
+//! an upstream change does not leave the old one behind.
 //!
 //! Off by default: a plain remote `inspect` never touches local disk
 //! without this flag. Entries live under
@@ -136,6 +136,58 @@ impl HeaderCacheEntry {
         let tmp = path.with_extension("json.tmp");
         crate::atomic_write::write_atomic(path, &tmp, json.as_bytes()).await
     }
+}
+
+/// How long an entry is used without checking the file's etag again.
+///
+/// Within this window a hit makes no request at all, so repeat inspections
+/// during one narrowing session work through a rate limit, or offline. Past
+/// it, a hit first spends the reader's 2-request probe to confirm the etag
+/// is unchanged, and a confirmed entry is trusted for another window. The
+/// cost is that a file replaced upstream inside the window is read from its
+/// old header until the window ends; published quant files rarely change.
+pub const TRUST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Finds the most recently written entry in `dir` for `(repo, revision,
+/// filename)` that is younger than `within`, whatever its etag.
+///
+/// This is the lookup a hit inside [`TRUST_WINDOW`] uses, before any
+/// request has been made: the etag is not known yet, so entries are matched
+/// on everything else. Entries that cannot be read, parsed or used under the
+/// current schema are skipped, as are future-dated ones.
+pub async fn find_recent(
+    dir: &Path,
+    repo: &str,
+    revision: &str,
+    filename: &str,
+    within: std::time::Duration,
+) -> Option<HeaderCacheEntry> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut newest: Option<HeaderCacheEntry> = None;
+    // EXPLICIT: an async directory stream has no iterator chain; each entry
+    // is read and parsed before it can be compared.
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let Ok(candidate) = serde_json::from_str::<HeaderCacheEntry>(&text) else {
+            continue;
+        };
+        let recent = candidate.cached_at.elapsed().is_ok_and(|age| age < within);
+        if recent
+            && candidate.is_compatible_with(repo, revision, filename, &candidate.etag)
+            && newest
+                .as_ref()
+                .is_none_or(|best| candidate.cached_at > best.cached_at)
+        {
+            newest = Some(candidate);
+        }
+    }
+    newest
 }
 
 /// Removes the entries in `dir` that the one just saved for `(repo,
@@ -339,6 +391,62 @@ mod tests {
         assert!(pinned.exists(), "another revision's entry should stay");
         assert!(other_file.exists(), "another file's entry should stay");
         assert!(stray.exists(), "an unparseable file should be left alone");
+    }
+
+    /// Saves an entry whose `cached_at` is `age` in the past.
+    async fn save_aged_entry(
+        repo_dir: &Path,
+        revision: &str,
+        filename: &str,
+        etag: &str,
+        age: std::time::Duration,
+    ) {
+        let path = crate::cache_layout::header_cache_path(repo_dir, filename, etag);
+        let mut entry = HeaderCacheEntry::new(
+            "org/model".to_owned(),
+            revision.to_owned(),
+            filename.to_owned(),
+            etag.to_owned(),
+            sample_info(),
+        );
+        entry.cached_at = SystemTime::now() - age;
+        entry.save_atomic(&path).await.expect("save");
+    }
+
+    #[tokio::test]
+    async fn find_recent_matches_any_etag_inside_the_window_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_dir = dir.path();
+        let cache_dir = crate::cache_layout::header_cache_dir(repo_dir);
+        let minute = std::time::Duration::from_secs(60);
+
+        // An hour-and-a-half-old entry is outside the window.
+        save_aged_entry(repo_dir, "main", "model.gguf", "etag-old", 90 * minute).await;
+        assert!(
+            find_recent(&cache_dir, "org/model", "main", "model.gguf", TRUST_WINDOW)
+                .await
+                .is_none()
+        );
+
+        // Two recent entries under different etags: the newer one wins.
+        save_aged_entry(repo_dir, "main", "model.gguf", "etag-a", 20 * minute).await;
+        save_aged_entry(repo_dir, "main", "model.gguf", "etag-b", 5 * minute).await;
+        let found = find_recent(&cache_dir, "org/model", "main", "model.gguf", TRUST_WINDOW)
+            .await
+            .expect("a recent entry");
+        assert_eq!(found.etag, "etag-b");
+
+        // Another revision or another file never matches.
+        assert!(
+            find_recent(&cache_dir, "org/model", "v2", "model.gguf", TRUST_WINDOW)
+                .await
+                .is_none()
+        );
+        assert!(
+            find_recent(&cache_dir, "org/model", "main", "other.gguf", TRUST_WINDOW)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

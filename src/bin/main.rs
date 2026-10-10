@@ -267,6 +267,18 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Bytes reserved out of `--fits` for KV cache / runtime overhead (default: none). Requires `--fits`.
         #[arg(long, value_name = "SIZE", value_parser = parse_size_arg, requires = "fits")]
         reserve: Option<u64>,
+        /// Cache the GGUF headers `--fits` inspects, as `inspect
+        /// --cache-headers` does. Requires `--fits`.
+        ///
+        /// A repeat run over the same candidates then skips each cached
+        /// header's range requests: an entry under an hour old costs no
+        /// request at all, and an older one 2, to confirm the file's etag is
+        /// unchanged. Entries live in
+        /// each candidate repo's `.hf-fm-header-cache/` sidecar, which `du`
+        /// counts. Off by default: `quants` never touches local disk without
+        /// this flag.
+        #[arg(long, requires = "fits")]
+        cache_headers: bool,
         /// Authentication token (or set `HF_TOKEN` env var).
         #[arg(long)]
         token: Option<String>,
@@ -531,10 +543,12 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Persist parsed remote headers to a local sidecar so repeat
         /// inspection of the same file skips the header's range requests.
         ///
-        /// A hit still makes 2 requests, to check the file's current etag,
-        /// so it needs the network; the `Source:` line reports them. Saving
-        /// an entry removes older ones for the same file and revision. Off
-        /// by default — a plain remote `inspect` never touches local
+        /// An entry under an hour old is used with no request at all, so a
+        /// repeat call works through a rate limit, or offline. An older one
+        /// is used once 2 requests confirm the file's etag is unchanged, and
+        /// is then trusted for another hour; the `Source:` line says which.
+        /// Saving an entry removes older ones for the same file and
+        /// revision. Off by default — a plain remote `inspect` never touches local
         /// disk without this flag. Keyed on `(repo, revision, filename,
         /// etag)`; a changed etag on a later call is a cache miss, not a
         /// stale hit. Entries live under a `.hf-fm-header-cache/` sidecar
@@ -1002,9 +1016,17 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             repo_id,
             fits,
             reserve,
+            cache_headers,
             token,
             json,
-        }) => run_quants(repo_id.as_str(), fits, reserve, token.as_deref(), json),
+        }) => run_quants(
+            repo_id.as_str(),
+            fits,
+            reserve,
+            cache_headers,
+            token.as_deref(),
+            json,
+        ),
         // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
         Some(Commands::Info {
             repo_id,
@@ -2575,13 +2597,15 @@ fn trivial_fit_verdict(row: &QuantArtifactRow, budget: u64, reserve: u64) -> Opt
 /// Rows [`trivial_fit_verdict`] already resolves never reach the fan-out at
 /// all — only rows where the answer is in doubt spawn a task. Returns
 /// verdicts in the same order as `rows` (index-aligned), regardless of
-/// completion order.
+/// completion order, and how many of the inspected headers came from the
+/// header cache (always 0 without `cache_headers`).
 async fn compute_fit_verdicts_concurrent(
     rows: &[QuantArtifactRow],
     budget: u64,
     reserve_bytes: u64,
     token: Option<&str>,
-) -> Vec<FitVerdict> {
+    cache_headers: bool,
+) -> (Vec<FitVerdict>, usize) {
     let mut verdicts: Vec<Option<FitVerdict>> = Vec::with_capacity(rows.len());
     let mut needs_inspection: Vec<(usize, QuantArtifactRow)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
@@ -2608,21 +2632,33 @@ async fn compute_fit_verdicts_concurrent(
         move |(index, row)| {
             let token_owned = token_owned.clone();
             async move {
-                let verdict =
-                    compute_fit_verdict(&row, budget, reserve_bytes, token_owned.as_deref()).await;
-                Some((index, verdict))
+                let (verdict, from_cache) = compute_fit_verdict(
+                    &row,
+                    budget,
+                    reserve_bytes,
+                    token_owned.as_deref(),
+                    cache_headers,
+                )
+                .await;
+                Some((index, verdict, from_cache))
             }
         },
     )
     .await;
 
-    for (index, verdict) in results.into_iter().flatten() {
+    let mut from_cache_count = 0;
+    // EXPLICIT: slots each verdict into its row's index while counting the
+    // header-cache hits; two writes per item read better as a loop.
+    for (index, verdict, from_cache) in results.into_iter().flatten() {
+        if from_cache {
+            from_cache_count += 1;
+        }
         if let Some(slot) = verdicts.get_mut(index) {
             *slot = Some(verdict);
         }
     }
 
-    verdicts
+    let verdicts = verdicts
         .into_iter()
         .map(|slot| {
             slot.unwrap_or_else(|| FitVerdict::DoesNotFit {
@@ -2630,7 +2666,8 @@ async fn compute_fit_verdicts_concurrent(
                 reason: "offload check task did not run".to_owned(),
             })
         })
-        .collect()
+        .collect();
+    (verdicts, from_cache_count)
 }
 
 /// Computes the `--fits` verdict for one row.
@@ -2640,26 +2677,57 @@ async fn compute_fit_verdicts_concurrent(
 /// is actually in doubt trigger a header fetch. Offload planning applies the
 /// fixed internal [`MOE_EXPERT_PATTERN`] (`llama.cpp`'s own `MoE`
 /// expert-tensor naming convention), never a user-supplied pattern.
+///
+/// The header comes through [`inspect_remote_with_cache`], which with
+/// `cache_headers` off is exactly the `inspect_gguf` call it replaced, and
+/// with it on consults and fills the header cache. Returns the verdict and
+/// whether the header came from that cache.
 async fn compute_fit_verdict(
     row: &QuantArtifactRow,
     budget: u64,
     reserve: u64,
     token: Option<&str>,
-) -> FitVerdict {
+    cache_headers: bool,
+) -> (FitVerdict, bool) {
     if let Some(verdict) = trivial_fit_verdict(row, budget, reserve) {
-        return verdict;
+        return (verdict, false);
     }
     let budget_after_reserve = budget.saturating_sub(reserve);
 
-    let (info, _source, _stats) =
-        match inspect::inspect_gguf(&row.repo, &row.artifact, token, None).await {
-            Ok(v) => v,
-            Err(e) => {
-                return FitVerdict::DoesNotFit {
-                    reason: format!("offload plan unavailable: {e}"),
-                };
-            }
-        };
+    let (info, source, _stats) = match inspect_remote_with_cache(
+        &row.repo,
+        &row.artifact,
+        None,
+        token,
+        false,
+        true,
+        false,
+        cache_headers,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let verdict = FitVerdict::DoesNotFit {
+                reason: format!("offload plan unavailable: {e}"),
+            };
+            return (verdict, false);
+        }
+    };
+    let from_cache = matches!(source, inspect::InspectSource::CachedHeader { .. });
+    (
+        plan_from_header(&info, row.size, budget_after_reserve),
+        from_cache,
+    )
+}
+
+/// Turns an inspected GGUF header into the `--fits` verdict: rolls up its
+/// `MoE` expert tensors and plans how many layers to offload.
+fn plan_from_header(
+    info: &inspect::SafetensorsHeaderInfo,
+    total_bytes: u64,
+    budget_after_reserve: u64,
+) -> FitVerdict {
     // BORROW: explicit .to_owned() for &str → owned String field
     let Ok(matcher) = compile_group_by_pattern(MOE_EXPERT_PATTERN) else {
         return FitVerdict::DoesNotFit {
@@ -2681,7 +2749,7 @@ async fn compute_fit_verdict(
     }
 
     compute_offload_plan(
-        row.size,
+        total_bytes,
         rollup.matched_bytes,
         layer_count,
         per_layer,
@@ -2689,8 +2757,8 @@ async fn compute_fit_verdict(
     )
 }
 
-/// Pure offload-plan arithmetic, factored out of [`compute_fit_verdict`] so
-/// it can be unit tested without a network-backed header fetch.
+/// Pure offload-plan arithmetic, factored out of [`plan_from_header`] so it
+/// can be unit tested without a network-backed header fetch.
 ///
 /// `total_bytes` is the whole artifact's size, `matched_bytes` the summed
 /// `MoE` expert bytes (from [`compute_group_by_rollup`]), `layer_count` and
@@ -2916,6 +2984,7 @@ fn run_quants(
     repo_id: &str,
     fits: Option<u64>,
     reserve: Option<u64>,
+    cache_headers: bool,
     token: Option<&str>,
     json: bool,
 ) -> Result<(), FetchError> {
@@ -2969,12 +3038,17 @@ fn run_quants(
             .filter(|r| trivial_fit_verdict(r, budget, reserve_bytes).is_none())
             .count();
         eprintln!("{inspected} inspected for offload plan");
-        Some(rt.block_on(compute_fit_verdicts_concurrent(
+        let (verdicts, from_cache) = rt.block_on(compute_fit_verdicts_concurrent(
             &rows,
             budget,
             reserve_bytes,
             owned_token.as_deref(),
-        )))
+            cache_headers,
+        ));
+        if cache_headers {
+            eprintln!("{from_cache} of {inspected} read from the header cache");
+        }
+        Some(verdicts)
     } else {
         None
     };
@@ -7902,15 +7976,18 @@ async fn dispatch_inspect_remote_from_reader(
 /// hf-hub cache (checked via [`inspect::resolve_cached_path`] — every
 /// `inspect_*` entry point prefers a local file over the network, and this
 /// path must not be the one place that preference is lost), this is exactly
-/// [`dispatch_inspect_remote`]. Otherwise: probes for the file's current
-/// etag first (one extra round trip — the same "2 extra requests" cost
+/// [`dispatch_inspect_remote`]. Otherwise, an entry younger than
+/// [`header_cache::TRUST_WINDOW`] is returned at once, with no request and
+/// no stats ([`header_cache::find_recent`]). Failing that: probes for the
+/// file's current etag first (one extra round trip — the same "2 extra requests" cost
 /// `HttpRangeReader::open` already pays internally, paid here up front on
 /// *every* call, hit or miss, since
 /// the etag is the only way to tell which one this is), checks the header
 /// cache keyed on `(repo, revision, filename, etag)`, and on a hit returns
 /// the cached header with [`inspect::InspectSource::CachedHeader`] and the
-/// probe's own stats, so the `Source:` line states that cost — no further
-/// range requests. On a miss, the already-open reader is handed to
+/// probe's own stats, so the `Source:` line states that cost, with no
+/// further range requests, and re-saves the entry with a fresh timestamp so
+/// it is trusted for another window. On a miss, the already-open reader is handed to
 /// [`dispatch_inspect_remote_from_reader`] instead of re-dispatching through
 /// [`dispatch_inspect_remote`], which would open a second, redundant
 /// [`HttpRangeReader`] over the same file — and the result is written to the
@@ -7953,6 +8030,25 @@ async fn inspect_remote_with_cache(
     let cache_dir = cache::hf_cache_dir()?;
     let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id);
 
+    // Inside the trust window an entry is used as is, before any request:
+    // what lets repeat runs work through a rate limit, or offline.
+    if let Some(entry) = header_cache::find_recent(
+        &cache_layout::header_cache_dir(&repo_dir),
+        repo_id,
+        rev,
+        filename,
+        header_cache::TRUST_WINDOW,
+    )
+    .await
+    {
+        let age = entry.cached_at.elapsed().unwrap_or_default();
+        return Ok((
+            entry.info,
+            inspect::InspectSource::CachedHeader { age },
+            None,
+        ));
+    }
+
     let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
     // BORROW: explicit .to_owned() — the etag is needed both to build the
     // cache-lookup key below and, later, as an owned field in the cache
@@ -7961,12 +8057,18 @@ async fn inspect_remote_with_cache(
     let etag = reader.probe_etag().to_owned();
 
     let cache_path = cache_layout::header_cache_path(&repo_dir, filename, &etag);
-    if let Some(entry) =
+    if let Some(mut entry) =
         header_cache::HeaderCacheEntry::load(&cache_path, repo_id, rev, filename, &etag).await
     {
+        // The etag probe confirmed the entry, and was this hit's whole cost:
+        // report it like any other run's, so the `Source:` line stays a
+        // measured figure. Re-saving the entry with a fresh timestamp trusts
+        // it for another window; failing to is only a missed shortcut.
         let age = entry.cached_at.elapsed().unwrap_or_default();
-        // The etag probe was this hit's whole cost; report it like any
-        // other run's, so the `Source:` line stays a measured figure.
+        entry.cached_at = std::time::SystemTime::now();
+        if let Err(e) = entry.save_atomic(&cache_path).await {
+            eprintln!("warning: failed to refresh header cache entry: {e}");
+        }
         return Ok((
             entry.info,
             inspect::InspectSource::CachedHeader { age },
@@ -8209,8 +8311,12 @@ fn run_inspect_single(
                 "requests"
             ),
         ),
+        // An entry inside the header cache's trust window: no request made.
         (inspect::InspectSource::CachedHeader { age }, None) => {
-            format!("cached header (age: {})", format_short_age(age))
+            format!(
+                "cached header (age: {}, not rechecked)",
+                format_short_age(age)
+            )
         }
         _ => "unknown".to_owned(),
     };
@@ -11847,7 +11953,12 @@ mod tests {
             })
             .collect();
 
-        let verdicts = compute_fit_verdicts_concurrent(&rows, 500, 0, None).await;
+        let (verdicts, from_cache) =
+            compute_fit_verdicts_concurrent(&rows, 500, 0, None, false).await;
+        assert_eq!(
+            from_cache, 0,
+            "nothing is read from the header cache without the flag"
+        );
 
         assert_eq!(verdicts.len(), rows.len());
         for (i, verdict) in verdicts.iter().enumerate() {

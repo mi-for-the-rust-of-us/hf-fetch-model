@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`quants --fits --cache-headers`**, the header cache for `--fits`'s
+  offload plans. `--fits` reads the GGUF header of every over-budget
+  candidate, and narrowing down means rerunning it: against
+  `poolside/Laguna-XS-2.1` at `--fits 16GiB --reserve 2.5GiB`, that is 76
+  headers from 48 sibling repos, and one measured at 59 range requests and
+  3.56 MiB, so some 4,500 requests per run.
+  Run anonymously, a second run a few minutes later, still contacting the
+  Hub for every one of those headers, was refused with `429 Too Many
+  Requests` on every row. With the flag, each header goes
+  through the same cache `inspect --cache-headers` uses, so the two share
+  entries, and stderr reports `N of M read from the header cache`. Measured:
+  the second run read 76 of 76 from the cache and printed the same table,
+  its only requests being discovery's search and listings. The 76 entries
+  took 5.77 MiB, which `du` shows as 12 header-only repos. Off by default,
+  like `inspect`'s flag, and it requires `--fits`. A CLI test checks the
+  `--fits` requirement and the help text; the end-to-end runs were done by
+  hand, being too heavy for the test suite.
+
 ### Changed
 
 - **`anamnesis` bumped `0.7.7` → `0.7.10`.** Three releases, and not a routine
@@ -399,13 +419,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     revision under another etag, which can never hit again. Entries for
     other revisions stay, so alternating a pinned revision and `main` never
     thrashes. A removal failure is a warning, never an error.
-  - **A hit reports its real cost.** It still makes the reader's 2-request
-    probe, which is how it reads the file's current etag; it skips the
-    header's own range requests, not the network, so it cannot work
-    offline. The `Source:` line now reads `cached header (age: 2m, 2
-    requests to check it is current)`. Measured on an isolated cache, an
-    84 MiB GGUF shard went from 30 range requests and 1.75 MiB to those 2,
-    and its entry took 29,649 bytes.
+  - **A recent hit makes no request; an older one reports its real cost.**
+    Every hit used to spend the reader's 2-request probe, which is how it
+    reads the file's current etag, before it could use its entry, so under
+    the Hub's rate limit a hit failed exactly like a miss. An entry younger
+    than an hour (`header_cache::TRUST_WINDOW`) is now used with no request
+    at all, and the `Source:` line reads `cached header (age: 2m, not
+    rechecked)`. An older entry is used once the probe confirms the etag,
+    reads `cached header (age: 2h, 2 requests to check it is current)`, and
+    is re-saved so it is trusted for another hour. The cost of the window
+    is that a file replaced upstream within it is read from its old header
+    until the hour ends; published quant files rarely change. Measured on an
+    isolated cache, an 84 MiB GGUF shard went from 30 range requests and
+    1.75 MiB to none, and its entry took 29,649 bytes.
   - The `--help` text ("free on later calls"), the FAQ and the CLI reference
     ("skips the range requests entirely") and the module doc ("free on the
     second and third call") said otherwise and are corrected. v0.12.1's
@@ -413,9 +439,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   New tests: three CLI tests on an isolated cache (everything in the
   directory counted, a header-only repo listed, one total when the gap does
-  not print), two unit tests for pruning, and the existing `--cache-headers`
-  CLI test, rewritten to check the `du` size, the `Source:` line on a hit,
-  and that a forced miss prunes a planted superseded entry. Each fails
+  not print), two unit tests for pruning, one for the trust window's
+  lookup, and the existing `--cache-headers` CLI test, rewritten to check
+  the `du` size, a hit inside the window (no request), a hit past it (the
+  probe, then trusted again), and that a forced miss prunes a planted
+  superseded entry. Each fails
   against the previous code; the pruning check also fails with only the
   prune call disabled.
 
