@@ -165,7 +165,7 @@ hf-fm du --tree
 ```
 
 ```
-  ├── mntss/clt-gemma-2-2b-2.5M    .  .  .  .  .  .  .  .  .  .  .  .  .              159.05 GiB  (53 files)
+  ├── mntss/clt-gemma-2-2b-2.5M  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .    159.05 GiB  (53 files)
   │   ├── W_dec_0.safetensors                                                          10.97 GiB
   │   ├── W_dec_1.safetensors                                                          10.55 GiB
   │   ├── W_dec_2.safetensors                                                          10.13 GiB

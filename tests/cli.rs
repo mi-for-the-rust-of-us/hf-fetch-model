@@ -4176,6 +4176,82 @@ fn du_total_line_takes_its_own_width_beside_a_quant_range() {
 }
 
 #[test]
+fn du_tree_leaders_reach_each_size_without_touching_it() {
+    // A quant-range repo's size cell fills the tree's size column, and a
+    // small repo's size is far narrower. Each branch's dotted leader must
+    // stop two to four spaces before its own size, where it used to touch
+    // the full-width one (`.4.0 KiB to 8.0 KiB`) and stop well short of the
+    // narrow one, and the dots must share one grid across the branches.
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--quant-dup",
+        "e1",
+        "model-Q4_K_M.gguf",
+        4096,
+    );
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--quant-dup",
+        "e2",
+        "model-Q8_0.gguf",
+        8192,
+    );
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--small",
+        "e3",
+        "config.json",
+        1536,
+    );
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--tree"]));
+    assert!(success, "du --tree should succeed: {stderr}");
+    let branches: Vec<&str> = stdout
+        .lines()
+        .filter(|l| {
+            l.starts_with("  \u{251c}\u{2500}\u{2500} ")
+                || l.starts_with("  \u{2514}\u{2500}\u{2500} ")
+        })
+        .collect();
+    assert_eq!(
+        branches.len(),
+        2,
+        "two repo branches expected, got:\n{stdout}"
+    );
+
+    let mut grid: Vec<usize> = Vec::new();
+    // Sorted by bytes on disk: the quant repo (24 KiB) before the small one.
+    for (line, size) in branches.iter().zip(["4.0 KiB to 8.0 KiB", "3.0 KiB"]) {
+        let Some(at) = line.find(size) else {
+            panic!("{size:?} missing from branch line {line:?}");
+        };
+        let before: Vec<char> = line.get(..at).unwrap_or_default().chars().collect();
+        let Some(last_dot) = before.iter().rposition(|&c| c == '.') else {
+            panic!("no leader dots before {size:?} in {line:?}");
+        };
+        let gap = before.len() - last_dot - 1;
+        assert!(
+            (2..=4).contains(&gap),
+            "leader should stop 2 to 4 spaces before {size:?}, got {gap} in {line:?}"
+        );
+        grid.extend(
+            before
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c == '.')
+                .map(|(i, _)| i % 3),
+        );
+    }
+    grid.dedup();
+    assert_eq!(
+        grid.len(),
+        1,
+        "leader dots should share one grid, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn quants_help_shows_fits_and_reserve_flags() {
     let (stdout, stderr, success) = run(hf_fm().args(["quants", "--help"]));
     assert!(success, "quants --help failed: {stderr}");

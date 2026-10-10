@@ -3974,29 +3974,29 @@ fn matches_filter(name: &str, pattern: &str) -> bool {
         .contains(pattern.to_lowercase().as_str())
 }
 
-/// Builds a table-of-contents-style dotted filler of the exact requested `width`.
+/// Builds the table-of-contents-style dotted leader that runs from a repo
+/// id to its size, of the exact `width` between the two.
 ///
-/// Pattern: `"  .  .  .  .  ."` — two leading spaces, dots separated by
-/// two spaces, and the rightmost dot flush against the trailing edge.
-/// When `width` isn't a clean multiple of the 3-char period, the slack
-/// is absorbed as extra leading spaces.
-fn dot_filler(width: usize) -> String {
-    if width < 3 {
-        return " ".repeat(width);
-    }
-    let dots = width / 3;
-    let pad = width - 3 * dots;
-    let mut s = String::with_capacity(width);
-    for _ in 0..(pad + 2) {
-        s.push(' ');
-    }
-    for i in 0..dots {
-        if i > 0 {
-            s.push_str("  ");
-        }
-        s.push('.');
-    }
-    s
+/// `to_size_column` is where the size column starts, counted from the
+/// leader's start. Dots sit every third column on a grid anchored there, so
+/// they line up vertically on every branch line of the tree. The leader
+/// keeps at least two spaces after the repo id and at least two before the
+/// size: a full-width size gets exactly two, and a narrower one, which
+/// starts further right, gets the dots running on into the size column up
+/// to a gap of two to four spaces, rather than a long blank run. A leader
+/// too short to hold a dot under those margins, at most six columns, is
+/// left blank.
+fn dot_leader(width: usize, to_size_column: usize) -> String {
+    (0..width)
+        .map(|j| {
+            let on_grid = j % 3 == to_size_column % 3;
+            if on_grid && j >= 2 && j + 3 <= width {
+                '.'
+            } else {
+                ' '
+            }
+        })
+        .collect()
 }
 
 /// Repo branch in the `du --tree` view.
@@ -4228,12 +4228,13 @@ fn render_cache_tree(repos: &[CacheTreeRepo], widths: &CacheTreeWidths, age: boo
 
 /// Renders a single repo branch and its file leaves.
 ///
-/// The gap between the repo id and the size column is rendered as a
-/// dotted filler ([`dot_filler`]) — `"  .  .  .  ."` — so the eye can
-/// travel from a short repo name to the (possibly far) shared size
-/// column. The filler width is `widths.repo + 2 - repo_id.len()`, sized
-/// so the size column lands at the column [`CacheTreeWidths::compute`]
-/// reserved for it on both branch and leaf lines.
+/// The gap between the repo id and its size is a dotted leader
+/// ([`dot_leader`]), `"  .  .  .  "`, so the eye can travel from a short
+/// repo name to the (possibly far) shared size column. The size column
+/// starts `widths.repo + 2 - repo_id.len()` after the repo id, where
+/// [`CacheTreeWidths::compute`] reserved it on both branch and leaf lines,
+/// and sizes are right-aligned in it, so the leader spans that distance
+/// plus however much narrower than the column this repo's size is.
 fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidths, age: bool) {
     let connector = if is_last { "└── " } else { "├── " };
     let indent = if is_last { "    " } else { "│   " };
@@ -4242,31 +4243,32 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
     let files_str = format_file_count(repo.file_count);
     let partial_marker = if repo.has_partial { "  \u{25cf}" } else { "" };
 
-    // Width of the gap between end of repo_id and start of size column.
-    // `widths.repo >= repo_id.len()` by construction, so the +2 keeps
-    // the saturating_sub a defensive no-op rather than load-bearing.
-    let filler = dot_filler((widths.repo + 2).saturating_sub(repo.repo_id.len()));
+    // `widths.repo >= repo_id.len()` and `widths.size >= size_str.len()` by
+    // construction, so the saturating_subs are defensive, not load-bearing.
+    let to_size_column = (widths.repo + 2).saturating_sub(repo.repo_id.len());
+    let leader = dot_leader(
+        to_size_column + widths.size.saturating_sub(size_str.len()),
+        to_size_column,
+    );
 
     if age {
         let age_str = repo
             .last_modified
             .map_or_else(|| "\u{2014}".to_owned(), format_age);
         println!(
-            "  {connector}{repo}{filler}{size:>sw$}  {files:<fw$}  {age_str:<aw$}{partial_marker}",
+            "  {connector}{repo}{leader}{size}  {files:<fw$}  {age_str:<aw$}{partial_marker}",
             repo = repo.repo_id,
             size = size_str,
             files = files_str,
-            sw = widths.size,
             fw = widths.files,
             aw = widths.age,
         );
     } else {
         println!(
-            "  {connector}{repo}{filler}{size:>sw$}  {files}{partial_marker}",
+            "  {connector}{repo}{leader}{size}  {files}{partial_marker}",
             repo = repo.repo_id,
             size = size_str,
             files = files_str,
-            sw = widths.size,
         );
     }
 
@@ -10745,6 +10747,58 @@ mod tests {
         );
         assert!(is_auth_status_error(&forbidden));
         assert!(is_auth_status_error(&unauthorized));
+    }
+
+    // ---------- dot_leader ----------
+
+    #[test]
+    fn dot_leader_stops_two_spaces_short_of_a_full_width_size() {
+        // The size column starts 9 columns on, and the size fills it. The
+        // previous filler put its last dot flush against the size.
+        assert_eq!(dot_leader(9, 9), "   .  .  ");
+    }
+
+    #[test]
+    fn dot_leader_runs_into_the_column_of_a_narrower_size() {
+        // The size column starts 9 columns on, and the size is 1, 2 or 3
+        // characters narrower than the column, so it starts further right.
+        // The previous filler stopped at the column and left a blank run.
+        assert_eq!(dot_leader(10, 9), "   .  .   ");
+        assert_eq!(dot_leader(11, 9), "   .  .    ");
+        assert_eq!(dot_leader(12, 9), "   .  .  .  ");
+    }
+
+    #[test]
+    fn dot_leader_is_blank_when_there_is_no_room_for_a_dot() {
+        assert_eq!(dot_leader(2, 2), "  ");
+        assert_eq!(dot_leader(4, 4), "    ");
+    }
+
+    #[test]
+    fn dot_leader_dots_line_up_across_branch_lines() {
+        // Branch lines whose repo ids end at different columns, before a
+        // size column starting at column 40, with sizes from full width
+        // down to 5 characters narrower. Every dot must land on one
+        // 3-column grid, keep two spaces after the repo id, and stop two to
+        // four spaces before the size.
+        let size_column = 40;
+        for repo_end in 20..=38 {
+            for narrower in 0..=5 {
+                let to_size_column = size_column - repo_end;
+                let leader = dot_leader(to_size_column + narrower, to_size_column);
+                assert_eq!(leader.len(), to_size_column + narrower, "{leader:?}");
+                assert!(leader.starts_with("  "), "{leader:?}");
+                for (j, c) in leader.char_indices() {
+                    if c == '.' {
+                        assert_eq!((repo_end + j) % 3, size_column % 3, "{leader:?}");
+                    }
+                }
+                if let Some(last) = leader.rfind('.') {
+                    let gap = leader.len() - last - 1;
+                    assert!((2..=4).contains(&gap), "gap {gap} in {leader:?}");
+                }
+            }
+        }
     }
 
     // ---------- matches_filter (case-insensitive substring) ----------

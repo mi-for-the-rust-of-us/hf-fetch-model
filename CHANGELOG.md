@@ -359,6 +359,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cache verify`, `quants` and `inspect` still use fixed size widths, which
   are out of this change's scope.
 
+- **`du --tree`'s dotted leaders touched a full-width size and stopped
+  short of a narrower one.** The leader between a repo id and its size ran
+  only up to the size column, its last dot flush against the column's edge,
+  and sizes are right-aligned in that column. So a size filling the column,
+  such as a quant range, read `.360.18 MiB` or `.4.0 KiB to 8.0 KiB`, and a
+  narrower one sat after a blank run as wide as the difference (on this
+  machine's cache, 15 spaces before `19.52 GiB`). The leader now spans the
+  whole gap to each size. Its dots stay on one 3-column grid shared by every
+  branch line, so they still line up down the tree, and stop two to four
+  spaces before the size, depending on where the size falls on that grid
+  (a leader too short to hold a dot, six columns at most, stays blank).
+  Four unit tests cover the leader, including the grid and the gap over 114
+  line shapes, and a CLI test checks both cases in a rendered tree; it fails
+  against the previous renderer with the dot touching the size.
+
 - **A size just below a unit boundary printed as a four-digit figure in the
   smaller unit, and sizes from 1000 TiB up had no unit to move to.** The
   CLI's `format_size` picked the unit from the raw byte count and then

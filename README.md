@@ -317,7 +317,7 @@ Cache: /home/user/.cache/huggingface/hub
 $ hf-fm du --tree
 Cache: /home/user/.cache/huggingface/hub
 
-  ├── google/gemma-2-2b-it    .  .  .  .  .  .  .  .  .  4.89 GiB  (8 files)
+  ├── google/gemma-2-2b-it  .  .  .  .  .  .  .  .  .    4.89 GiB  (8 files)
   │   ├── model-00001-of-00002.safetensors               4.65 GiB
   │   ├── model-00002-of-00002.safetensors             229.54 MiB
   │   ├── tokenizer.json                                16.71 MiB
@@ -326,12 +326,12 @@ Cache: /home/user/.cache/huggingface/hub
   │   ├── config.json                                       838 B
   │   ├── special_tokens_map.json                           636 B
   │   └── generation_config.json                            187 B
-  ├── EleutherAI/pythia-1.4b  .  .  .  .  .  .  .  .  .  2.73 GiB  (4 files)  ●
+  ├── EleutherAI/pythia-1.4b   .  .  .  .  .  .  .  .    2.73 GiB  (4 files)  ●
   │   ├── tokenizer.json                                 2.02 MiB
   │   ├── config.json                                       570 B
   │   ├── tokenizer_config.json                             396 B
   │   └── special_tokens_map.json                            99 B
-  └── google/gemma-scope-2b-pt-res  .  .  .  .  .  .  .360.18 MiB  (2 files)
+  └── google/gemma-scope-2b-pt-res   .  .  .  .  .  .  360.18 MiB  (2 files)
       ├── layer_0/width_16k/average_l0_105/params.npz  288.13 MiB
       └── embedding/width_4k/average_l0_44/params.npz   72.04 MiB
 
