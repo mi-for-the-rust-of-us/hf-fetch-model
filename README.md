@@ -334,7 +334,6 @@ Cache: /home/user/.cache/huggingface/hub
   └── google/gemma-scope-2b-pt-res   .  .  .  .  .  .  360.18 MiB  (2 files)
       ├── layer_0/width_16k/average_l0_105/params.npz  288.13 MiB
       └── embedding/width_4k/average_l0_44/params.npz   72.04 MiB
-
   ──────────────────────────────────────────────────────────────────────────
   7.97 GiB  total (3 repos, 14 files)
   ● = partial downloads

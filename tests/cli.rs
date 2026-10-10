@@ -4252,6 +4252,96 @@ fn du_tree_leaders_reach_each_size_without_touching_it() {
         1,
         "leader dots should share one grid, got:\n{stdout}"
     );
+    // The rule follows the last leaf directly, as in the other `du` views.
+    assert!(
+        !stdout.contains("\n\n  \u{2500}"),
+        "no blank line before the tree's rule, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_repo_number_column_widens_past_999_files() {
+    // 1,000 files: the `#` column must widen from 3 to 4 so the 1,000th row
+    // lines up with the others, and the rule must span the widened rows.
+    let dir = temp_hf_home();
+    let snapshot = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--many-files")
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    for i in 0..1000 {
+        std::fs::write(snapshot.join(format!("f{i:04}.bin")), b"x").expect("write file");
+    }
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/many-files"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    // 4 (#) + 2 + 4 ("SIZE") + 2 + 9 ("f0000.bin")
+    let rule = format!("  {}", "\u{2500}".repeat(4 + 2 + 4 + 2 + 9));
+    assert!(
+        lines.contains(&"     #  SIZE  FILE"),
+        "the header should widen with the column, got:\n{stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("     1   1 B  f"))
+            && lines.iter().any(|l| l.starts_with("  1000   1 B  f")),
+        "rows 1 and 1,000 should line up, got:\n{stdout}"
+    );
+    assert!(
+        lines.contains(&rule.as_str()),
+        "the rule should span the widened rows, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_number_column_widens_past_999_repos() {
+    // 1,000 repos: the flat view's `#` column must widen from 3 to 4, and
+    // its rule must still span the rows exactly.
+    let dir = temp_hf_home();
+    for i in 0..1000 {
+        let snapshot = dir
+            .path()
+            .join("hub")
+            .join(format!("models--test-org--r{i:04}"))
+            .join("snapshots")
+            .join("fake0000000000000000000000000000000000000");
+        std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+        std::fs::write(snapshot.join("x.bin"), b"x").expect("write file");
+    }
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du"]));
+    assert!(success, "du should succeed: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.iter().any(|l| l.starts_with("     #  ")),
+        "the header should widen with the column, got:\n{stdout}"
+    );
+    let rows: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| {
+            l.trim_start().starts_with(|c: char| c.is_ascii_digit()) && l.contains("test-org/r")
+        })
+        .collect();
+    assert_eq!(rows.len(), 1000, "one row per repo, got:\n{stdout}");
+    assert!(
+        rows.iter().any(|l| l.starts_with("     1  "))
+            && rows.iter().any(|l| l.starts_with("  1000  ")),
+        "rows 1 and 1,000 should line up, got:\n{stdout}"
+    );
+    let row_width = rows.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let Some(rule) = lines.iter().find(|l| l.starts_with("  \u{2500}")) else {
+        panic!("no rule line, got:\n{stdout}");
+    };
+    assert_eq!(
+        rule.chars().count(),
+        row_width,
+        "the rule should span the rows exactly, got:\n{stdout}"
+    );
 }
 
 #[test]

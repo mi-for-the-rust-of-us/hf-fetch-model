@@ -375,6 +375,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line shapes, and a CLI test checks both cases in a rendered tree; it fails
   against the previous renderer with the dot touching the size.
 
+- **`du`'s count columns had fixed widths, and the tree printed a blank
+  line before its rule.** The flat view's `#` (3 wide) and FILES (5 wide)
+  columns and `du <repo>`'s `#` (3 wide) were fixed, so a cache of 1,000 or
+  more repos, or a repo of 1,000 or more files, pushed rows out of line
+  under a rule that no longer matched them, and a repo of 100,000 files
+  would do the same to FILES. Both now size from their counts, with the old
+  widths as floors, so anything smaller prints exactly as before. The tree,
+  unlike the flat and `du <repo>` views, left a blank line between its last
+  leaf and its rule; it no longer does. A unit test covers the width
+  helper, two CLI tests render 1,000 repos and a 1,000-file repo, and the
+  tree test checks for the blank line; all three CLI tests fail against the
+  previous code.
+
 - **A size just below a unit boundary printed as a four-digit figure in the
   smaller unit, and sizes from 1000 TiB up had no unit to move to.** The
   CLI's `format_size` picked the unit from the raw byte count and then

@@ -3420,6 +3420,18 @@ fn format_repo_size_cell(total_size: u64, gguf_size_range: Option<(u64, u64)>) -
     }
 }
 
+/// Width of a right-aligned count column: the digits of its widest count,
+/// but never less than `floor` (the column's header, or the width it has
+/// always had). Shared by `du`'s flat view (`#`, `FILES`) and `du <repo>`
+/// (`#`), so neither hard-codes how many repos or files it can show.
+fn count_column_width(counts: impl Iterator<Item = usize>, floor: usize) -> usize {
+    counts
+        .map(|n| n.to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(floor)
+}
+
 /// Shows disk usage summary for all cached repos, sorted by size descending.
 fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
@@ -3463,15 +3475,19 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         .map(|s| format_repo_size_cell(s.total_size, s.gguf_size_range))
         .collect();
     let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // floor: "SIZE".len()
+    // floor: the `#` column's historical width, so up to 999 repos print as before
+    let iw = count_column_width(std::iter::once(summaries.len()), 3);
+    // floor: "FILES".len()
+    let fw = count_column_width(summaries.iter().map(|s| s.file_count), 5);
 
     if age {
         println!(
-            "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}  {:<15}",
+            "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}  {:<15}",
             "#", "SIZE", "REPO", "FILES", "AGE"
         );
     } else {
         println!(
-            "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}",
+            "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}",
             "#", "SIZE", "REPO", "FILES"
         );
     }
@@ -3499,7 +3515,7 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
                 .last_modified
                 .map_or_else(|| "\u{2014}".to_owned(), format_age);
             println!(
-                "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}  {:<15}{}",
+                "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}  {:<15}{}",
                 i + 1,
                 size_cell,
                 s.repo_id,
@@ -3509,7 +3525,7 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
             );
         } else {
             println!(
-                "  {:>3}  {:>sw$}  {:<repo_width$} {:>5}{}",
+                "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}{}",
                 i + 1,
                 size_cell,
                 s.repo_id,
@@ -3520,14 +3536,11 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     }
 
     // The rule spans a row after its 2-space margin, as in the tree and
-    // `du <repo>` views: 3 (#) + 2 + sw (SIZE) + 2 + repo_width + 1 + 5
-    // (FILES) = repo_width + sw + 13, plus 2 (gap) + 15 (AGE) with --age. A
-    // trailing partial-download marker is not counted, as in the tree.
-    let rule_width = if age {
-        repo_width + sw + 30
-    } else {
-        repo_width + sw + 13
-    };
+    // `du <repo>` views: iw (#) + 2 + sw (SIZE) + 2 + repo_width + 1 + fw
+    // (FILES), plus 2 (gap) + 15 (AGE) with --age. A trailing
+    // partial-download marker is not counted, as in the tree.
+    let row_width = iw + 2 + sw + 2 + repo_width + 1 + fw;
+    let rule_width = if age { row_width + 2 + 15 } else { row_width };
     println!("  {}", "\u{2500}".repeat(rule_width));
     // The total is a footer, not a cell of the SIZE column, so it takes its
     // own width: borrowing `sw` let a wide `min to max` range cell push it
@@ -3612,15 +3625,17 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     // Sized from the data, like every other hf-fm table (v0.9.6).
     let size_cells: Vec<String> = files.iter().map(|f| format_size(f.size)).collect();
     let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // floor: "SIZE".len()
-    let row_width = 3 + 2 + sw + 2 + fw;
-    println!("  {:>3}  {:>sw$}  FILE", "#", "SIZE");
+    // floor: the `#` column's historical width, so up to 999 files print as before
+    let iw = count_column_width(std::iter::once(files.len()), 3);
+    let row_width = iw + 2 + sw + 2 + fw;
+    println!("  {:>iw$}  {:>sw$}  FILE", "#", "SIZE");
 
     let mut listed_bytes: u64 = 0;
 
     // EXPLICIT: accumulates the listing's sum while printing each row.
     for (i, (f, size_cell)) in files.iter().zip(&size_cells).enumerate() {
         listed_bytes = listed_bytes.saturating_add(f.size);
-        println!("  {:>3}  {:>sw$}  {}", i + 1, size_cell, f.filename);
+        println!("  {:>iw$}  {:>sw$}  {}", i + 1, size_cell, f.filename);
     }
 
     println!("  {}", "\u{2500}".repeat(row_width));
@@ -4332,7 +4347,7 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     let any_partial = repos.iter().any(|r| r.has_partial);
     let any_quant_alternatives = repos.iter().any(|r| r.gguf_size_range.is_some());
 
-    println!("\n  {}", "\u{2500}".repeat(widths.rule_width()));
+    println!("  {}", "\u{2500}".repeat(widths.rule_width()));
     // A footer, as in the flat view: it takes its own width.
     println!(
         "  {}  total ({} {}, {} {})",
@@ -10748,6 +10763,20 @@ mod tests {
         );
         assert!(is_auth_status_error(&forbidden));
         assert!(is_auth_status_error(&unauthorized));
+    }
+
+    // ---------- count_column_width ----------
+
+    #[test]
+    fn count_column_width_grows_past_its_floor_only_when_a_count_needs_it() {
+        // `FILES`: 5 wide until a repo holds 100,000 files.
+        assert_eq!(count_column_width([99_999, 3].into_iter(), 5), 5);
+        assert_eq!(count_column_width([100_000, 3].into_iter(), 5), 6);
+        // `#`: 3 wide until the 1,000th row.
+        assert_eq!(count_column_width(std::iter::once(999), 3), 3);
+        assert_eq!(count_column_width(std::iter::once(1000), 3), 4);
+        // No counts at all: the floor.
+        assert_eq!(count_column_width(std::iter::empty(), 5), 5);
     }
 
     // ---------- du_repo_gap_note ----------
