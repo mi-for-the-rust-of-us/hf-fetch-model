@@ -3649,10 +3649,15 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
             files.len(),
         );
         println!("  {:>10}  total on disk", format_size(disk_bytes));
-        println!(
-            "\n  Note: blobs/ holds bytes beyond the files listed above \
-             (on Windows, typically a second copy of each)."
-        );
+        // An unfinished download's temp blobs sit in `blobs/` at their full
+        // preallocated size on every platform, so they are named first.
+        let beyond = if has_partial {
+            "an unfinished download's temp files, and on Windows typically \
+             a second copy of each listed file"
+        } else {
+            "on Windows, typically a second copy of each"
+        };
+        println!("\n  Note: blobs/ holds bytes beyond the files listed above ({beyond}).");
     }
 
     // Hint the user when this repo has partial downloads (computed above).

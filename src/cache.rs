@@ -1537,6 +1537,30 @@ mod tests {
         );
     }
 
+    /// An interrupted chunked download leaves its temp blob and resume
+    /// sidecar in `blobs/`, and both are counted at their length. The temp
+    /// blob is preallocated at the file's full size, so that is what it
+    /// occupies, and what `cache delete` or `cache clean-partial` frees. It
+    /// is not a listed file until it is renamed into place.
+    #[test]
+    fn walk_counts_a_partial_temp_blob_at_its_length() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        std::fs::copy(&blob, snap.join("config.json")).unwrap();
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        std::fs::write(blobs.join("cafe.chunked.part"), vec![0u8; 8192]).unwrap();
+        std::fs::write(blobs.join("cafe.chunked.part.state"), b"{}").unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.total_size, 1000 + 1000 + 8192 + 2);
+        assert_eq!(
+            walk.files.len(),
+            1,
+            "only the finished file is listed, got {:?}",
+            walk.files
+        );
+    }
+
     /// An empty repo directory is zero bytes, not an error.
     #[test]
     fn walk_of_an_empty_repo_dir_is_zero() {

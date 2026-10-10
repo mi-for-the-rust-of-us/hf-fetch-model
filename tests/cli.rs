@@ -3875,6 +3875,10 @@ fn du_repo_counts_a_blob_and_its_snapshot_copy() {
         stdout.contains("6.0 KiB  total on disk"),
         "the total should be the bytes on disk, got:\n{stdout}"
     );
+    assert!(
+        stdout.contains("(on Windows, typically a second copy of each)."),
+        "with no partial download, the note points at the copies, got:\n{stdout}"
+    );
 
     let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/dup-repo");
     assert_eq!(total, 6144, "total_bytes is bytes on disk: blob + copy");
@@ -3917,6 +3921,51 @@ fn du_repo_with_a_symlinked_pointer_keeps_its_single_total_line() {
 
     let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/link-repo");
     assert_eq!((total, listed, whole_cache), (3072, 3072, 3072));
+}
+
+#[test]
+fn du_repo_with_a_partial_download_names_it_in_the_note() {
+    // An unfinished download's temp blob sits in `blobs/` at its full
+    // preallocated size on every platform, symlinked caches included, so the
+    // note must name it rather than point only at Windows copies.
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--partial-repo",
+        "e1",
+        "config.json",
+        1024,
+    );
+    let blobs = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--partial-repo")
+        .join("blobs");
+    std::fs::write(blobs.join("e2.chunked.part"), vec![0u8; 8192]).expect("write temp blob");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/partial-repo"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains("1.0 KiB  listed above (1 file)"),
+        "the temp blob is not a listed file, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("10.0 KiB  total on disk"),
+        "but it is bytes on disk, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("an unfinished download's temp files"),
+        "the note should name the partial download, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("partial downloads — run `hf-fm status test-org/partial-repo`"),
+        "the partial hint should follow, got:\n{stdout}"
+    );
+
+    let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/partial-repo");
+    assert_eq!((total, listed, whole_cache), (10240, 1024, 10240));
 }
 
 #[test]

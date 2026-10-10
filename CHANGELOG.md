@@ -197,7 +197,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Note that the per-file listing and the total no longer sum to each other on
   a copy layout, deliberately: the listing shows the repo's *logical* files
   and the total shows *physical* bytes, and on Windows those genuinely differ
-  by the duplication. Both docs say so.
+  by the duplication. Both docs say so. An interrupted download's
+  `.chunked.part` temp blobs, which live in `blobs/`, now count as well, at
+  the full size they are preallocated to, since that is what they occupy and
+  what `cache delete` frees. Before, they did not count at all, so a repo
+  mid-download read as its finished files alone. A dedicated test pins this.
 
   Fixed alongside, from the same root cause: the per-file sizes
   `cache_repo_usage` reports are now resolved through the pointer, so on a
@@ -299,13 +303,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on disk, which is also what `du` reports). Its total is now the repo's bytes
   on disk, from `cache::repo_disk_usage`. When that differs from the
   listing's sum, both are shown, `123.29 MiB  listed above (3 files)` and then
-  `244.94 MiB  total on disk`, followed by a one-line note; where they agree,
+  `244.94 MiB  total on disk`, followed by a one-line note saying where the
+  extra bytes are (Windows copies, or an unfinished download's preallocated
+  temp files, which make the two differ on any platform); where they agree,
   as on a symlinked cache, the output is byte-for-byte what it was. A
   quant-alternatives repo states its bytes on disk under its range, and a repo
   holding blobs but no snapshot files now says how much they occupy instead of
-  `No cached files found`. Four new CLI tests pin these cases on an isolated
-  cache: three portable ones, each failing against the previous code, and a
-  Unix one guarding that the symlinked output is unchanged. The existing
+  `No cached files found`. Five new CLI tests pin these cases on an isolated
+  cache: four portable ones, each failing against the previous code (the
+  fourth covers the note's partial-download wording), and a Unix one
+  guarding that the symlinked output is unchanged. The existing
   `du_json_repo` test's invariant moves from `total_bytes` to `listed_bytes`.
 
   **For scripts reading `du --json`:** both repo-level figures now mean bytes

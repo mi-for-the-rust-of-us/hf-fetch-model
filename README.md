@@ -277,10 +277,10 @@ $ hf-fm quants google/gemma-2-2b-it --fits 9.5GiB
 $ hf-fm du
    #        SIZE  REPO                                             FILES
    1    5.10 GiB  google/gemma-2-2b-it                                 8
-   2    2.80 GiB  EleutherAI/pythia-1.4b                              12  ●
+   2    3.80 GiB  EleutherAI/pythia-1.4b                              12  ●
    3    1.20 GiB  google/gemma-scope-2b-pt-res                         3
   ─────────────────────────────────────────────────────────────────────────────
-   9.10 GiB  total (3 repos, 23 files)
+  10.10 GiB  total (3 repos, 23 files)
   ● = partial downloads
 
 $ hf-fm du 2
@@ -291,17 +291,20 @@ $ hf-fm du 2
    2    0.26 GiB  model-00002-of-00002.safetensors
    ...
   ──────────────────────────────────────────────────────────────────
-   2.80 GiB  total (12 files)
+   2.80 GiB  listed above (12 files)
+   3.80 GiB  total on disk
+
+  Note: blobs/ holds bytes beyond the files listed above (an unfinished download's temp files, and on Windows typically a second copy of each listed file).
 
   ● partial downloads — run `hf-fm status EleutherAI/pythia-1.4b` for details
 
 $ hf-fm du --age
    #        SIZE  REPO                                             FILES  AGE
    1    5.10 GiB  google/gemma-2-2b-it                                 8  2 days ago
-   2    2.80 GiB  EleutherAI/pythia-1.4b                              12  45 days ago     ●
+   2    3.80 GiB  EleutherAI/pythia-1.4b                              12  45 days ago     ●
    3    1.20 GiB  google/gemma-scope-2b-pt-res                         3  3 months ago
   ─────────────────────────────────────────────────────────────────────────────────────────
-   9.10 GiB  total (3 repos, 23 files)
+  10.10 GiB  total (3 repos, 23 files)
   ● = partial downloads
 
 $ hf-fm du --tree
@@ -309,12 +312,12 @@ $ hf-fm du --tree
   │   ├── model-00001-of-00002.safetensors  2.50 GiB
   │   ├── model-00002-of-00002.safetensors  2.60 GiB
   │   └── config.json                          856 B
-  ├── EleutherAI/pythia-1.4b        2.80 GiB  (12 files)  ●
+  ├── EleutherAI/pythia-1.4b        3.80 GiB  (12 files)  ●
   │   └── ...
   └── google/gemma-scope-2b-pt-res  1.20 GiB  (3 files)
       └── ...
   ─────────────────────────────────────────────────────────
-   9.10 GiB  total (3 repos, 23 files)
+  10.10 GiB  total (3 repos, 23 files)
   ● = partial downloads
 
 $ hf-fm cache path google/gemma-2-2b-it
