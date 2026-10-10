@@ -83,3 +83,6 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [unsloth-6071-p1.md](unsloth-6071-p1.md) | unsloth #6071 — Qwen3.5/3.6 GGUF "truncated SSM tensor" claim, refuted across 4 files via remote GGUF header inspection | Posted |
 | [unsloth-6071-p2.md](unsloth-6071-p2.md) | unsloth #6071 — cross-repo evidence (OpenWhispr#939) refines root cause toward a `llama.cpp` NextN-layer issue | Posted, partially inaccurate (see p3) |
 | [unsloth-6071-p3.md](unsloth-6071-p3.md) | unsloth #6071 — bisected to a stale `llama.cpp` build (fixed 2026-05-16, `b9180`); confirms p2's hypothesis in source and corrects p2's framing | Posted (2026-09-16) |
+| [hf-fetch-model-16-p1.md](hf-fetch-model-16-p1.md) | hf-fetch-model #16 (issue we opened) — `du` ignores `blobs/`; 189 GiB of 825 GiB under-reported | Posted (2026-10-01); Unix claim corrected by p2 |
+| [hf-fetch-model-16-p2.md](hf-fetch-model-16-p2.md) | hf-fetch-model #16 — accidental auto-close explained; fix measured byte-exact; Unix correction; fixes 2/3 moved to #21 | Posted (2026-10-10) |
+| [hf-fetch-model-21-p1.md](hf-fetch-model-21-p1.md) | hf-fetch-model #21 (issue we opened) — reclaim duplicated snapshot copies on Windows (hard-link pointers, reclaim command) | Posted (2026-10-10) |

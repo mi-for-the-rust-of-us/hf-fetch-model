@@ -1,4 +1,4 @@
-# hf-fetch-model #16, reply 1 (Posted)
+# hf-fetch-model #16 — reply 1 (Posted)
 
 - **Target issue:** https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16
 - **Status:** Posted (2026-10-01). The body below matches what is live verbatim.
@@ -14,8 +14,18 @@
   three existing promises true. Seventeen tests came with it.
   **Suggested fixes 2 and 3 are NOT done, and they are the ones that reclaim
   disk.** The accounting fix makes the 189.25 GiB visible; it does not free a
-  byte of it. Not yet pushed or released as of this edit, so the issue should
-  stay open at least until both.
+  byte of it.
+  **The issue was closed by mistake on 2026-10-02**, as COMPLETED with no
+  comment, by the keyword `Closes #16.` in `3667323`'s message, which had not
+  been agreed. Reply 2 ([p2](hf-fetch-model-16-p2.md), posted 2026-10-10) explains this,
+  corrects this post's Unix claim (flag 5), and moves fixes 2 and 3 to a new
+  issue, [#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21) ([p1](hf-fetch-model-21-p1.md)).
+  **A gap in fix 1 itself was found on 2026-10-10**, by a consistency pass
+  over that reply: the single-repo view `du <repo>`, which is this post's own
+  example command, still sums the logical per-file listing, so it still
+  under-reports on a copy layout. Fixed in `e5949c7` ("fix(du): report bytes on disk
+  in du <repo>", pushed 2026-10-10), which unblocked reply 2.
+  The fix is on `main` but unreleased (crates.io still serves 0.12.1).
 - **Lesson / Leverage angle:** The first measurement ("du reports half") was
   true for one repo and wrong as a rule; the whole-cache scan (189 GiB of
   825 GiB, 0x to 2x per repo) is what the issue states. Also, deletion frees the
@@ -30,14 +40,21 @@
      fixing it:** both write copies on Windows, by design and with the reason
      documented in each. hf-fm's `chunked::symlink_or_copy` tries
      `std::os::windows::fs::symlink_file` and falls back to `std::fs::copy`
-     when it fails, which it does without `SeCreateSymbolicLinkPrivilege`;
-     hf-hub 1.0's `cache::storage::create_pointer_symlink` carries the comment
-     "On Windows, copies the blob instead of creating a symlink because
-     symlinks [need privilege]". Neither ever creates a hard link, which is
-     also why the fix can skip hard-link dedup on Windows.
+     when it fails, which it does without `SeCreateSymbolicLinkPrivilege`.
+     hf-hub 1.0's `cache::storage::create_pointer_symlink` does not try at
+     all: on Windows it copies **unconditionally** (`#[cfg(windows)]
+     std::fs::copy`, `src/cache/storage.rs:88-95`), and its comment reads,
+     verbatim: "On Windows, copies the blob instead of creating a symlink
+     because symlinks require elevated privileges." (An earlier version of
+     this flag paraphrased that comment inside quotation marks, and read as
+     if hf-hub also fell back; corrected 2026-10-10.) Neither ever creates a
+     hard link, which is also why the fix can skip hard-link dedup on
+     Windows.
   3. **Personal path redacted** to `%USERPROFILE%`.
   4. **Not verified:** that `cache gc --size` budgets against the same figure;
-     the issue says "if".
+     the issue says "if". **Resolved 2026-10-10:** it does. `compute_gc_plan`
+     sums `CachedModelSummary::total_size`, and its `Freed` line adds the same
+     per-repo sizes (see [p2](hf-fetch-model-16-p2.md)).
   5. **The posted body understates the bug, and fix 1's "Totals on the usual
      Unix layout are unchanged" is wrong.** Established only while fixing it:
      sizes came from `DirEntry::metadata`, which `std` documents as
