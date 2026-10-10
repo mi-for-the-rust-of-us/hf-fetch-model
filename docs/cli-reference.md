@@ -530,7 +530,7 @@ hf-fm cache gc --older-than 30 --yes
 | `--yes` | Skip the confirmation prompt | off |
 | `--list-kept` | List every kept repo in the preview (default: hidden for terseness) | off |
 
-At least one of `--older-than` or `--max-size` is required. When both are set, age eviction runs first; if the cache is still over budget, oldest non-protected repos are evicted next, oldest first. Repos with active partial downloads (mtime within the last hour) are skipped to avoid racing with `hf-fm download`; run `cache clean-partial` first to clear stale partials.
+At least one of `--older-than` or `--max-size` is required. When both are set, age eviction runs first; if the cache is still over budget, oldest non-protected repos are evicted next, oldest first. A repo's age is the newest modification time among its snapshot files, or, for a repo with none (an interrupted first download, or only `inspect --cache-headers` entries), among its other files. Repos with active partial downloads (mtime within the last hour) are skipped to avoid racing with `hf-fm download`; run `cache clean-partial` first to clear stale partials.
 
 Decimal-prefixed size suffixes (`KB`, `MB`, `GB`, `TB`) are rejected — `hf-fm` reports sizes in binary units everywhere else and silent reinterpretation would mislead. Use `KiB`, `MiB`, `GiB`, `TiB`.
 

@@ -562,7 +562,10 @@ pub struct CachedModelSummary {
     /// Whether there are incomplete `.chunked.part` temp files.
     pub has_partial: bool,
     /// Most recent modification time among the repo's snapshot files, across
-    /// every snapshot; a symlinked entry reports its blob's.
+    /// every snapshot; a symlinked entry reports its blob's. A repo with no
+    /// snapshot files (an interrupted first download, or only hf-fm's header
+    /// cache) takes the newest among its other files instead, so it still
+    /// has an age that `cache gc` can act on.
     ///
     /// `None` if no files were found or all metadata reads failed.
     pub last_modified: Option<std::time::SystemTime>,
@@ -992,7 +995,9 @@ struct RepoFileWalk {
     /// and both are counted, and where it is a symlink or a hard link only
     /// the blob is.
     total_size: u64,
-    /// The newest modification time across every snapshot file, if any.
+    /// The newest modification time across every snapshot file, or, for a
+    /// repo with none, across its other files (blobs, sidecars, `refs/`).
+    /// `None` only when the directory holds no readable file at all.
     last_modified: Option<std::time::SystemTime>,
 }
 
@@ -1035,6 +1040,9 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     let mut last_modified: Option<std::time::SystemTime> = None;
     // Identities of the physical files already charged to `total_size`.
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    // Newest mtime outside `snapshots/`: the age of a repo that has no
+    // snapshot files at all.
+    let mut other_modified: Option<std::time::SystemTime> = None;
 
     // Blobs first, so a snapshot entry that hard-links to one is recognised
     // as already counted rather than charged a second time.
@@ -1042,6 +1050,7 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
         &crate::cache_layout::blobs_dir(repo_dir),
         &mut total_size,
         &mut seen,
+        &mut other_modified,
     );
 
     // A repo can legitimately hold blobs with no readable `snapshots/` (an
@@ -1074,14 +1083,24 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
             if name == "blobs" || name == "snapshots" {
                 continue;
             }
-            walk_other_files(&entry.path(), &mut total_size, &mut seen);
+            walk_other_files(
+                &entry.path(),
+                &mut total_size,
+                &mut seen,
+                &mut other_modified,
+            );
         }
     }
 
     RepoFileWalk {
         files,
         total_size,
-        last_modified,
+        // A downloaded repo is aged by its snapshot files, as `cache gc`
+        // documents. One with none, such as an interrupted first download or
+        // a repo holding only hf-fm's header cache, would otherwise have no
+        // age at all: `cache gc --older-than` could never select it, and the
+        // guard that spares an active download could not recognise it.
+        last_modified: last_modified.or(other_modified),
     }
 }
 
@@ -1092,7 +1111,12 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
 /// Symlinks are skipped rather than followed: a blob is always a real file,
 /// and following one would let a crafted cache charge this repo for bytes
 /// that live outside it.
-fn walk_blob_files(blobs_dir: &Path, total_size: &mut u64, seen: &mut HashSet<(u64, u64)>) {
+fn walk_blob_files(
+    blobs_dir: &Path,
+    total_size: &mut u64,
+    seen: &mut HashSet<(u64, u64)>,
+    newest: &mut Option<std::time::SystemTime>,
+) {
     let Ok(entries) = std::fs::read_dir(blobs_dir) else {
         return;
     };
@@ -1106,6 +1130,7 @@ fn walk_blob_files(blobs_dir: &Path, total_size: &mut u64, seen: &mut HashSet<(u
         if !meta.is_file() {
             continue;
         }
+        note_newest_mtime(newest, &meta);
         if let Some(id) = physical_id(&meta)
             && !seen.insert(id)
         {
@@ -1123,7 +1148,12 @@ fn walk_blob_files(blobs_dir: &Path, total_size: &mut u64, seen: &mut HashSet<(u
 /// symlinks are skipped rather than followed, so nothing outside the repo is
 /// charged to it, and [`physical_id`] keeps a file named twice from counting
 /// twice.
-fn walk_other_files(path: &Path, total_size: &mut u64, seen: &mut HashSet<(u64, u64)>) {
+fn walk_other_files(
+    path: &Path,
+    total_size: &mut u64,
+    seen: &mut HashSet<(u64, u64)>,
+    newest: &mut Option<std::time::SystemTime>,
+) {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
@@ -1133,15 +1163,25 @@ fn walk_other_files(path: &Path, total_size: &mut u64, seen: &mut HashSet<(u64, 
         };
         for entry in entries {
             let Ok(entry) = entry else { continue };
-            walk_other_files(&entry.path(), total_size, seen);
+            walk_other_files(&entry.path(), total_size, seen, newest);
         }
     } else if meta.is_file() {
+        note_newest_mtime(newest, &meta);
         if let Some(id) = physical_id(&meta)
             && !seen.insert(id)
         {
             return;
         }
         *total_size = total_size.saturating_add(meta.len());
+    }
+}
+
+/// Raises `newest` to `meta`'s modification time when that is later.
+fn note_newest_mtime(newest: &mut Option<std::time::SystemTime>, meta: &std::fs::Metadata) {
+    if let Ok(modified) = meta.modified()
+        && newest.is_none_or(|current| modified > current)
+    {
+        *newest = Some(modified);
     }
 }
 
@@ -1608,6 +1648,75 @@ mod tests {
             "only the finished file is listed, got {:?}",
             walk.files
         );
+    }
+
+    /// Writes `bytes` at `path` with its modification time set `days_ago`.
+    fn write_aged(path: &Path, bytes: usize, days_ago: u64) -> std::time::SystemTime {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b'x'; bytes]).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days_ago * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        when
+    }
+
+    /// A repo holding only hf-fm's header cache (`inspect --cache-headers`
+    /// on a repo never downloaded) has no snapshot files, so it takes its age
+    /// from the entry; without one, `cache gc --older-than` never selects it.
+    #[test]
+    fn walk_ages_a_header_cache_only_repo_by_its_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        let entry = crate::cache_layout::header_cache_path(&repo_dir, "model.gguf", "e1");
+        let when = write_aged(&entry, 100, 100);
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.last_modified, Some(when));
+        assert!(walk.files.is_empty());
+    }
+
+    /// A downloaded repo keeps its snapshot-based age, as `cache gc`
+    /// documents, even when a sidecar or a blob was written later.
+    #[test]
+    fn walk_ages_a_downloaded_repo_by_its_snapshot_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        let snap = crate::cache_layout::snapshot_dir(&repo_dir, "c0ffee");
+        let snapshot_time = write_aged(&snap.join("model.bin"), 100, 100);
+        write_aged(
+            &crate::cache_layout::blobs_dir(&repo_dir).join("deadbeef"),
+            100,
+            1,
+        );
+        write_aged(
+            &crate::cache_layout::header_cache_path(&repo_dir, "model.bin", "e1"),
+            100,
+            1,
+        );
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.last_modified, Some(snapshot_time));
+    }
+
+    /// An interrupted first download, with only a `.chunked.part` temp blob
+    /// and no snapshot file yet, takes its age from the temp blob, so
+    /// `cache gc` can tell that it is still being written.
+    #[test]
+    fn walk_ages_a_first_download_in_progress_by_its_temp_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        let when = write_aged(&blobs.join("cafe.chunked.part"), 4096, 0);
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.last_modified, Some(when));
     }
 
     /// An empty repo directory is zero bytes, not an error.

@@ -419,6 +419,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the previous code; the pruning check also fails with only the
   prune call disabled.
 
+- **A repo with no snapshot files had no age, so `cache gc --older-than`
+  never selected it, and `--max-size` evicted it first, even mid-download.**
+  `cache gc` reads a repo's age from its snapshot files. A repo holding only
+  `inspect --cache-headers` entries, or a first download that so far has
+  only `.chunked.part` temp blobs, has none, so its age was unknown.
+  `--older-than` skips unknown ages, and `--max-size` evicts them first. The
+  guard that spares a partial download modified within the last hour also
+  needs an age, so it could not see a first download in progress, and
+  `--max-size` removed that download before anything else. Such a repo now
+  takes the newest modification time among its other files (blobs,
+  sidecars, `refs/`); a downloaded repo keeps its snapshot-based age, as
+  documented. Three unit tests cover a header-only repo, a downloaded repo
+  with a newer sidecar, and a first download in progress. Two CLI tests
+  show `cache gc --older-than 30` selecting a 100-day-old header-only repo
+  and `--max-size 0` sparing a fresh first download; both fail against the
+  previous code.
+
 - **`du`'s count columns had fixed widths, and the tree printed a blank
   line before its rule.** The flat view's `#` (3 wide) and FILES (5 wide)
   columns and `du <repo>`'s `#` (3 wide) were fixed, so a cache of 1,000 or

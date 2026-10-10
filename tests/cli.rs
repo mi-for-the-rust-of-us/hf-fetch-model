@@ -4274,6 +4274,80 @@ fn du_lists_a_repo_that_holds_only_header_cache_entries() {
 }
 
 #[test]
+fn cache_gc_evicts_an_old_header_cache_only_repo() {
+    // A repo holding only hf-fm's header cache has no snapshot files, and
+    // until v0.12.2 no age either, so `cache gc --older-than` never selected
+    // it. It now takes its age from its entries.
+    let dir = temp_hf_home();
+    let entry = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--old-headers")
+        .join(".hf-fm-header-cache")
+        .join("model.gguf.e1.json");
+    std::fs::create_dir_all(entry.parent().expect("entry has a parent")).expect("create dir");
+    std::fs::write(&entry, vec![b'{'; 2048]).expect("write header cache entry");
+    let hundred_days_ago =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&entry)
+        .expect("open entry")
+        .set_modified(hundred_days_ago)
+        .expect("age the entry");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "gc",
+        "--older-than",
+        "30",
+        "--dry-run",
+    ]));
+    assert!(success, "cache gc --dry-run should succeed: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("test-org/old-headers") && l.contains("3 months ago")),
+        "the repo should be selected at its entry's age, got:\n{stdout}"
+    );
+    assert!(entry.exists(), "a dry run must not delete anything");
+}
+
+#[test]
+fn cache_gc_spares_a_first_download_in_progress() {
+    // A first download with only a fresh `.chunked.part` temp blob has no
+    // snapshot file yet. Until v0.12.2 it therefore had no age, so the guard
+    // that spares a partial modified within the last hour could not see it,
+    // and `--max-size`, which evicts unknown ages first, picked it first.
+    let dir = temp_hf_home();
+    let blobs = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--downloading")
+        .join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join("cafe.chunked.part"), vec![0u8; 4096]).expect("write temp blob");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "gc",
+        "--max-size",
+        "0",
+        "--dry-run",
+    ]));
+    assert!(success, "cache gc --dry-run should succeed: {stderr}");
+    let will_remove = stdout.split("Will remove:").nth(1).unwrap_or_default();
+    assert!(
+        !will_remove.contains("test-org/downloading"),
+        "an active first download must not be evicted, got:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("skipped (active partial"),
+        "it should be reported as skipped, got:\n{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn du_repo_prints_one_total_when_the_gap_does_not_show() {
     // A 1 MiB file and its 40-byte ref: the bytes on disk exceed the
     // listing's sum, but both print as 1.00 MiB, so a second line and a

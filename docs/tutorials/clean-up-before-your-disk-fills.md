@@ -301,7 +301,7 @@ Protected by --except:
 Cache: 816.32 GiB → 383.67 GiB (free 432.65 GiB)
 ```
 
-Two caveats worth knowing before you trust GC. "Last accessed" is approximated by the newest modification time among the repo's snapshot files — the HF cache layout does not record true access times, so a repo you *read* daily but never re-download looks old; protect it with `--except`. And repos with a partial download modified within the last hour are skipped automatically, so GC never races an `hf-fm` download running in another shell.
+Two caveats worth knowing before you trust GC. "Last accessed" is approximated by the newest modification time among the repo's snapshot files (or, for a repo that has none, such as one you only inspected with `--cache-headers`, among its other files) — the HF cache layout does not record true access times, so a repo you *read* daily but never re-download looks old; protect it with `--except`. And repos with a partial download modified within the last hour are skipped automatically, so GC never races an `hf-fm` download running in another shell.
 
 ## Trust, but verify: `cache verify`
 
