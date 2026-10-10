@@ -3680,12 +3680,13 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
 /// Says why `du <repo>`'s bytes on disk differ from its listing's sum.
 ///
 /// The gap runs either way. More on disk: a snapshot entry that copies its
-/// blob holds the bytes twice, which is how `hf-hub` writes on Windows, and
-/// an unfinished download's `.chunked.part` temp blobs count at their full
-/// length while listing nothing. Less on disk: snapshot entries that are
-/// symlinks share their blob, so a repo cached at several revisions, or
-/// holding identical files, lists the same bytes more than once.
-fn du_repo_gap_note(listed_bytes: u64, disk_bytes: u64, has_partial: bool) -> &'static str {
+/// blob holds the bytes twice, which is how `hf-hub` writes on Windows; an
+/// unfinished download's `.chunked.part` temp blobs count at their full
+/// length while listing nothing; and so does a blob that no snapshot entry
+/// points at. Less on disk: snapshot entries that are symlinks share their
+/// blob, so a repo cached at several revisions, or holding identical files,
+/// lists the same bytes more than once.
+const fn du_repo_gap_note(listed_bytes: u64, disk_bytes: u64, has_partial: bool) -> &'static str {
     if disk_bytes < listed_bytes {
         "some files listed above share their bytes on disk (one blob behind \
          several cached revisions, or behind identical files)."
@@ -3694,8 +3695,8 @@ fn du_repo_gap_note(listed_bytes: u64, disk_bytes: u64, has_partial: bool) -> &'
          download's temp files, and on Windows typically a second copy of \
          each listed file)."
     } else {
-        "blobs/ holds bytes beyond the files listed above (on Windows, \
-         typically a second copy of each)."
+        "blobs/ holds bytes beyond the files listed above (a second copy of \
+         each, as on Windows, or blobs that no snapshot points at)."
     }
 }
 
@@ -3736,7 +3737,7 @@ struct DuRepoJson {
     repo_id: String,
     /// Total size on disk in bytes.
     size: u64,
-    /// Number of files in the snapshot directory.
+    /// Number of files listed across the repo's snapshots.
     file_count: usize,
     /// Whether the repo has incomplete `.chunked.part` downloads.
     has_partial: bool,
@@ -9740,7 +9741,7 @@ fn run_status(
         .map(|(name, _)| name.len())
         .max()
         .unwrap_or(4)
-        .max(4); // floor: "File".len()
+        .max(4); // floor: a short filename's width (this table prints no header)
     for (filename, file_status) in &status.files {
         match file_status {
             cache::FileStatus::Complete { local_size } => {
@@ -9813,7 +9814,7 @@ fn run_status(
 struct StatusRepoSummaryJson {
     /// Repository identifier.
     repo_id: String,
-    /// Number of files in the snapshot directory.
+    /// Number of files listed across the repo's snapshots.
     file_count: usize,
     /// Total size on disk in bytes.
     size: u64,
@@ -10747,6 +10748,40 @@ mod tests {
         );
         assert!(is_auth_status_error(&forbidden));
         assert!(is_auth_status_error(&unauthorized));
+    }
+
+    // ---------- du_repo_gap_note ----------
+
+    #[test]
+    fn du_repo_gap_note_names_shared_blobs_when_the_listing_is_larger() {
+        // Less on disk than listed: symlinked entries sharing one blob. This
+        // wins over a partial download, which only ever adds bytes on disk.
+        for has_partial in [false, true] {
+            let note = du_repo_gap_note(6144, 3072, has_partial);
+            assert!(note.contains("share their bytes on disk"), "{note}");
+            assert!(!note.contains("beyond"), "{note}");
+        }
+    }
+
+    #[test]
+    fn du_repo_gap_note_names_the_extra_bytes_when_disk_is_larger() {
+        let partial = du_repo_gap_note(1024, 10240, true);
+        assert!(
+            partial.contains("an unfinished download's temp files"),
+            "{partial}"
+        );
+        let copies = du_repo_gap_note(3072, 6144, false);
+        assert!(
+            copies.contains("a second copy of each, as on Windows"),
+            "{copies}"
+        );
+        assert!(
+            copies.contains("blobs that no snapshot points at"),
+            "{copies}"
+        );
+        for note in [partial, copies] {
+            assert!(note.starts_with("blobs/ holds bytes beyond"), "{note}");
+        }
     }
 
     // ---------- dot_leader ----------

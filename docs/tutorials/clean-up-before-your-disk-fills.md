@@ -153,7 +153,7 @@ hf-fm du 17
    7.12 GiB  listed above (20 files)
   14.24 GiB  total on disk
 
-  Note: blobs/ holds bytes beyond the files listed above (on Windows, typically a second copy of each).
+  Note: blobs/ holds bytes beyond the files listed above (a second copy of each, as on Windows, or blobs that no snapshot points at).
 ```
 
 The two totals differ, and not by rounding. The files as listed add up to 7.12 GiB, but the repo occupies 14.24 GiB, because each file is stored twice: as its blob in `blobs/`, and as a full copy under `snapshots/` where Linux and macOS would put a symlink. That is how hf-fm's downloads usually land on Windows, where creating a symlink needs Developer Mode or an elevated shell. The listing shows what the model is made of; `total on disk` is what deleting it frees, and it is the figure the whole-cache `du`, `cache gc` and `cache delete` all use. Where the two agree, as they do with symlinked entries on Linux and macOS, `du` prints a single `total` line.

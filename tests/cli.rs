@@ -1184,7 +1184,7 @@ fn du_json_repo() {
     // (#16), which the isolated `du_repo_*` tests below pin exactly. Here, on
     // the shared global cache, its relation to listed_bytes depends on the
     // layout (copies make it larger, revisions sharing a symlinked blob make
-    // it smaller), so only its presence is asserted.
+    // it smaller), so only that it is positive is asserted.
     let sum: u64 = files
         .iter()
         .map(|f| f.get("size").and_then(Value::as_u64).expect("size u64"))
@@ -3868,16 +3868,19 @@ fn du_repo_counts_a_blob_and_its_snapshot_copy() {
         .env("HF_HOME", dir.path())
         .args(["du", "test-org/dup-repo"]));
     assert!(success, "du <repo> should succeed: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
     assert!(
-        stdout.contains("3.0 KiB  listed above (1 file)"),
-        "the listing's sum should be named as such, got:\n{stdout}"
+        lines.windows(2).any(|w| w
+            == [
+                "  3.0 KiB  listed above (1 file)",
+                "  6.0 KiB  total on disk"
+            ]),
+        "the listing's sum and the bytes on disk, each at its own width, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("6.0 KiB  total on disk"),
-        "the total should be the bytes on disk, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("(on Windows, typically a second copy of each)."),
+        stdout.contains(
+            "(a second copy of each, as on Windows, or blobs that no snapshot points at)."
+        ),
         "with no partial download, the note points at the copies, got:\n{stdout}"
     );
     assert!(

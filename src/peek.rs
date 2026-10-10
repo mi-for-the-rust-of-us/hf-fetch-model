@@ -591,6 +591,8 @@ fn format_bytes_approx(bytes: u64) -> String {
     // CAST: u64 → f64, precision loss acceptable; value is a display-only size scalar
     #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
     let mut val = bytes as f64 / 1024.0;
+    // EXPLICIT: carries `val` down one unit per step and returns at the first
+    // unit whose rounded figure stays below its threshold.
     for (unit, decimals, next_at) in STEPS {
         let shown = format!("{val:.decimals$}");
         // Decided on the rounded string itself, so it cannot disagree with
@@ -757,6 +759,37 @@ mod tests {
         assert_eq!(format_bytes_approx(1000 << 50), "0.98 EiB");
         assert_eq!(format_bytes_approx(1 << 60), "1.00 EiB");
         assert_eq!(format_bytes_approx(u64::MAX), "16.00 EiB");
+        // `format_size`'s `output_never_exceeds_ten_characters` sweep.
+        // Every power of two and its neighbours, and every unit's `999`,
+        // `1000`, `1023` and `1024` multiples and their neighbours: the
+        // values where a unit boundary or a rounding carry can widen the
+        // output. None may exceed 10 characters, and none may show a figure
+        // that should have flipped to the next unit.
+        let mut samples: Vec<u64> = Vec::new();
+        for k in 0..64 {
+            let p = 1u64 << k;
+            samples.extend([p - 1, p, p + 1]);
+        }
+        samples.push(u64::MAX);
+        for k in 0..6 {
+            let unit = 1u64 << (10 * k);
+            for n in [999u64, 1000, 1023, 1024] {
+                if let Some(v) = n.checked_mul(unit) {
+                    samples.extend([v.saturating_sub(1), v, v.saturating_add(1)]);
+                }
+            }
+        }
+        for bytes in samples {
+            let s = format_bytes_approx(bytes);
+            assert!(
+                s.len() <= 10,
+                "{bytes} printed as {s:?}, over 10 characters"
+            );
+            assert!(
+                !s.starts_with("1024.0 ") && !s.starts_with("1000.00 "),
+                "{bytes} printed as {s:?}, which should have flipped to the next unit"
+            );
+        }
     }
 
     // ---------- transport_limits ----------

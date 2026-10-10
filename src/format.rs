@@ -24,11 +24,12 @@
 /// would round to `1024.0 KiB` or `1000.00 MiB`, prints in the next unit
 /// (`1.00 MiB`, `0.98 GiB`) instead. The `1000` thresholds above KiB, rather
 /// than `1024`, keep the integer part to at most three digits, the CLI
-/// convention since v0.9.3: a 1.0 GiB file prints as `"1.00 GiB"`, never
-/// `"1024.00 MiB"`. So every `u64` prints in at most 10 characters (the
-/// widest are `"1023.9 KiB"` and `"999.99 MiB"` and their peers, and
-/// `u64::MAX` is `"16.00 EiB"`), which is what fixed-width size columns rely
-/// on.
+/// convention for MiB since v0.9.3 and for GiB since v0.9.4: a 1.0 GiB file
+/// prints as `"1.00 GiB"`, never `"1024.00 MiB"`. PiB and EiB, added in
+/// v0.12.2, extend it to the top. So every `u64` prints in at most 10
+/// characters (the widest are `"1023.9 KiB"` and `"999.99 MiB"` and their
+/// peers, and `u64::MAX` is `"16.00 EiB"`), which is what fixed-width size
+/// columns rely on.
 #[must_use]
 pub fn format_size(bytes: u64) -> String {
     // Each unit below EiB, with its decimals and the displayed value at
@@ -47,6 +48,8 @@ pub fn format_size(bytes: u64) -> String {
     // CAST: u64 → f64, precision loss acceptable; value is a display-only size scalar
     #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
     let mut val = bytes as f64 / 1024.0;
+    // EXPLICIT: carries `val` down one unit per step and returns at the first
+    // unit whose rounded figure stays below its threshold.
     for (unit, decimals, next_at) in STEPS {
         let shown = format!("{val:.decimals$}");
         // Decided on the rounded string itself, so it cannot disagree with

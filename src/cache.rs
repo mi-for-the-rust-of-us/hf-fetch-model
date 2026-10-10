@@ -560,7 +560,8 @@ pub struct CachedModelSummary {
     pub total_size: u64,
     /// Whether there are incomplete `.chunked.part` temp files.
     pub has_partial: bool,
-    /// Most recent modification time among files in the snapshot directory.
+    /// Most recent modification time among the repo's snapshot files, across
+    /// every snapshot; a symlinked entry reports its blob's.
     ///
     /// `None` if no files were found or all metadata reads failed.
     pub last_modified: Option<std::time::SystemTime>,

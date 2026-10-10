@@ -308,9 +308,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on disk, from `cache::repo_disk_usage`. When that differs from the
   listing's sum, both are shown, `123.29 MiB  listed above (3 files)` and then
   `244.94 MiB  total on disk`, followed by a one-line note saying why. The
-  gap runs either way. Windows copies, or an unfinished download's temp
-  files, which count on any platform, put more on disk than the listing
-  holds. Symlinked revisions sharing one blob make the listing the larger,
+  gap runs either way. Windows copies, an unfinished download's temp files
+  (which count on any platform), or blobs that no snapshot points at put
+  more on disk than the listing holds. Symlinked revisions sharing one blob make the listing the larger,
   since it names the same bytes twice. The note names whichever applies.
   Where the two agree, a single `total` line is printed, as before. A
   quant-alternatives repo states its bytes on disk under its range, with the
@@ -320,7 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing against the previous code (one covers the note's partial-download
   wording, one pins every line of a single-total table), and two Unix ones,
   guarding that the symlinked output keeps its single total line and that
-  two revisions sharing a blob get the right note. The existing
+  two revisions sharing a blob get the right note; unit tests cover every
+  branch of the note on every platform. The existing
   `du_json_repo` test's invariant moves from `total_bytes` to `listed_bytes`;
   it no longer asserts that the total is at least the listing, which the
   shared-blob case disproves.
@@ -385,12 +386,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   printed `16777216.00 TiB`. The unit is now chosen after rounding, decided
   on the very string that is printed, and PiB and EiB follow TiB, so every
   `u64` prints in at most 10 characters (`u64::MAX` is `16.00 EiB`). Only
-  those boundary counts change: everything else prints exactly as before.
+  those boundary counts, and counts from 1000 TiB up, print differently:
+  everything else prints exactly as before.
   The library keeps a private copy for `peek`'s messages
   (`peek::format_bytes_approx`, deliberately not promoted to public API),
   whose body must stay identical to `format_size`'s. It is now a verbatim
   copy of the new body, and its cross-check test carries the same new
-  samples. Three new tests pin the boundary values, the units above TiB,
+  samples and the same 10-character sweep. Three new tests pin the boundary values, the units above TiB,
   and the 10-character bound over every power of two and every unit's
   `999`/`1000`/`1023`/`1024` multiples with their neighbours; all three
   fail against the previous code. The pre-download disk check
