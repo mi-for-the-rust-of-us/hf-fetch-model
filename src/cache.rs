@@ -549,12 +549,13 @@ pub struct CachedModelSummary {
     /// `snapshots/`, counting each physical file once.
     ///
     /// This is what `cache delete` frees, not the sum of the snapshot's
-    /// logical file sizes: where the platform cannot create pointer
-    /// symlinks (Windows without `SeCreateSymbolicLinkPrivilege`) each
-    /// snapshot entry is a full copy of its blob and the repo holds the same
-    /// bytes twice, so this figure is about double the snapshot's own size.
-    /// Where the pointers are symlinks or hard links, only the blob's bytes
-    /// count. See `walk_repo_files` for why both directories are walked.
+    /// logical file sizes. Where a snapshot entry is a full copy of its blob
+    /// (always for files `hf-hub` writes on Windows, which never tries a
+    /// symlink there, and for this crate's own writes whenever creating a
+    /// symlink is refused), the repo holds those bytes twice, so this figure
+    /// can reach double the snapshot's own size. Where the pointers are
+    /// symlinks or hard links, only the blob's bytes count. See
+    /// `walk_repo_files` for why both directories are walked.
     pub total_size: u64,
     /// Whether there are incomplete `.chunked.part` temp files.
     pub has_partial: bool,
@@ -1000,11 +1001,12 @@ struct RepoFileWalk {
 ///
 /// The `HuggingFace` layout stores each file's bytes once, under
 /// `blobs/<etag>`, and puts a *pointer* at `snapshots/<commit>/<filename>`.
-/// That pointer is a symlink where the platform allows one and a full copy
-/// otherwise: on Windows, creating a symlink needs
-/// `SeCreateSymbolicLinkPrivilege`, so both [`crate::chunked`]'s
-/// `symlink_or_copy` and `hf-hub` fall back to `std::fs::copy`, and the
-/// repo then holds the same bytes twice.
+/// That pointer is a symlink on Unix. On Windows it is usually a full copy,
+/// and the repo then holds the same bytes twice: `hf-hub` copies there
+/// unconditionally, never trying a symlink (its own comment says symlinks
+/// "require elevated privileges"), and [`crate::chunked`]'s
+/// `symlink_or_copy` tries one and falls back to `std::fs::copy` when it is
+/// refused, as it is without `SeCreateSymbolicLinkPrivilege`.
 ///
 /// Walking `snapshots/` alone, as this did until the fix for
 /// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16),

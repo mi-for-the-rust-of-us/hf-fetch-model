@@ -1179,15 +1179,27 @@ fn du_json_repo() {
         .and_then(Value::as_array)
         .expect("files array");
     assert!(!files.is_empty(), "files should not be empty");
-    // Rock-solid invariant: total_bytes == Σ files[].size (same source).
+    // Rock-solid invariant: listed_bytes == Σ files[].size (same source).
+    // Before v0.12.2 this was total_bytes; total_bytes is now bytes on disk
+    // (#16), which the isolated `du_repo_*` tests below pin exactly. Here, on
+    // the shared global cache, only the layout-independent bound is safe:
+    // the repo occupies at least the bytes its files hold.
     let sum: u64 = files
         .iter()
         .map(|f| f.get("size").and_then(Value::as_u64).expect("size u64"))
         .sum();
     assert_eq!(
-        v.get("total_bytes").and_then(Value::as_u64),
+        v.get("listed_bytes").and_then(Value::as_u64),
         Some(sum),
-        "total_bytes must equal the sum of file sizes"
+        "listed_bytes must equal the sum of file sizes"
+    );
+    let total = v
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .expect("total_bytes u64");
+    assert!(
+        total >= sum,
+        "total_bytes (on disk) {total} must be at least listed_bytes {sum}"
     );
     assert_eq!(
         v.get("file_count").and_then(Value::as_u64),
@@ -3778,6 +3790,194 @@ fn du_and_du_tree_show_range_for_locally_cached_quant_alternatives() {
     assert!(
         tree_stdout.contains(" to ") && tree_stdout.contains("mutually"),
         "du --tree should show a size range for the quant-alternatives repo, got:\n{tree_stdout}"
+    );
+}
+
+/// Stages one file in an isolated `HF_HOME`'s cache the way a writer that
+/// cannot create symlinks stores it, which is how every file `hf-hub` writes
+/// on Windows ends up: the bytes under `blobs/<etag>`, plus a full *copy* of
+/// them at `snapshots/<commit>/<filename>`.
+fn stage_blob_and_copy(
+    hf_home: &std::path::Path,
+    repo_folder: &str,
+    etag: &str,
+    filename: &str,
+    bytes: usize,
+) {
+    let repo = hf_home.join("hub").join(repo_folder);
+    let blobs = repo.join("blobs");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    std::fs::write(blobs.join(etag), vec![0u8; bytes]).expect("write blob");
+    std::fs::copy(blobs.join(etag), snapshot.join(filename)).expect("copy blob into snapshot");
+}
+
+/// Runs `du <repo> --json` and `du --json` against `hf_home`, returning
+/// `(total_bytes, listed_bytes, whole_cache_size)` for `repo_id`.
+fn du_repo_figures(hf_home: &std::path::Path, repo_id: &str) -> (u64, u64, u64) {
+    let (out, err, ok) = run(hf_fm()
+        .env("HF_HOME", hf_home)
+        .args(["du", repo_id, "--json"]));
+    assert!(ok, "du <repo> --json should succeed: {err}");
+    let v = parse_json(&out);
+    let total = v
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .expect("total_bytes u64");
+    let listed = v
+        .get("listed_bytes")
+        .and_then(Value::as_u64)
+        .expect("listed_bytes u64");
+
+    let (all_out, all_err, all_ok) = run(hf_fm().env("HF_HOME", hf_home).args(["du", "--json"]));
+    assert!(all_ok, "du --json should succeed: {all_err}");
+    let all = parse_json(&all_out);
+    let size = all
+        .get("repos")
+        .and_then(Value::as_array)
+        .expect("repos array")
+        .iter()
+        .find(|r| r.get("repo_id").and_then(Value::as_str) == Some(repo_id))
+        .and_then(|r| r.get("size"))
+        .and_then(Value::as_u64)
+        .expect("repo present in whole-cache du --json");
+    (total, listed, size)
+}
+
+#[test]
+fn du_repo_counts_a_blob_and_its_snapshot_copy() {
+    // Issue #16's own reproduction in miniature: one file stored twice, as a
+    // blob and a snapshot copy. `du <repo>` must report the bytes on disk,
+    // name the listing's sum separately, and agree with the whole-cache `du`
+    // for the same repo. Before v0.12.2 its total was the listing's sum, so
+    // it printed half of what the directory held.
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--dup-repo",
+        "e1",
+        "model.bin",
+        3072,
+    );
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/dup-repo"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains("3.0 KiB  listed above (1 file)"),
+        "the listing's sum should be named as such, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("6.0 KiB  total on disk"),
+        "the total should be the bytes on disk, got:\n{stdout}"
+    );
+
+    let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/dup-repo");
+    assert_eq!(total, 6144, "total_bytes is bytes on disk: blob + copy");
+    assert_eq!(listed, 3072, "listed_bytes is the sum of the listing");
+    assert_eq!(
+        total, whole_cache,
+        "du <repo> and du must agree on the repo's bytes on disk"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn du_repo_with_a_symlinked_pointer_keeps_its_single_total_line() {
+    // The usual Unix layout: the bytes exist once, so listing and disk agree,
+    // and the output must be exactly what it was before v0.12.2.
+    let dir = temp_hf_home();
+    let repo = dir.path().join("hub").join("models--test-org--link-repo");
+    let blobs = repo.join("blobs");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    std::fs::write(blobs.join("e1"), vec![0u8; 3072]).expect("write blob");
+    std::os::unix::fs::symlink("../../blobs/e1", snapshot.join("model.bin"))
+        .expect("symlink pointer");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/link-repo"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains("3.0 KiB  total (1 file)"),
+        "one figure, in the pre-v0.12.2 form, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("total on disk"),
+        "no second line when listing and disk agree, got:\n{stdout}"
+    );
+
+    let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/link-repo");
+    assert_eq!((total, listed, whole_cache), (3072, 3072, 3072));
+}
+
+#[test]
+fn du_repo_with_only_blobs_reports_their_bytes() {
+    // Blobs with no snapshot entry (an interrupted download): nothing to
+    // list, but real bytes that `cache delete` would free.
+    let dir = temp_hf_home();
+    let blobs = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--orphan-blobs")
+        .join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join("e1"), vec![0u8; 3072]).expect("write blob");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/orphan-blobs"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains(
+            "No snapshot files found for test-org/orphan-blobs, but 3.0 KiB is on disk under blobs/."
+        ),
+        "the blob bytes should be reported, got:\n{stdout}"
+    );
+
+    let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/orphan-blobs");
+    assert_eq!((total, listed, whole_cache), (3072, 0, 3072));
+}
+
+#[test]
+fn du_repo_with_quant_alternatives_states_its_bytes_on_disk() {
+    // The range replaces the listing's sum, but the bytes on disk are real
+    // and must still be stated: 2 x (4 KiB + 8 KiB), blob plus copy each.
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--quant-dup",
+        "e1",
+        "model-Q4_K_M.gguf",
+        4096,
+    );
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--quant-dup",
+        "e2",
+        "model-Q8_0.gguf",
+        8192,
+    );
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/quant-dup"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains("4.0 KiB to 8.0 KiB") && stdout.contains("mutually exclusive quants"),
+        "the quant range should still be shown, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("24.0 KiB  total on disk"),
+        "the bytes on disk should be stated under the range, got:\n{stdout}"
     );
 }
 

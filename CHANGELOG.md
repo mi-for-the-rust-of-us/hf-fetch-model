@@ -167,9 +167,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   It was wrong in **two different ways**, by different amounts, depending on
   what the pointer is:
-  - Where the pointer is a **copy** of its blob (Windows without
-    `SeCreateSymbolicLinkPrivilege`, where both this crate's `symlink_or_copy`
-    and `hf-hub` fall back to `std::fs::copy`), the repo holds the same bytes
+  - Where the pointer is a **copy** of its blob (on Windows, where `hf-hub`
+    always copies, never trying a symlink, and this crate's `symlink_or_copy`
+    falls back to `std::fs::copy` when a symlink is refused, as it is without
+    `SeCreateSymbolicLinkPrivilege`), the repo holds the same bytes
     twice and only one copy was counted, so it reported about half. A 5.18 GiB
     model in a directory holding 10.36 GiB read as 5.18 GiB.
   - Where the pointer is a **symlink**, the usual Unix layout, it was far
@@ -287,6 +288,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reproduced CI's error exactly at the same line, then on the fix, where all
   seven steps passed with the binaries included and the eight Unix tests ran
   inside the real crate.
+
+  **Found by a consistency pass over the reply drafted for #16: the issue's
+  own example command was still wrong.** The single-repo view `du <repo>`
+  computed its `total` line by adding up its per-file listing, and that
+  listing deliberately shows each file's logical size. So on a copy layout it
+  still printed `5.18 GiB total` for a 10.36 GiB directory, and disagreed with
+  the whole-cache `du` about the same repo by up to a factor of two (measured
+  on `mntss/gemma-scope-transcoders`: 123.29 MiB "total" against 244.94 MiB
+  on disk, which is also what `du` reports). Its total is now the repo's bytes
+  on disk, from `cache::repo_disk_usage`. When that differs from the
+  listing's sum, both are shown, `123.29 MiB  listed above (3 files)` and then
+  `244.94 MiB  total on disk`, followed by a one-line note; where they agree,
+  as on a symlinked cache, the output is byte-for-byte what it was. A
+  quant-alternatives repo states its bytes on disk under its range, and a repo
+  holding blobs but no snapshot files now says how much they occupy instead of
+  `No cached files found`. Four new CLI tests pin these cases on an isolated
+  cache: three portable ones, each failing against the previous code, and a
+  Unix one guarding that the symlinked output is unchanged. The existing
+  `du_json_repo` test's invariant moves from `total_bytes` to `listed_bytes`.
+
+  **For scripts reading `du --json`:** both repo-level figures now mean bytes
+  on disk. Whole-cache `du --json`'s per-repo `size` changed with the fix
+  above, and `du <repo> --json`'s `total_bytes` changes with this one, so the
+  two agree for every repo. The previous meaning of `total_bytes`, the sum of
+  `files[].size`, survives as a new field, `listed_bytes`. No Rust API
+  changed, and this makes the documented meaning true ("Output disk usage as
+  JSON"), so it ships in a patch release rather than 0.13.0.
 
 - **`clippy::assert_is_empty`, new in Rust 1.99, failed the `-D warnings`
   gate in three places.** The lint's point is sound: `assert!(x.is_empty())`

@@ -3551,19 +3551,45 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
 }
 
 /// Shows per-file disk usage for a specific cached repo, sorted by size descending.
+///
+/// Two figures can differ here, and both are shown when they do. The
+/// per-file listing is the repo's *logical* files, from
+/// [`cache::cache_repo_usage`]. The total is the bytes the repo occupies *on
+/// disk*, from [`cache::repo_disk_usage`]: every physical file under `blobs/`
+/// and `snapshots/`, counted once. That is the same figure the whole-cache
+/// `du` shows for this repo, and what `cache delete` frees. Where snapshot
+/// entries are copies of their blobs (always for files `hf-hub` writes on
+/// Windows) the repo holds the bytes twice, so the total exceeds the sum of
+/// the listing. Until v0.12.2 the total was that sum, which is how
+/// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)'s
+/// own example printed `5.18 GiB total` for a 10.36 GiB directory.
 fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
     let files = cache::cache_repo_usage(repo_id)?;
     let has_partial = cache::repo_has_partial(repo_id)?;
+    let (_, disk_bytes) = cache::repo_disk_usage(repo_id)?;
 
     if json {
-        return print_du_repo_json(repo_id, &files, has_partial, &cache_dir);
+        return print_du_repo_json(repo_id, &files, disk_bytes, has_partial, &cache_dir);
     }
 
     println!("Cache: {}\n", cache_dir.display());
 
     if files.is_empty() {
-        println!("No cached files found for {repo_id}.");
+        if disk_bytes == 0 {
+            println!("No cached files found for {repo_id}.");
+        } else {
+            // Blobs with no snapshot entry pointing at them, for example
+            // from an interrupted download: no files to list, but real
+            // bytes that `cache delete` would free.
+            println!(
+                "No snapshot files found for {repo_id}, but {} is on disk under blobs/.",
+                format_size(disk_bytes)
+            );
+        }
+        if has_partial {
+            println!("\n  \u{25cf} partial downloads — run `hf-fm status {repo_id}` for details");
+        }
         return Ok(());
     }
 
@@ -3577,10 +3603,10 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     let row_width = 3 + 2 + 10 + 2 + fw;
     println!("  {:>3}  {:>10}  FILE", "#", "SIZE");
 
-    let mut total_size: u64 = 0;
+    let mut listed_bytes: u64 = 0;
 
     for (i, f) in files.iter().enumerate() {
-        total_size = total_size.saturating_add(f.size);
+        listed_bytes = listed_bytes.saturating_add(f.size);
         println!(
             "  {:>3}  {:>10}  {}",
             i + 1,
@@ -3590,9 +3616,11 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     }
 
     println!("  {}", "\u{2500}".repeat(row_width));
+    let file_word = pluralize(files.len(), "file", "files");
     // A repo holding N mutually-exclusive `.gguf` quant alternatives gets a
-    // min/max range instead of a total — see `list-files`' identical fix and
-    // `discover::gguf_size_range`.
+    // min/max range instead of a sum — see `list-files`' identical fix and
+    // `discover::gguf_size_range`. Its bytes on disk are still real, so they
+    // are always stated beneath the range.
     // BORROW: explicit .as_str() instead of Deref coercion
     let sized: Vec<(&str, Option<u64>)> = files
         .iter()
@@ -3600,18 +3628,30 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
         .collect();
     if let Some((min, max)) = discover::gguf_size_range(sized) {
         println!(
-            "  {} to {}  (mutually exclusive quants, {} {})",
+            "  {} to {}  (mutually exclusive quants, {} {file_word})",
             format_size(min),
             format_size(max),
             files.len(),
-            pluralize(files.len(), "file", "files"),
+        );
+        println!("  {:>10}  total on disk", format_size(disk_bytes));
+    } else if disk_bytes == listed_bytes {
+        // The usual case wherever pointers are symlinks: one figure, and the
+        // output is byte-identical to what it was before v0.12.2.
+        println!(
+            "  {:>10}  total ({} {file_word})",
+            format_size(listed_bytes),
+            files.len(),
         );
     } else {
         println!(
-            "  {:>10}  total ({} {})",
-            format_size(total_size),
+            "  {:>10}  listed above ({} {file_word})",
+            format_size(listed_bytes),
             files.len(),
-            pluralize(files.len(), "file", "files"),
+        );
+        println!("  {:>10}  total on disk", format_size(disk_bytes));
+        println!(
+            "\n  Note: blobs/ holds bytes beyond the files listed above \
+             (on Windows, typically a second copy of each)."
         );
     }
 
@@ -3668,8 +3708,8 @@ struct DuRepoJson {
     last_modified: Option<u64>,
     /// `true` when this repo's `.gguf` files are mutually-exclusive quant
     /// alternatives rather than shards of one logical file (same meaning as
-    /// `list-files --json`'s field of the same name). `size` above stays a
-    /// well-defined sum either way.
+    /// `list-files --json`'s field of the same name). `size` above is the
+    /// repo's bytes on disk either way.
     quant_alternatives: bool,
     /// Smallest cached `.gguf` file's size, present only when `quant_alternatives` is `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3706,8 +3746,17 @@ struct DuRepoDetailJson {
     repo_id: String,
     /// Per-file entries, sorted by size descending.
     files: Vec<DuFileJson>,
-    /// Total bytes across the repo's files.
+    /// Bytes the repo occupies on disk: every physical file under `blobs/`
+    /// and `snapshots/`, counted once. Always equal to `du --json`'s `size`
+    /// for the same repo. Until v0.12.2 this was the sum of `files[].size`,
+    /// which is now `listed_bytes`
+    /// ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)).
     total_bytes: u64,
+    /// Sum of `files[].size`, the repo's logical files (new in v0.12.2).
+    /// Smaller than `total_bytes` where snapshot entries are copies of their
+    /// blobs rather than links to them, which is always the case for files
+    /// `hf-hub` writes on Windows.
+    listed_bytes: u64,
     /// Number of files.
     file_count: usize,
     /// Whether the repo has incomplete `.chunked.part` downloads.
@@ -3806,17 +3855,22 @@ fn print_du_tree_json(
 }
 
 /// Prints a single repo's per-file disk usage as JSON.
+///
+/// `disk_bytes` becomes `total_bytes` (bytes on disk, as in `du --json`'s
+/// per-repo `size`); the sum of the listing becomes `listed_bytes`. See
+/// [`run_du_repo`] for why the two differ.
 fn print_du_repo_json(
     repo_id: &str,
     files: &[cache::CacheFileUsage],
+    disk_bytes: u64,
     has_partial: bool,
     cache_dir: &std::path::Path,
 ) -> Result<(), FetchError> {
-    let mut total_bytes: u64 = 0;
+    let mut listed_bytes: u64 = 0;
     let mut entries: Vec<DuFileJson> = Vec::with_capacity(files.len());
-    // EXPLICIT: accumulates total alongside entry construction.
+    // EXPLICIT: accumulates the listing's sum alongside entry construction.
     for f in files {
-        total_bytes = total_bytes.saturating_add(f.size);
+        listed_bytes = listed_bytes.saturating_add(f.size);
         entries.push(DuFileJson {
             // BORROW: explicit .clone() for owned String field
             filename: f.filename.clone(),
@@ -3839,7 +3893,8 @@ fn print_du_repo_json(
         repo_id: repo_id.to_owned(),
         file_count: entries.len(),
         files: entries,
-        total_bytes,
+        total_bytes: disk_bytes,
+        listed_bytes,
         has_partial,
         quant_alternatives,
         size_min,
