@@ -529,9 +529,12 @@ See also: hf-fm list-families, hf-fm discover")]
         #[arg(long)]
         cached: bool,
         /// Persist parsed remote headers to a local sidecar so repeat
-        /// inspection of the same file is free on later calls.
+        /// inspection of the same file skips the header's range requests.
         ///
-        /// Off by default — a plain remote `inspect` never touches local
+        /// A hit still makes 2 requests, to check the file's current etag,
+        /// so it needs the network; the `Source:` line reports them. Saving
+        /// an entry removes older ones for the same file and revision. Off
+        /// by default — a plain remote `inspect` never touches local
         /// disk without this flag. Keyed on `(repo, revision, filename,
         /// etag)`; a changed etag on a later call is a cache miss, not a
         /// stale hit. Entries live under a `.hf-fm-header-cache/` sidecar
@@ -3438,11 +3441,13 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
 
     let mut summaries = cache::cache_summary()?;
     // `du` reports disk usage — a repo contributing zero bytes and no
-    // partial download (e.g. a directory that exists solely because of an
-    // `inspect --cache-headers` sidecar, never downloaded) doesn't belong
-    // in this view. Filtered here, at the display layer, rather than in
+    // partial download (an empty repo directory) doesn't belong in this
+    // view. Filtered here, at the display layer, rather than in
     // `cache::cache_summary()` itself, so `cache gc`/`status` — which read
-    // the same function — still see and can act on these repos.
+    // the same function — still see and can act on these repos. A repo
+    // holding only hf-fm's header cache (`inspect --cache-headers` on a repo
+    // never downloaded) is not zero-byte, since its sidecar counts, so it is
+    // listed: `du` is where a user finds it.
     summaries.retain(|s| s.total_size > 0 || s.file_count > 0 || s.has_partial);
     summaries.sort_by_key(|s| std::cmp::Reverse(s.total_size));
 
@@ -3571,11 +3576,11 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
 
 /// Shows per-file disk usage for a specific cached repo, sorted by size descending.
 ///
-/// Two figures can differ here, and both are shown when they do. The
-/// per-file listing is the repo's *logical* files, from
+/// Two figures can differ here, and both are shown when they print
+/// differently. The per-file listing is the repo's *logical* files, from
 /// [`cache::cache_repo_usage`]. The total is the bytes the repo occupies *on
-/// disk*, from [`cache::repo_disk_usage`]: every physical file under `blobs/`
-/// and `snapshots/`, counted once. That is the figure the whole-cache `du`
+/// disk*, from [`cache::repo_disk_usage`]: every physical file in its
+/// directory, counted once. That is the figure the whole-cache `du`
 /// sorts by and reports as this repo's `size` in `--json` (its text view
 /// shows a range instead for quant alternatives), and what `cache delete`
 /// frees. Where snapshot entries are copies of their blobs (always for files
@@ -3601,11 +3606,12 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
         if disk_bytes == 0 {
             println!("No cached files found for {repo_id}.");
         } else {
-            // Blobs with no snapshot entry pointing at them, for example
-            // from an interrupted download: no files to list, but real
-            // bytes that `cache delete` would free.
+            // Blobs with no snapshot entry pointing at them (an interrupted
+            // download), or only hf-fm's header cache (`inspect
+            // --cache-headers` on a repo never downloaded): no files to list,
+            // but real bytes that `cache delete` would free.
             println!(
-                "No snapshot files found for {repo_id}, but {} is on disk under blobs/.",
+                "No snapshot files found for {repo_id}, but its directory holds {} on disk.",
                 format_size(disk_bytes)
             );
         }
@@ -3649,6 +3655,13 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
         .iter()
         .map(|f| (f.filename.as_str(), Some(f.size)))
         .collect();
+    // The two figures are compared as printed. The repo directory always
+    // holds a few bytes no file lists (`refs/main` alone is 40), and a
+    // second line or a note that changes nothing visible is only noise;
+    // `--json` keeps the exact figures.
+    let listed = format_size(listed_bytes);
+    let disk = format_size(disk_bytes);
+    let differs = listed != disk;
     if let Some((min, max)) = discover::gguf_size_range(sized) {
         println!(
             "  {} to {}  (mutually exclusive quants, {} {file_word})",
@@ -3656,19 +3669,13 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
             format_size(max),
             files.len(),
         );
-        println!("  {}  total on disk", format_size(disk_bytes));
-    } else if disk_bytes == listed_bytes {
+        println!("  {disk}  total on disk");
+    } else if !differs {
         // One figure, in the same footer form as the whole-cache view, at its
-        // own width: each listed file's bytes are on disk exactly once.
-        println!(
-            "  {}  total ({} {file_word})",
-            format_size(listed_bytes),
-            files.len(),
-        );
+        // own width: the bytes on disk print the same as the listing's sum.
+        println!("  {listed}  total ({} {file_word})", files.len());
     } else {
         // Two figures, right-aligned to each other at the wider one's width.
-        let listed = format_size(listed_bytes);
-        let disk = format_size(disk_bytes);
         let tw = listed.len().max(disk.len());
         println!(
             "  {listed:>tw$}  listed above ({} {file_word})",
@@ -3677,7 +3684,7 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
         println!("  {disk:>tw$}  total on disk");
     }
     // Under the range too: it hides the listing's sum, not the gap.
-    if disk_bytes != listed_bytes {
+    if differs {
         println!(
             "\n  Note: {}",
             du_repo_gap_note(listed_bytes, disk_bytes, has_partial)
@@ -3697,21 +3704,23 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
 /// The gap runs either way. More on disk: a snapshot entry that copies its
 /// blob holds the bytes twice, which is how `hf-hub` writes on Windows; an
 /// unfinished download's `.chunked.part` temp blobs count at their full
-/// length while listing nothing; and so does a blob that no snapshot entry
-/// points at. Less on disk: snapshot entries that are symlinks share their
-/// blob, so a repo cached at several revisions, or holding identical files,
-/// lists the same bytes more than once.
+/// length while listing nothing; and so do a blob that no snapshot entry
+/// points at and the repo's bookkeeping (`refs/`, hf-fm's header cache).
+/// Less on disk: snapshot entries that are symlinks share their blob, so a
+/// repo cached at several revisions, or holding identical files, lists the
+/// same bytes more than once.
 const fn du_repo_gap_note(listed_bytes: u64, disk_bytes: u64, has_partial: bool) -> &'static str {
     if disk_bytes < listed_bytes {
         "some files listed above share their bytes on disk (one blob behind \
          several cached revisions, or behind identical files)."
     } else if has_partial {
-        "blobs/ holds bytes beyond the files listed above (an unfinished \
-         download's temp files, and on Windows typically a second copy of \
-         each listed file)."
+        "the repo holds more on disk than the files listed above: an \
+         unfinished download's temp files, and on Windows typically a second \
+         copy of each listed file."
     } else {
-        "blobs/ holds bytes beyond the files listed above (a second copy of \
-         each, as on Windows, or blobs that no snapshot points at)."
+        "the repo holds more on disk than the files listed above: a second \
+         copy of each (as on Windows), blobs that no snapshot points at, or \
+         bookkeeping such as refs/ and hf-fm's header cache."
     }
 }
 
@@ -3798,8 +3807,8 @@ struct DuRepoDetailJson {
     repo_id: String,
     /// Per-file entries, sorted by size descending.
     files: Vec<DuFileJson>,
-    /// Bytes the repo occupies on disk: every physical file under `blobs/`
-    /// and `snapshots/`, counted once. Always equal to `du --json`'s `size`
+    /// Bytes the repo occupies on disk: every physical file in its
+    /// directory, counted once. Always equal to `du --json`'s `size`
     /// for the same repo. Until v0.12.2 this was the sum of `files[].size`,
     /// which is now `listed_bytes`
     /// ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)).
@@ -4027,8 +4036,8 @@ struct CacheTreeRepo {
     /// Repository identifier (e.g., `"google/gemma-2-2b-it"`).
     repo_id: String,
     /// Bytes the repo occupies on disk, from
-    /// [`cache::CachedModelSummary::total_size`]: every physical file under
-    /// `blobs/` and `snapshots/`, counted once.
+    /// [`cache::CachedModelSummary::total_size`]: every physical file in
+    /// the repo's directory, counted once.
     total_size: u64,
     /// Number of files listed across the repo's snapshots.
     file_count: usize,
@@ -7899,14 +7908,17 @@ async fn dispatch_inspect_remote_from_reader(
 /// *every* call, hit or miss, since
 /// the etag is the only way to tell which one this is), checks the header
 /// cache keyed on `(repo, revision, filename, etag)`, and on a hit returns
-/// the cached header with [`inspect::InspectSource::CachedHeader`] — no
-/// further range requests. On a miss, the already-open reader is handed to
+/// the cached header with [`inspect::InspectSource::CachedHeader`] and the
+/// probe's own stats, so the `Source:` line states that cost — no further
+/// range requests. On a miss, the already-open reader is handed to
 /// [`dispatch_inspect_remote_from_reader`] instead of re-dispatching through
 /// [`dispatch_inspect_remote`], which would open a second, redundant
 /// [`HttpRangeReader`] over the same file — and the result is written to the
-/// cache before returning it. A cache **write** failure is logged to stderr
-/// but never fails the inspect — the header was still fetched successfully;
-/// only the opportunistic save didn't stick.
+/// cache before returning it, removing the entries it supersedes (an older
+/// etag of the same file and revision; see
+/// [`header_cache::prune_superseded`]). A cache **write** or prune failure
+/// is logged to stderr but never fails the inspect — the header was still
+/// fetched successfully; only the opportunistic save didn't stick.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 async fn inspect_remote_with_cache(
     repo_id: &str,
@@ -7953,10 +7965,12 @@ async fn inspect_remote_with_cache(
         header_cache::HeaderCacheEntry::load(&cache_path, repo_id, rev, filename, &etag).await
     {
         let age = entry.cached_at.elapsed().unwrap_or_default();
+        // The etag probe was this hit's whole cost; report it like any
+        // other run's, so the `Source:` line stays a measured figure.
         return Ok((
             entry.info,
             inspect::InspectSource::CachedHeader { age },
-            None,
+            Some(reader.stats()),
         ));
     }
 
@@ -7976,6 +7990,16 @@ async fn inspect_remote_with_cache(
     );
     if let Err(e) = entry.save_atomic(&cache_path).await {
         eprintln!("warning: failed to write header cache entry: {e}");
+    } else if let Err(e) = header_cache::prune_superseded(
+        &cache_layout::header_cache_dir(&repo_dir),
+        repo_id,
+        rev,
+        filename,
+        &entry.etag,
+    )
+    .await
+    {
+        eprintln!("warning: failed to remove a superseded header cache entry: {e}");
     }
 
     Ok((info, source, stats))
@@ -8175,7 +8199,17 @@ fn run_inspect_single(
         // Unreachable via any current call path (see comment above); a
         // generic label beats guessing at a request count.
         (inspect::InspectSource::Remote, None) => "remote".to_owned(),
-        (inspect::InspectSource::CachedHeader { age }, _) => {
+        (inspect::InspectSource::CachedHeader { age }, Some(stats)) => format!(
+            "cached header (age: {}, {} {} to check it is current)",
+            format_short_age(age),
+            stats.requests,
+            pluralize(
+                usize::try_from(stats.requests).unwrap_or(usize::MAX),
+                "request",
+                "requests"
+            ),
+        ),
+        (inspect::InspectSource::CachedHeader { age }, None) => {
             format!("cached header (age: {})", format_short_age(age))
         }
         _ => "unknown".to_owned(),
@@ -10788,7 +10822,7 @@ mod tests {
         for has_partial in [false, true] {
             let note = du_repo_gap_note(6144, 3072, has_partial);
             assert!(note.contains("share their bytes on disk"), "{note}");
-            assert!(!note.contains("beyond"), "{note}");
+            assert!(!note.contains("holds more on disk"), "{note}");
         }
     }
 
@@ -10800,16 +10834,18 @@ mod tests {
             "{partial}"
         );
         let copies = du_repo_gap_note(3072, 6144, false);
-        assert!(
-            copies.contains("a second copy of each, as on Windows"),
-            "{copies}"
-        );
-        assert!(
-            copies.contains("blobs that no snapshot points at"),
-            "{copies}"
-        );
+        for cause in [
+            "a second copy of each (as on Windows)",
+            "blobs that no snapshot points at",
+            "refs/ and hf-fm's header cache",
+        ] {
+            assert!(copies.contains(cause), "{cause:?} missing from {copies}");
+        }
         for note in [partial, copies] {
-            assert!(note.starts_with("blobs/ holds bytes beyond"), "{note}");
+            assert!(
+                note.starts_with("the repo holds more on disk than the files listed above"),
+                "{note}"
+            );
         }
     }
 

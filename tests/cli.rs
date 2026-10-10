@@ -3717,45 +3717,104 @@ fn inspect_without_cache_headers_never_creates_the_sidecar_dir() {
 }
 
 #[test]
-fn cache_headers_only_repo_is_hidden_from_du_but_visible_to_status() {
-    // Regression pin: cache_summary() must not hide a repo whose directory
-    // exists solely because of a --cache-headers sidecar (no snapshots, no
-    // partial download) from *every* consumer — only du's own display
-    // filters it out (cosmetic: du reports disk usage, and such a repo uses
-    // none). `status` and `cache gc` both read the same underlying
-    // cache::cache_summary() list and must still be able to see it;
-    // otherwise repeated --cache-headers use grows the sidecar directory
-    // with no way to discover or bulk-reclaim it short of `cache delete` by
-    // exact repo ID guessed blind.
+fn cache_headers_only_repo_is_listed_by_du_and_status_with_its_bytes() {
+    // A repo whose directory exists solely because of a --cache-headers
+    // sidecar (no snapshots, no partial download) holds real bytes, which
+    // `du` counts as everything in the repo directory does. So `du` lists
+    // it, at the sidecar's size, and so does `status`: until v0.12.2 `du`
+    // hid it and counted nothing, leaving the sidecar invisible. A second
+    // inspect hits the cache, and its `Source:` line reports the requests
+    // the etag check still made.
     let dir = temp_hf_home();
-    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+    let args = [
         "inspect",
         "hf-internal-testing/tiny-random-gpt2",
         "model.safetensors",
         "--cache-headers",
-    ]));
+    ];
+    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(args));
     assert!(success, "--cache-headers call should succeed: {stderr}");
 
-    // du (whole-cache summary) should not list a repo contributing zero
-    // bytes and no partial download.
-    let (du_stdout, du_stderr, du_success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
-    assert!(du_success, "du should succeed: {du_stderr}");
-    assert!(
-        !du_stdout.contains("tiny-random-gpt2"),
-        "du should hide a header-cache-only repo from its summary, got:\n{du_stdout}"
+    let sidecar = dir
+        .path()
+        .join("hub")
+        .join("models--hf-internal-testing--tiny-random-gpt2")
+        .join(".hf-fm-header-cache");
+    let sidecar_bytes: u64 = std::fs::read_dir(&sidecar)
+        .expect("read sidecar dir")
+        .map(|e| e.expect("dir entry").metadata().expect("metadata").len())
+        .sum();
+    assert!(sidecar_bytes > 0, "the sidecar should hold an entry");
+
+    let (du_stdout, du_stderr, du_success) =
+        run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--json"]));
+    assert!(du_success, "du --json should succeed: {du_stderr}");
+    let v = parse_json(&du_stdout);
+    let size = v
+        .get("repos")
+        .and_then(Value::as_array)
+        .and_then(|repos| {
+            repos.iter().find(|r| {
+                r.get("repo_id").and_then(Value::as_str)
+                    == Some("hf-internal-testing/tiny-random-gpt2")
+            })
+        })
+        .and_then(|r| r.get("size"))
+        .and_then(Value::as_u64);
+    assert_eq!(
+        size,
+        Some(sidecar_bytes),
+        "du should list the repo at its sidecar's bytes, got:\n{du_stdout}"
     );
 
-    // status (no REPO_ID, whole-cache summary) reads cache_summary()
-    // directly with no filtering — it must still see the repo, proving
-    // cache_summary() itself stayed complete rather than hiding the entry
-    // from every consumer.
     let (status_stdout, status_stderr, status_success) =
         run(hf_fm().env("HF_HOME", dir.path()).arg("status"));
     assert!(status_success, "status should succeed: {status_stderr}");
     assert!(
         status_stdout.contains("tiny-random-gpt2"),
-        "status should still see a header-cache-only repo, got:\n{status_stdout}"
+        "status should list the repo too, got:\n{status_stdout}"
     );
+
+    let (hit_stdout, hit_stderr, hit_success) = run(hf_fm().env("HF_HOME", dir.path()).args(args));
+    assert!(hit_success, "the repeat call should succeed: {hit_stderr}");
+    assert!(
+        hit_stdout.contains("Source:   cached header (age: ")
+            && hit_stdout.contains(" to check it is current)"),
+        "a hit should report the etag check's requests, got:\n{hit_stdout}"
+    );
+
+    // Pruning: plant an entry for an older etag of the same file and
+    // revision, remove the current one to force a miss, and inspect again.
+    // Saving the fresh entry must remove the superseded one.
+    let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&sidecar)
+        .expect("read sidecar dir")
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one entry after a miss and a hit");
+    let Some(current) = entries.first() else {
+        panic!("no header cache entry");
+    };
+    let mut old: Value =
+        serde_json::from_str(&std::fs::read_to_string(current).expect("read entry"))
+            .expect("parse entry");
+    let Some(etag) = old.get_mut("etag") else {
+        panic!("the entry should carry an etag");
+    };
+    *etag = Value::from("superseded");
+    let old_path = sidecar.join("model.safetensors.superseded.json");
+    std::fs::write(&old_path, old.to_string()).expect("write superseded entry");
+    std::fs::remove_file(current).expect("remove current entry");
+
+    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(args));
+    assert!(
+        success,
+        "the call after the forced miss should succeed: {stderr}"
+    );
+    assert!(
+        !old_path.exists(),
+        "saving the fresh entry should remove the superseded one"
+    );
+    assert!(current.exists(), "the fresh entry should be saved");
 }
 
 #[test]
@@ -3878,9 +3937,7 @@ fn du_repo_counts_a_blob_and_its_snapshot_copy() {
         "the listing's sum and the bytes on disk, each at its own width, got:\n{stdout}"
     );
     assert!(
-        stdout.contains(
-            "(a second copy of each, as on Windows, or blobs that no snapshot points at)."
-        ),
+        stdout.contains("a second copy of each (as on Windows), blobs that no snapshot points at"),
         "with no partial download, the note points at the copies, got:\n{stdout}"
     );
     assert!(
@@ -3971,8 +4028,8 @@ fn du_repo_with_two_revisions_sharing_a_blob_says_so() {
         "the note should explain the shared blob, got:\n{stdout}"
     );
     assert!(
-        !stdout.contains("holds bytes beyond"),
-        "blobs/ does not hold more here, got:\n{stdout}"
+        !stdout.contains("holds more on disk"),
+        "the repo does not hold more on disk here, got:\n{stdout}"
     );
 
     let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/rev-repo");
@@ -4052,7 +4109,7 @@ fn du_repo_with_only_blobs_reports_their_bytes() {
     assert!(success, "du <repo> should succeed: {stderr}");
     assert!(
         stdout.contains(
-            "No snapshot files found for test-org/orphan-blobs, but 3.0 KiB is on disk under blobs/."
+            "No snapshot files found for test-org/orphan-blobs, but its directory holds 3.0 KiB on disk."
         ),
         "the blob bytes should be reported, got:\n{stdout}"
     );
@@ -4094,7 +4151,7 @@ fn du_repo_with_quant_alternatives_states_its_bytes_on_disk() {
         "the bytes on disk should be stated under the range, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Note: blobs/ holds bytes beyond the files listed above"),
+        stdout.contains("Note: the repo holds more on disk than the files listed above"),
         "the range hides the listing's sum, not the gap, got:\n{stdout}"
     );
 }
@@ -4138,6 +4195,114 @@ fn du_repo_with_one_copy_of_each_file_prints_a_single_total() {
 
     let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/single-repo");
     assert_eq!((total, listed, whole_cache), (3072, 3072, 3072));
+}
+
+#[test]
+fn du_counts_everything_in_the_repo_directory() {
+    // A repo's bytes on disk are what `cache delete` frees: blobs/,
+    // snapshots/, refs/ and hf-fm's two sidecars. Until v0.12.2 only blobs/
+    // and snapshots/ counted, so the header cache could grow unseen.
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--sidecars",
+        "e1",
+        "model.bin",
+        3072,
+    );
+    let repo = dir.path().join("hub").join("models--test-org--sidecars");
+    std::fs::create_dir_all(repo.join("refs")).expect("create refs dir");
+    std::fs::write(repo.join("refs").join("main"), [b'a'; 40]).expect("write ref");
+    std::fs::create_dir_all(repo.join(".hf-fm-header-cache")).expect("create sidecar dir");
+    std::fs::write(
+        repo.join(".hf-fm-header-cache").join("model.bin.e1.json"),
+        vec![b'{'; 1000],
+    )
+    .expect("write header cache entry");
+    std::fs::write(repo.join(".hf-fm-snapshot.json"), vec![b'{'; 100])
+        .expect("write snapshot sidecar");
+
+    let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/sidecars");
+    // blob + snapshot copy + ref + header cache entry + snapshot sidecar
+    assert_eq!(total, 3072 + 3072 + 40 + 1000 + 100);
+    assert_eq!((listed, whole_cache), (3072, total));
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/sidecars"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains("7.1 KiB  total on disk")
+            && stdout.contains("refs/ and hf-fm's header cache"),
+        "the total and the note should cover the whole directory, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_lists_a_repo_that_holds_only_header_cache_entries() {
+    // `inspect --cache-headers` on a repo never downloaded leaves only the
+    // sidecar. It holds bytes, so `du` lists it, and `du <repo>` says so.
+    let dir = temp_hf_home();
+    let sidecar = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--headers-only")
+        .join(".hf-fm-header-cache");
+    std::fs::create_dir_all(&sidecar).expect("create sidecar dir");
+    std::fs::write(sidecar.join("model.gguf.e1.json"), vec![b'{'; 2048])
+        .expect("write header cache entry");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du"]));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("2.0 KiB") && l.contains("test-org/headers-only")),
+        "du should list the repo at its sidecar's size, got:\n{stdout}"
+    );
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/headers-only"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains(
+            "No snapshot files found for test-org/headers-only, but its directory holds 2.0 KiB on disk."
+        ),
+        "du <repo> should report the sidecar's bytes, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_repo_prints_one_total_when_the_gap_does_not_show() {
+    // A 1 MiB file and its 40-byte ref: the bytes on disk exceed the
+    // listing's sum, but both print as 1.00 MiB, so a second line and a
+    // note would only be noise. `--json` keeps the exact figures.
+    let dir = temp_hf_home();
+    let repo = dir.path().join("hub").join("models--test-org--with-ref");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    std::fs::write(snapshot.join("model.bin"), vec![0u8; 1 << 20]).expect("write file");
+    std::fs::create_dir_all(repo.join("refs")).expect("create refs dir");
+    std::fs::write(repo.join("refs").join("main"), [b'a'; 40]).expect("write ref");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/with-ref"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.lines().any(|l| l == "  1.00 MiB  total (1 file)"),
+        "one total line when both figures print the same, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("total on disk") && !stdout.contains("Note:"),
+        "no second line and no note, got:\n{stdout}"
+    );
+
+    let (total, listed, _) = du_repo_figures(dir.path(), "test-org/with-ref");
+    assert_eq!((total, listed), ((1 << 20) + 40, 1 << 20));
 }
 
 #[test]

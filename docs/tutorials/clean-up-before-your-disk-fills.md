@@ -15,16 +15,18 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
 2. Reproducibility: unlike the inspect tutorial, there is no revision to
    pin — the cache is machine-local. Output blocks come from three capture
    sessions on the same machine. The du / gc blocks are from 2026-10-10
-   (815 GiB, 75 repos), recaptured for v0.12.2, whose du counts bytes on
-   disk, blobs/ as well as snapshots/ (issue #16); the 2026-06-11 captures
-   they replace counted snapshot files only. The status / delete / verify /
-   path blocks are from 2026-06-11, and the partial-download blocks (status
-   PARTIAL, clean-partial, resume) from a 2026-06-12 follow-up that staged
-   an interrupted download (note 3). None of the 2026-06 blocks shows a
-   figure the fix changes: the delete preview's 276.5 KiB is what v0.12.2's
-   du reports for that repo too. The du ● marker block those sessions
-   produced was dropped rather than kept with a pre-fix size. The reader's
-   numbers WILL differ; the column shapes and legends must not.
+   (816 GiB, 75 repos), recaptured for v0.12.2, whose du counts bytes on
+   disk, everything in each repo's directory (issue #16); the 2026-06-11
+   captures they replace counted snapshot files only. The status / delete /
+   verify / path blocks are from 2026-06-11, and the partial-download
+   blocks (status PARTIAL, clean-partial, resume) from a 2026-06-12
+   follow-up that staged an interrupted download (note 3). Of the 2026-06
+   blocks, only the delete preview shows a figure v0.12.2 changes: its
+   276.5 KiB now reads 276.7 KiB, the repo's refs/ being counted. It is
+   kept rather than re-run, so that nothing is deleted or prompted on the
+   real cache. The du ● marker block those sessions produced was dropped
+   rather than kept with a pre-fix size. The reader's numbers WILL differ;
+   the column shapes and legends must not.
 3. Safety: every destructive command appears with --dry-run, or with its
    confirmation prompt visible and answered `n`. Never paste an output
    that shows an actual deletion the reader did not see previewed first.
@@ -84,10 +86,10 @@ Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
     4                 32.39 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                   87
     5                 32.26 GiB  mntss/transcoder-Llama-3.2-1B                                  17
     …
-   74                   2.3 KiB  chanind/sae-gemma-2-2b-standard                                 1
-   75                     567 B  EleutherAI/pythia-70m                                           1
+   74                   2.4 KiB  chanind/sae-gemma-2-2b-standard                                 1
+   75                     607 B  EleutherAI/pythia-70m                                           1
   ────────────────────────────────────────────────────────────────────────────────────────────────
-  815.06 GiB  total (75 repos, 932 files)
+  816.32 GiB  total (75 repos, 944 files)
   Note: a size range means that repo's cached `.gguf` files are mutually exclusive quant alternatives rather than shards of one file — you likely only need one of them (see `du <repo>` for the exact file sizes). The total above still reflects real bytes on disk across every cached file.
 ```
 
@@ -107,10 +109,10 @@ Will remove:
   …
   TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF                         1.16 GiB  6 months ago
 
-Cache: 815.06 GiB → 414.90 GiB (free 400.15 GiB)
+Cache: 816.32 GiB → 416.16 GiB (free 400.15 GiB)
 ```
 
-That preview says: everything untouched for six months, removed in one stroke, frees 400.15 GiB, about half the cache. Pick the threshold to fit your own cache: on this one, 90 days would have taken 790.40 GiB, nearly all of it, since most of it has sat idle for three months or more. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
+That preview says: everything untouched for six months, removed in one stroke, frees 400.15 GiB, about half the cache. Pick the threshold to fit your own cache: on this one, 90 days would have taken 789.77 GiB, nearly all of it, since most of it has sat idle for three months or more. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
 
 ## Seeing: the `du` family
 
@@ -153,7 +155,7 @@ hf-fm du 17
    7.12 GiB  listed above (20 files)
   14.24 GiB  total on disk
 
-  Note: blobs/ holds bytes beyond the files listed above (a second copy of each, as on Windows, or blobs that no snapshot points at).
+  Note: the repo holds more on disk than the files listed above: a second copy of each (as on Windows), blobs that no snapshot points at, or bookkeeping such as refs/ and hf-fm's header cache.
 ```
 
 The two totals differ, and not by rounding. The files as listed add up to 7.12 GiB, but the repo occupies 14.24 GiB, because each file is stored twice: as its blob in `blobs/`, and as a full copy under `snapshots/` where Linux and macOS would put a symlink. That is how hf-fm's downloads usually land on Windows, where creating a symlink needs Developer Mode or an elevated shell. The listing shows what the model is made of; `total on disk` is what deleting it frees, and it is the figure the whole-cache `du`, `cache gc` and `cache delete` all use. Where the two agree, as they do with symlinked entries on Linux and macOS, `du` prints a single `total` line.
@@ -296,7 +298,7 @@ Will remove:
 Protected by --except:
   bluelightai/clt-qwen3-1.7b-base-20k
 
-Cache: 815.06 GiB → 382.40 GiB (free 432.65 GiB)
+Cache: 816.32 GiB → 383.67 GiB (free 432.65 GiB)
 ```
 
 Two caveats worth knowing before you trust GC. "Last accessed" is approximated by the newest modification time among the repo's snapshot files — the HF cache layout does not record true access times, so a repo you *read* daily but never re-download looks old; protect it with `--except`. And repos with a partial download modified within the last hour are skipped automatically, so GC never races an `hf-fm` download running in another shell.

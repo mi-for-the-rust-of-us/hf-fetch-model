@@ -7,8 +7,12 @@
 //! `.npz` / `.pth`) normalizes into —
 //! keyed on `(repo, revision, filename, etag)`, so repeat inspection of the
 //! same remote file across invocations (the natural pattern of iterative
-//! narrowing over a handful of quant candidates) is free on the second and
-//! third call.
+//! narrowing over a handful of quant candidates) skips the header's own
+//! range requests. It is not free: every call, hit or miss, first spends
+//! the 2-request probe that reads the file's current etag, so a hit still
+//! needs the network. Saving an entry removes the ones it supersedes (see
+//! [`prune_superseded`]), so an upstream change does not leave the old one
+//! behind.
 //!
 //! Off by default: a plain remote `inspect` never touches local disk
 //! without this flag. Entries live under
@@ -134,6 +138,59 @@ impl HeaderCacheEntry {
     }
 }
 
+/// Removes the entries in `dir` that the one just saved for `(repo,
+/// revision, filename, etag)` supersedes: the same repo, revision and
+/// filename under a different etag.
+///
+/// A lookup only ever matches the file's current etag, so once the upstream
+/// file changes, the entry for its previous etag can never hit again;
+/// without this, every upstream change would leave one behind for good.
+/// Entries for other revisions are kept, so inspecting a pinned revision and
+/// `main` in turn never evicts either. Best effort on the reading side: an
+/// entry that cannot be read or parsed (another schema, a stray file) is
+/// left alone. Returns how many entries were removed.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if a superseded entry cannot be removed.
+pub async fn prune_superseded(
+    dir: &Path,
+    repo: &str,
+    revision: &str,
+    filename: &str,
+    etag: &str,
+) -> Result<usize, FetchError> {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    // EXPLICIT: an async directory stream has no iterator chain; each entry
+    // is read and parsed before deciding whether to remove it.
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let Ok(other) = serde_json::from_str::<HeaderCacheEntry>(&text) else {
+            continue;
+        };
+        if other.repo == repo
+            && other.revision == revision
+            && other.filename == filename
+            && other.etag != etag
+        {
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|e| FetchError::Io { path, source: e })?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
@@ -236,6 +293,62 @@ mod tests {
         let loaded =
             HeaderCacheEntry::load(&path, "org/model", "main", "model.gguf", "etag-1").await;
         assert!(loaded.is_none());
+    }
+
+    /// Saves an entry for `(org/model, revision, filename, etag)` at its
+    /// real cache path under `repo_dir`, returning that path.
+    async fn save_entry(
+        repo_dir: &Path,
+        revision: &str,
+        filename: &str,
+        etag: &str,
+    ) -> std::path::PathBuf {
+        let path = crate::cache_layout::header_cache_path(repo_dir, filename, etag);
+        HeaderCacheEntry::new(
+            "org/model".to_owned(),
+            revision.to_owned(),
+            filename.to_owned(),
+            etag.to_owned(),
+            sample_info(),
+        )
+        .save_atomic(&path)
+        .await
+        .expect("save");
+        path
+    }
+
+    #[tokio::test]
+    async fn prune_superseded_removes_only_the_same_file_and_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_dir = dir.path();
+        let old = save_entry(repo_dir, "main", "model.gguf", "etag-1").await;
+        let current = save_entry(repo_dir, "main", "model.gguf", "etag-2").await;
+        let pinned = save_entry(repo_dir, "v2", "model.gguf", "etag-3").await;
+        let other_file = save_entry(repo_dir, "main", "other.gguf", "etag-4").await;
+        let cache_dir = crate::cache_layout::header_cache_dir(repo_dir);
+        let stray = cache_dir.join("stray.json");
+        std::fs::write(&stray, b"not an entry").expect("write stray file");
+
+        let removed = prune_superseded(&cache_dir, "org/model", "main", "model.gguf", "etag-2")
+            .await
+            .expect("prune");
+
+        assert_eq!(removed, 1);
+        assert!(!old.exists(), "the superseded etag should be removed");
+        assert!(current.exists(), "the entry just saved should stay");
+        assert!(pinned.exists(), "another revision's entry should stay");
+        assert!(other_file.exists(), "another file's entry should stay");
+        assert!(stray.exists(), "an unparseable file should be left alone");
+    }
+
+    #[tokio::test]
+    async fn prune_superseded_without_a_cache_dir_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = crate::cache_layout::header_cache_dir(dir.path());
+        let removed = prune_superseded(&cache_dir, "org/model", "main", "model.gguf", "etag-1")
+            .await
+            .expect("prune");
+        assert_eq!(removed, 0);
     }
 
     #[tokio::test]

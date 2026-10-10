@@ -299,7 +299,7 @@ Cache: /home/user/.cache/huggingface/hub
   2.02 MiB  listed above (4 files)
   2.73 GiB  total on disk
 
-  Note: blobs/ holds bytes beyond the files listed above (an unfinished download's temp files, and on Windows typically a second copy of each listed file).
+  Note: the repo holds more on disk than the files listed above: an unfinished download's temp files, and on Windows typically a second copy of each listed file.
 
   ● partial downloads — run `hf-fm status EleutherAI/pythia-1.4b` for details
 

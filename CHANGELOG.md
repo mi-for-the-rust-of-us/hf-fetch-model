@@ -309,10 +309,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listing's sum, both are shown, `123.29 MiB  listed above (3 files)` and then
   `244.94 MiB  total on disk`, followed by a one-line note saying why. The
   gap runs either way. Windows copies, an unfinished download's temp files
-  (which count on any platform), or blobs that no snapshot points at put
-  more on disk than the listing holds. Symlinked revisions sharing one blob make the listing the larger,
-  since it names the same bytes twice. The note names whichever applies.
-  Where the two agree, a single `total` line is printed, as before. A
+  (which count on any platform), blobs that no snapshot points at, or the
+  repo's bookkeeping (`refs/`, hf-fm's header cache) put more on disk than
+  the listing holds. Symlinked revisions sharing one blob make the listing
+  the larger, since it names the same bytes twice. The note names whichever
+  applies. Where the two print the same, a single `total` line is printed,
+  as before; `--json` keeps the exact figures either way. A
   quant-alternatives repo states its bytes on disk under its range, with the
   same note when they differ, and a repo holding blobs but no snapshot files
   now says how much they occupy instead of `No cached files found`. Seven new
@@ -375,6 +377,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line shapes, and a CLI test checks both cases in a rendered tree; it fails
   against the previous renderer with the dot touching the size.
 
+- **`inspect --cache-headers`'s sidecar was invisible to `du` and grew
+  without bound, and a cache hit was reported as free.** `du` counted a
+  repo's `blobs/` and `snapshots/` only, so `.hf-fm-header-cache/` (like
+  `.hf-fm-snapshot.json` and `refs/`) was never counted, and a repo that
+  held nothing but the sidecar, from inspecting a repo never downloaded, was
+  hidden from `du` altogether. `status` listed it as `0 B`, and `cache gc`
+  never evicted it, having no snapshot files to give it an age. Entries are
+  keyed by etag, so every upstream change of a file left its previous entry
+  behind for good.
+  - **`du` now counts everything in the repo's directory**, each physical
+    file once, which is exactly what `cache delete` frees. A repo holding
+    only header-cache entries is listed at its sidecar's size, which is
+    where a user finds it; this reverses v0.12.1's hiding, added when such
+    a repo showed as a phantom `0 B`. Since every repo now has a few bytes
+    no file lists (`refs/main` alone is 40), `du <repo>` shows its second
+    figure and its note only when the two print differently; `--json`
+    keeps the exact numbers. **For scripts:** `du --json` sizes grow by
+    those bytes.
+  - **Saving an entry removes the ones it supersedes**: the same file and
+    revision under another etag, which can never hit again. Entries for
+    other revisions stay, so alternating a pinned revision and `main` never
+    thrashes. A removal failure is a warning, never an error.
+  - **A hit reports its real cost.** It still makes the reader's 2-request
+    probe, which is how it reads the file's current etag; it skips the
+    header's own range requests, not the network, so it cannot work
+    offline. The `Source:` line now reads `cached header (age: 2m, 2
+    requests to check it is current)`. Measured on an isolated cache, an
+    84 MiB GGUF shard went from 30 range requests and 1.75 MiB to those 2,
+    and its entry took 29,649 bytes.
+  - The `--help` text ("free on later calls"), the FAQ and the CLI reference
+    ("skips the range requests entirely") and the module doc ("free on the
+    second and third call") said otherwise and are corrected. v0.12.1's
+    entry below said the same and is left as released.
+
+  New tests: three CLI tests on an isolated cache (everything in the
+  directory counted, a header-only repo listed, one total when the gap does
+  not print), two unit tests for pruning, and the existing `--cache-headers`
+  CLI test, rewritten to check the `du` size, the `Source:` line on a hit,
+  and that a forced miss prunes a planted superseded entry. Each fails
+  against the previous code; the pruning check also fails with only the
+  prune call disabled.
+
 - **`du`'s count columns had fixed widths, and the tree printed a blank
   line before its rule.** The flat view's `#` (3 wide) and FILES (5 wide)
   columns and `du <repo>`'s `#` (3 wide) were fixed, so a cache of 1,000 or
@@ -400,12 +444,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the very string that is printed, and PiB and EiB follow TiB, so every
   `u64` prints in at most 10 characters (`u64::MAX` is `16.00 EiB`). Only
   those boundary counts, and counts from 1000 TiB up, print differently:
-  everything else prints exactly as before.
-  The library keeps a private copy for `peek`'s messages
-  (`peek::format_bytes_approx`, deliberately not promoted to public API),
-  whose body must stay identical to `format_size`'s. It is now a verbatim
-  copy of the new body, and its cross-check test carries the same new
-  samples and the same 10-character sweep. Three new tests pin the boundary values, the units above TiB,
+  everything else prints exactly as before. The library keeps a private
+  copy for `peek`'s messages (`peek::format_bytes_approx`, deliberately not
+  promoted to public API), whose body must stay identical to
+  `format_size`'s. It is now a verbatim copy of the new body, and its
+  cross-check test carries the same new samples and the same 10-character
+  sweep. Three new tests pin the boundary values, the units above TiB,
   and the 10-character bound over every power of two and every unit's
   `999`/`1000`/`1023`/`1024` multiples with their neighbours; all three
   fail against the previous code. The pre-download disk check

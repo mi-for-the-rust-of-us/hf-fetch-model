@@ -545,8 +545,9 @@ pub struct CachedModelSummary {
     pub repo_id: String,
     /// Number of files listed across the repo's snapshots.
     pub file_count: usize,
-    /// Physical bytes this repo occupies on disk, across `blobs/` and
-    /// `snapshots/`, counting each physical file once.
+    /// Physical bytes this repo occupies on disk: every file in its
+    /// directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars),
+    /// counting each physical file once.
     ///
     /// This is what `cache delete` frees, not the sum of the snapshot's
     /// logical file sizes. Where a snapshot entry is a full copy of its blob
@@ -575,8 +576,8 @@ pub struct CachedModelSummary {
 /// Scans the entire HF cache and returns a summary for each cached model.
 ///
 /// This is a local-only operation (no API calls). It lists all `models--*`
-/// directories and, for each, counts its snapshot files and the bytes it
-/// occupies across `blobs/` and `snapshots/`.
+/// directories and, for each, counts its snapshot files and the bytes its
+/// whole directory occupies.
 ///
 /// # Errors
 ///
@@ -609,8 +610,8 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
 
         // Single walk over the repo directory for file_count/total_size/
         // last_modified and the raw filenames needed to classify `.gguf`
-        // quant alternatives. `total_size` is physical bytes across `blobs/`
-        // and `snapshots/`; `file_count` and the filenames stay the
+        // quant alternatives. `total_size` is the physical bytes of the whole
+        // repo directory; `file_count` and the filenames stay the
         // snapshot's own, which is what a user means by "N files" and what
         // `gguf_size_range` needs to see extensions on.
         let RepoFileWalk {
@@ -630,15 +631,12 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
         let has_partial = find_partial_blob_size(&crate::cache_layout::blobs_dir(&repo_dir)) > 0;
 
         // Deliberately NOT filtering out zero-byte, non-partial repos here
-        // (e.g. a repo whose directory exists solely because of an
-        // `inspect --cache-headers` sidecar, never downloaded): `cache gc`
-        // and `status` both consume this same list, and a repo invisible
-        // here would be unreachable by bulk eviction — the header-cache
-        // sidecar could grow unboundedly (new etags are never cleaned up)
-        // with no way to reclaim it short of `cache delete <repo>` by exact
-        // ID. `du`'s own summary view filters purely cosmetic zero-byte
-        // entries out at its own call site instead, leaving this shared
-        // data layer complete.
+        // (e.g. an empty repo directory): `cache gc` and `status` both
+        // consume this same list, and a repo invisible here would be
+        // unreachable by bulk eviction. `du`'s own summary view filters
+        // purely cosmetic zero-byte entries out at its own call site
+        // instead, leaving this shared data layer complete. (A repo holding
+        // only hf-fm's header cache is not zero-byte: its sidecar counts.)
         summaries.push(CachedModelSummary {
             repo_id,
             file_count,
@@ -661,7 +659,7 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
 /// (e.g., for the `cache delete` preview).
 ///
 /// The size is [`CachedModelSummary::total_size`]'s figure: every physical
-/// file under `blobs/` and `snapshots/`, counted once. That is what
+/// file in the repo's directory, counted once. That is what
 /// `cache delete`'s `remove_dir_all` goes on to free, so its preview and its
 /// `Freed ...` line agree with what leaves the disk. Before the fix for
 /// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)
@@ -987,11 +985,12 @@ struct RepoFileWalk {
     /// each size resolved through a pointer symlink to the bytes the file
     /// actually holds.
     files: Vec<CacheFileUsage>,
-    /// Distinct physical bytes the repo occupies, across `blobs/` and
-    /// `snapshots/`. Deliberately not the sum of `files`: where a snapshot
-    /// entry is a *copy* of its blob (the Windows layout) both occupy their
-    /// own bytes and both are counted, and where it is a symlink or a hard
-    /// link only the blob is.
+    /// Distinct physical bytes the repo directory holds: `blobs/`,
+    /// `snapshots/`, and everything else in it (`refs/`, hf-fm's sidecars).
+    /// Deliberately not the sum of `files`: where a snapshot entry is a
+    /// *copy* of its blob (the Windows layout) both occupy their own bytes
+    /// and both are counted, and where it is a symlink or a hard link only
+    /// the blob is.
     total_size: u64,
     /// The newest modification time across every snapshot file, if any.
     last_modified: Option<std::time::SystemTime>,
@@ -1000,7 +999,7 @@ struct RepoFileWalk {
 /// Walks one cached repo, returning its snapshot file list, its physical
 /// byte total and its newest mtime in a single pass.
 ///
-/// # Why both `blobs/` and `snapshots/`
+/// # Why `blobs/` and `snapshots/` both, and the rest
 ///
 /// The `HuggingFace` layout stores each file's bytes once, under
 /// `blobs/<etag>`, and puts a *pointer* at `snapshots/<commit>/<filename>`.
@@ -1026,8 +1025,10 @@ struct RepoFileWalk {
 ///
 /// So this walks `blobs/` first, recording each blob's identity, then
 /// `snapshots/`, where a symlink contributes no bytes of its own and a hard
-/// link to an already-counted blob contributes none either. The result is
-/// what `cache delete`'s `remove_dir_all` actually frees.
+/// link to an already-counted blob contributes none either, then every
+/// other file in the repo directory: `refs/`, and hf-fm's own sidecars
+/// (`.hf-fm-header-cache/`, `.hf-fm-snapshot.json`). The result is exactly
+/// what `cache delete`'s `remove_dir_all` frees.
 fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     let mut files: Vec<CacheFileUsage> = Vec::new();
     let mut total_size: u64 = 0;
@@ -1064,6 +1065,19 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
         }
     }
 
+    // Everything else the directory holds, so the total is what deleting
+    // it frees.
+    if let Ok(entries) = std::fs::read_dir(repo_dir) {
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            if name == "blobs" || name == "snapshots" {
+                continue;
+            }
+            walk_other_files(&entry.path(), &mut total_size, &mut seen);
+        }
+    }
+
     RepoFileWalk {
         files,
         total_size,
@@ -1096,6 +1110,36 @@ fn walk_blob_files(blobs_dir: &Path, total_size: &mut u64, seen: &mut HashSet<(u
             && !seen.insert(id)
         {
             continue;
+        }
+        *total_size = total_size.saturating_add(meta.len());
+    }
+}
+
+/// Charges a repo entry outside `blobs/` and `snapshots/` to `total_size`:
+/// a regular file directly, a directory by walking it recursively.
+///
+/// These are `refs/` and hf-fm's own sidecars, which list no model file but
+/// occupy bytes that `cache delete` frees. As in [`walk_blob_files`],
+/// symlinks are skipped rather than followed, so nothing outside the repo is
+/// charged to it, and [`physical_id`] keeps a file named twice from counting
+/// twice.
+fn walk_other_files(path: &Path, total_size: &mut u64, seen: &mut HashSet<(u64, u64)>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            walk_other_files(&entry.path(), total_size, seen);
+        }
+    } else if meta.is_file() {
+        if let Some(id) = physical_id(&meta)
+            && !seen.insert(id)
+        {
+            return;
         }
         *total_size = total_size.saturating_add(meta.len());
     }

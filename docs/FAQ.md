@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-09-16, hf-fm v0.12.1 (inspect --group-by, quants --fits, --cache-headers) -->
+<!-- Last updated: 2026-10-10, hf-fm v0.12.2 (--cache-headers: what a hit costs, pruning, counted by du) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -436,7 +436,7 @@ Pass `--cache-headers`:
 hf-fm inspect bartowski/gemma-2-2b-it-GGUF gemma-2-2b-it-Q4_K_M.gguf --cache-headers
 ```
 
-The first call parses the header normally and saves it to a `.hf-fm-header-cache/` sidecar next to the repo's usual cache directory, keyed on `(repo, revision, filename, etag)`. A second call against the same file reports `Source: cached header (age: 2m)` and skips the range requests entirely — a changed etag (the upstream file was updated) is a cache miss, not a stale hit. Off by default: a plain `inspect` never touches local disk without this flag, even against a repo you have never downloaded. Useful for the iterative-narrowing pattern `hf-fm quants` encourages — checking the same handful of candidates more than once while deciding.
+The first call parses the header normally and saves it to a `.hf-fm-header-cache/` sidecar inside the repo's cache directory, keyed on `(repo, revision, filename, etag)`. A second call against the same file reports `Source: cached header (age: 2m, 2 requests to check it is current)`. It skips the header's own range requests (28 of the 30 on the 84 MiB GGUF shard above) but still makes the reader's 2-request probe, which is how it reads the file's current etag. So it saves time and transfer, not the network: a cached header cannot be used offline. A changed etag (the upstream file was updated) is a cache miss, not a stale hit, and saving the fresh entry removes the one it supersedes, so the sidecar does not grow with every upstream change. An entry takes tens of KiB (about 29 KiB for that shard). `du` counts it like everything else in the repo's directory, so a repo you have only inspected this way shows up there at its sidecar's size, and `cache delete` removes it. Off by default: a plain `inspect` never touches local disk without this flag, even against a repo you have never downloaded. Useful for the iterative-narrowing pattern `hf-fm quants` encourages — checking the same handful of candidates more than once while deciding.
 
 ### Why didn't my pipeline catch a download failure?
 
