@@ -1609,7 +1609,7 @@ fn render_download_plan(plan: &DownloadPlan) -> Result<(), FetchError> {
         .map(|fp| fp.filename.len())
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "File".len()
+        .max(4); // floor: "File".len()
     let row_width = fw + 2 + 10 + 2 + 11;
     println!("  {:<fw$} {:>10}  Status", "File", "Size");
     println!(
@@ -2051,14 +2051,14 @@ fn run_list_families(show: &[ShowFamiliesColumn], tag: Option<&str>) -> Result<(
         .map(String::len)
         .max()
         .unwrap_or(6)
-        .max(6) // BORROW: "Family".len()
+        .max(6) // floor: "Family".len()
         + 2;
     let mw = families
         .values()
         .flat_map(|entries| entries.iter().map(|e| e.repo_id.len()))
         .max()
         .unwrap_or(6)
-        .max(6); // BORROW: "Models".len()
+        .max(6); // floor: "Models".len()
     // BORROW: explicit .as_deref() in the closure below for Option<String> → Option<&str>
     let qw = if show_quant {
         families
@@ -2070,7 +2070,7 @@ fn run_list_families(show: &[ShowFamiliesColumn], tag: Option<&str>) -> Result<(
             })
             .max()
             .unwrap_or(5)
-            .max(5) // BORROW: "Quant".len()
+            .max(5) // floor: "Quant".len()
             + 2
     } else {
         0
@@ -2132,14 +2132,14 @@ fn run_discover(limit: usize, tag: Option<&str>) -> Result<(), FetchError> {
         .map(|f| f.model_type.len())
         .max()
         .unwrap_or(6)
-        .max(6) // BORROW: "Family".len()
+        .max(6) // floor: "Family".len()
         + 2;
     let mw = discovered
         .iter()
         .map(|f| f.top_model.len())
         .max()
         .unwrap_or(9)
-        .max(9); // BORROW: "Top Model".len()
+        .max(9); // floor: "Top Model".len()
     println!("{:<fw$}Top Model", "Family");
     println!("{:-<fw$}{:-<mw$}", "", "");
     for family in &discovered {
@@ -2740,7 +2740,7 @@ fn print_quants_table(rows: &[QuantArtifactRow], fits: Option<&[FitVerdict]>) {
         .map(|r| r.artifact.len())
         .max()
         .unwrap_or(8)
-        .max(8); // BORROW: "ARTIFACT".len()
+        .max(8); // floor: "ARTIFACT".len()
 
     println!();
     if let Some(verdicts) = fits {
@@ -2776,7 +2776,7 @@ fn print_quants_table(rows: &[QuantArtifactRow], fits: Option<&[FitVerdict]>) {
             );
         }
     } else {
-        let rw = rows.iter().map(|r| r.repo.len()).max().unwrap_or(4).max(4); // BORROW: "REPO".len()
+        let rw = rows.iter().map(|r| r.repo.len()).max().unwrap_or(4).max(4); // floor: "REPO".len()
         println!(
             "  {:<aw$} {:>10}  {:<rw$}  BITS",
             "ARTIFACT", "SIZE", "REPO"
@@ -3340,7 +3340,7 @@ fn run_status_all(json: bool) -> Result<(), FetchError> {
         .map(|s| s.repo_id.len())
         .max()
         .unwrap_or(10)
-        .max(10); // BORROW: "Repository".len()
+        .max(10); // floor: "Repository".len()
     println!(
         "  {:<rw$} {:>5}  {:>10}  Status",
         "Repository", "Files", "Size"
@@ -3462,7 +3462,7 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         .iter()
         .map(|s| format_repo_size_cell(s.total_size, s.gguf_size_range))
         .collect();
-    let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // BORROW: "SIZE".len()
+    let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // floor: "SIZE".len()
 
     if age {
         println!(
@@ -3608,10 +3608,10 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
         .map(|f| f.filename.len())
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "FILE".len()
+        .max(4); // floor: "FILE".len()
     // Sized from the data, like every other hf-fm table (v0.9.6).
     let size_cells: Vec<String> = files.iter().map(|f| format_size(f.size)).collect();
-    let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // BORROW: "SIZE".len()
+    let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // floor: "SIZE".len()
     let row_width = 3 + 2 + sw + 2 + fw;
     println!("  {:>3}  {:>sw$}  FILE", "#", "SIZE");
 
@@ -7033,14 +7033,14 @@ fn run_inspect_list(
         .map(|(f, _)| f.len())
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "File".len()
+        .max(4); // floor: "File".len()
     let size_strings: Vec<String> = entries.iter().map(|(_, s)| format_size(*s)).collect();
     let size_width = size_strings
         .iter()
         .map(String::len)
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "Size".len()
+        .max(4); // floor: "Size".len()
 
     println!(
         "{:>index_width$}  {:<file_width$}  {:>size_width$}",
@@ -8218,13 +8218,13 @@ fn run_inspect_single(
         .map(|t| t.name.len())
         .max()
         .unwrap_or(6)
-        .max(6); // BORROW: "Tensor".len()
+        .max(6); // floor: "Tensor".len()
     let shape_strs: Vec<String> = info
         .tensors
         .iter()
         .map(|t| format!("{:?}", t.shape))
         .collect();
-    let sw = shape_strs.iter().map(String::len).max().unwrap_or(5).max(5); // BORROW: "Shape".len()
+    let sw = shape_strs.iter().map(String::len).max().unwrap_or(5).max(5); // floor: "Shape".len()
     let row_width = nw + 2 + 8 + sw + 2 + 10 + 2 + 10;
 
     println!();
@@ -8819,15 +8819,15 @@ fn print_multi_shard_table(
         .map(|(_, t)| t.name.len())
         .max()
         .unwrap_or(6)
-        .max(6); // BORROW: "Tensor".len()
+        .max(6); // floor: "Tensor".len()
     let shape_strs: Vec<String> = flat.iter().map(|(_, t)| format!("{:?}", t.shape)).collect();
-    let sw = shape_strs.iter().map(String::len).max().unwrap_or(5).max(5); // BORROW: "Shape".len()
+    let sw = shape_strs.iter().map(String::len).max().unwrap_or(5).max(5); // floor: "Shape".len()
     let fw = flat
         .iter()
         .map(|(file, _)| file.len())
         .max()
         .unwrap_or(5)
-        .max(5); // BORROW: "Shard".len()
+        .max(5); // floor: "Shard".len()
     let row_width = nw + 2 + 8 + 2 + sw + 2 + 10 + 2 + 10 + 2 + fw;
 
     println!();
@@ -8984,7 +8984,7 @@ where
         entry.1 = entry.1.saturating_add(t.num_elements());
         entry.2 = entry.2.saturating_add(t.byte_len());
     }
-    // BORROW: flatten nested HashMap tuple into (dtype, count, params, bytes)
+    // Flatten the nested HashMap tuple into (dtype, count, params, bytes).
     let mut rows: Vec<(&str, usize, u64, u64)> = groups
         .into_iter()
         .map(|(dtype, (count, params, bytes))| (dtype, count, params, bytes))
@@ -9036,7 +9036,7 @@ fn print_dtype_summary(
         .map(|(d, _, _, _)| d.len())
         .max()
         .unwrap_or(5)
-        .max(5); // BORROW: "Dtype".len()
+        .max(5); // floor: "Dtype".len()
     let row_width = dw + 2 + 8 + 2 + 12 + 2 + 10;
 
     println!();
@@ -9356,7 +9356,7 @@ fn print_shard_index_summary(repo_id: &str, index: &inspect::ShardedIndex, filte
         .map(String::len)
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "File".len()
+        .max(4); // floor: "File".len()
     let row_width = fw + 2 + 8;
     println!("  {:<fw$} {:>8}", "File", "Tensors");
 
@@ -9576,7 +9576,7 @@ fn print_multi_file_summary(
         .map(|(name, _)| name.len())
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "File".len()
+        .max(4); // floor: "File".len()
     let row_width = fw + 2 + 8 + 1 + 12;
     println!("  {:<fw$} {:>8} {:>12}", "File", "Tensors", "Params");
 
@@ -9738,7 +9738,7 @@ fn run_status(
         .map(|(name, _)| name.len())
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "File".len()
+        .max(4); // floor: "File".len()
     for (filename, file_status) in &status.files {
         match file_status {
             cache::FileStatus::Complete { local_size } => {
@@ -10125,7 +10125,7 @@ fn run_list_files(
         .map(|f| f.filename.len())
         .max()
         .unwrap_or(4)
-        .max(4); // BORROW: "File".len()
+        .max(4); // floor: "File".len()
 
     // Print table header.
     if no_checksum {

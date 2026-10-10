@@ -275,53 +275,72 @@ $ hf-fm quants google/gemma-2-2b-it --fits 9.5GiB
 
 ```
 $ hf-fm du
-   #        SIZE  REPO                                             FILES
-   1    5.10 GiB  google/gemma-2-2b-it                                 8
-   2    3.80 GiB  EleutherAI/pythia-1.4b                              12  ●
-   3    1.20 GiB  google/gemma-scope-2b-pt-res                         3
-  ─────────────────────────────────────────────────────────────────────────────
-  10.10 GiB  total (3 repos, 23 files)
+Cache: /home/user/.cache/huggingface/hub
+
+    #        SIZE  REPO                                             FILES
+    1    4.89 GiB  google/gemma-2-2b-it                                 8
+    2    2.73 GiB  EleutherAI/pythia-1.4b                               4  ●
+    3  360.18 MiB  google/gemma-scope-2b-pt-res                         2
+  ───────────────────────────────────────────────────────────────────────
+  7.97 GiB  total (3 repos, 14 files)
   ● = partial downloads
 
 $ hf-fm du 2
+Cache: /home/user/.cache/huggingface/hub
+
   EleutherAI/pythia-1.4b:
 
-    #        SIZE  FILE
-    1    2.50 GiB  model-00001-of-00002.safetensors
-    2  266.24 MiB  model-00002-of-00002.safetensors
-   ...
-  ─────────────────────────────────────────────────
-  2.80 GiB  listed above (12 files)
-  3.80 GiB  total on disk
+    #      SIZE  FILE
+    1  2.02 MiB  tokenizer.json
+    2     570 B  config.json
+    3     396 B  tokenizer_config.json
+    4      99 B  special_tokens_map.json
+  ──────────────────────────────────────
+  2.02 MiB  listed above (4 files)
+  2.73 GiB  total on disk
 
   Note: blobs/ holds bytes beyond the files listed above (an unfinished download's temp files, and on Windows typically a second copy of each listed file).
 
   ● partial downloads — run `hf-fm status EleutherAI/pythia-1.4b` for details
 
 $ hf-fm du --age
-   #        SIZE  REPO                                             FILES  AGE
-   1    5.10 GiB  google/gemma-2-2b-it                                 8  2 days ago
-   2    3.80 GiB  EleutherAI/pythia-1.4b                              12  45 days ago     ●
-   3    1.20 GiB  google/gemma-scope-2b-pt-res                         3  3 months ago
-  ─────────────────────────────────────────────────────────────────────────────────────────
-  10.10 GiB  total (3 repos, 23 files)
+Cache: /home/user/.cache/huggingface/hub
+
+    #        SIZE  REPO                                             FILES  AGE
+    1    4.89 GiB  google/gemma-2-2b-it                                 8  2 days ago
+    2    2.73 GiB  EleutherAI/pythia-1.4b                               4  1 month ago      ●
+    3  360.18 MiB  google/gemma-scope-2b-pt-res                         2  3 months ago
+  ────────────────────────────────────────────────────────────────────────────────────────
+  7.97 GiB  total (3 repos, 14 files)
   ● = partial downloads
 
 $ hf-fm du --tree
-  ├── google/gemma-2-2b-it          5.10 GiB  (8 files)
-  │   ├── model-00001-of-00002.safetensors  2.50 GiB
-  │   ├── model-00002-of-00002.safetensors  2.60 GiB
-  │   └── config.json                          856 B
-  ├── EleutherAI/pythia-1.4b        3.80 GiB  (12 files)  ●
-  │   └── ...
-  └── google/gemma-scope-2b-pt-res  1.20 GiB  (3 files)
-      └── ...
-  ─────────────────────────────────────────────────────────
-  10.10 GiB  total (3 repos, 23 files)
+Cache: /home/user/.cache/huggingface/hub
+
+  ├── google/gemma-2-2b-it    .  .  .  .  .  .  .  .  .  4.89 GiB  (8 files)
+  │   ├── model-00001-of-00002.safetensors               4.65 GiB
+  │   ├── model-00002-of-00002.safetensors             229.54 MiB
+  │   ├── tokenizer.json                                16.71 MiB
+  │   ├── tokenizer_config.json                          45.9 KiB
+  │   ├── model.safetensors.index.json                   23.7 KiB
+  │   ├── config.json                                       838 B
+  │   ├── special_tokens_map.json                           636 B
+  │   └── generation_config.json                            187 B
+  ├── EleutherAI/pythia-1.4b  .  .  .  .  .  .  .  .  .  2.73 GiB  (4 files)  ●
+  │   ├── tokenizer.json                                 2.02 MiB
+  │   ├── config.json                                       570 B
+  │   ├── tokenizer_config.json                             396 B
+  │   └── special_tokens_map.json                            99 B
+  └── google/gemma-scope-2b-pt-res  .  .  .  .  .  .  .360.18 MiB  (2 files)
+      ├── layer_0/width_16k/average_l0_105/params.npz  288.13 MiB
+      └── embedding/width_4k/average_l0_44/params.npz   72.04 MiB
+
+  ──────────────────────────────────────────────────────────────────────────
+  7.97 GiB  total (3 repos, 14 files)
   ● = partial downloads
 
 $ hf-fm cache path google/gemma-2-2b-it
-/home/user/.cache/huggingface/hub/models--google--gemma-2-2b-it/snapshots/abc1234
+/home/user/.cache/huggingface/hub/models--google--gemma-2-2b-it/snapshots/299a8560bedf22ed1c72a8a11e7dce4a7f9f51f8
 ```
 
 ## Library quick start
