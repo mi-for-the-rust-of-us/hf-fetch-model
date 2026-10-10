@@ -543,7 +543,7 @@ pub async fn repo_status(
 pub struct CachedModelSummary {
     /// The repository identifier (e.g., `"RWKV/RWKV7-Goose-World3-1.5B-HF"`).
     pub repo_id: String,
-    /// Number of files in the snapshot directory.
+    /// Number of files listed across the repo's snapshots.
     pub file_count: usize,
     /// Physical bytes this repo occupies on disk, across `blobs/` and
     /// `snapshots/`, counting each physical file once.
@@ -554,7 +554,8 @@ pub struct CachedModelSummary {
     /// symlink there, and for this crate's own writes whenever creating a
     /// symlink is refused), the repo holds those bytes twice, so this figure
     /// can reach double the snapshot's own size. Where the pointers are
-    /// symlinks or hard links, only the blob's bytes count. See
+    /// symlinks, or hard links on Unix, only the blob's bytes count (a hard
+    /// link on Windows is counted twice; see `physical_id`). See
     /// `walk_repo_files` for why both directories are walked.
     pub total_size: u64,
     /// Whether there are incomplete `.chunked.part` temp files.
@@ -573,7 +574,8 @@ pub struct CachedModelSummary {
 /// Scans the entire HF cache and returns a summary for each cached model.
 ///
 /// This is a local-only operation (no API calls). It lists all `models--*`
-/// directories and counts files + sizes in each snapshot.
+/// directories and, for each, counts its snapshot files and the bytes it
+/// occupies across `blobs/` and `snapshots/`.
 ///
 /// # Errors
 ///
@@ -1539,9 +1541,11 @@ mod tests {
 
     /// An interrupted chunked download leaves its temp blob and resume
     /// sidecar in `blobs/`, and both are counted at their length. The temp
-    /// blob is preallocated at the file's full size, so that is what it
-    /// occupies, and what `cache delete` or `cache clean-partial` frees. It
-    /// is not a listed file until it is renamed into place.
+    /// blob is preallocated to the file's full length. On Windows that
+    /// length is allocated, so it is what the blob occupies; on filesystems
+    /// that keep the unwritten part sparse, such as ext4, the length runs
+    /// ahead of the allocation until the download finishes. It is not a
+    /// listed file until it is renamed into place.
     #[test]
     fn walk_counts_a_partial_temp_blob_at_its_length() {
         let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);

@@ -2,7 +2,7 @@
 
 *See what the HuggingFace cache holds, decide what to keep, and reclaim the rest — with a dry-run before anything is deleted.*
 
-*~1,640 words · about 7 min read*
+*~1,650 words · about 7 min read*
 
 <!-- Last updated: 2026-10-10, hf-fm v0.12.2 -->
 
@@ -86,8 +86,8 @@ Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
     …
    74                   2.3 KiB  chanind/sae-gemma-2-2b-standard                                 1
    75                     567 B  EleutherAI/pythia-70m                                           1
-  ──────────────────────────────────────────────────────────────────────────────────────────────────────
-                815.06 GiB  total (75 repos, 932 files)
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+  815.06 GiB  total (75 repos, 932 files)
   Note: a size range means that repo's cached `.gguf` files are mutually exclusive quant alternatives rather than shards of one file — you likely only need one of them (see `du <repo>` for the exact file sizes). The total above still reflects real bytes on disk across every cached file.
 ```
 
@@ -114,7 +114,7 @@ That preview says: everything untouched for six months, removed in one stroke, f
 
 ## Seeing: the `du` family
 
-`du` is one command with progressive flags. The `#` column is not decoration: every index it prints is accepted wherever a repo ID is (`du 17`, `cache delete 17`, `cache verify 17`), so you never type `models--microsoft--Phi-3.5-mini-instruct` or even `microsoft/Phi-3.5-mini-instruct` by hand. A `●` after a row's file count flags a repo with an interrupted download, and a `● = partial downloads` line under the total explains it. Nothing in the listing above is mid-download, so neither appears there; the next section interrupts a download on purpose. While a repo carries the marker, its size includes the in-flight shards at the full size each one is preallocated to, since that is what they occupy on disk, but its file count leaves them out until they finish. `status`, below, is what shows their true progress.
+`du` is one command with progressive flags. The `#` column is not decoration: every index it prints is accepted wherever a repo ID is (`du 17`, `cache delete 17`, `cache verify 17`), so you never type `models--microsoft--Phi-3.5-mini-instruct` or even `microsoft/Phi-3.5-mini-instruct` by hand. A `●` after a row's file count flags a repo with an interrupted download, and a `● = partial downloads` line under the total explains it. Nothing in the listing above is mid-download, so neither appears there; the next section interrupts a download on purpose. While a repo carries the marker, its size includes the in-flight shards at the full size each one is preallocated to, which on Windows is what they occupy on disk, but its file count leaves them out until they finish. `status`, below, is what shows their true progress.
 
 `--age` adds the question GC will ask — *when did I last touch this?*
 
@@ -143,15 +143,15 @@ hf-fm du 17
 ```
   microsoft/Phi-3.5-mini-instruct:
 
-    #        SIZE  FILE
-    1    4.63 GiB  model-00001-of-00002.safetensors
-    2    2.49 GiB  model-00002-of-00002.safetensors
-    3    1.76 MiB  tokenizer.json
+    #       SIZE  FILE
+    1   4.63 GiB  model-00001-of-00002.safetensors
+    2   2.49 GiB  model-00002-of-00002.safetensors
+    3   1.76 MiB  tokenizer.json
     …
-   20       195 B  generation_config.json
-  ─────────────────────────────────────────────────
-    7.12 GiB  listed above (20 files)
-   14.24 GiB  total on disk
+   20      195 B  generation_config.json
+  ────────────────────────────────────────────────
+   7.12 GiB  listed above (20 files)
+  14.24 GiB  total on disk
 
   Note: blobs/ holds bytes beyond the files listed above (on Windows, typically a second copy of each).
 ```
@@ -274,7 +274,7 @@ Would remove 3 files (13.87 GiB):
   NousResearch/Meta-Llama-3.1-8B: f8b9704a…chunked.part  (4.63 GiB)
 ```
 
-The reclaimed figure is real disk: a chunked download preallocates each temp blob at its *full* size, so a half-finished 4.66 GiB shard occupies 4.66 GiB on disk even though `status` (reading the sidecar) correctly reports only the bytes truly transferred. Pass a repo ID to scope the sweep to one model (`cache clean-partial NousResearch/Meta-Llama-3.1-8B`); omit it to clean everything. Either way, heed the lesson above — a partial is resume state, so clean only the downloads you have given up on. An empty cache simply reports `No partial downloads found.`
+The reclaimed figure is real disk on Windows: a chunked download preallocates each temp blob at its *full* size, so a half-finished 4.66 GiB shard occupies 4.66 GiB on disk even though `status` (reading the sidecar) correctly reports only the bytes truly transferred. Pass a repo ID to scope the sweep to one model (`cache clean-partial NousResearch/Meta-Llama-3.1-8B`); omit it to clean everything. Either way, heed the lesson above — a partial is resume state, so clean only the downloads you have given up on. An empty cache simply reports `No partial downloads found.`
 
 **The sweep:** `cache gc` evicts by either of the two budgets you actually think in. `--older-than <DAYS>` answers *"what haven't I used lately?"* (the 30-second answer above). `--max-size <SIZE>` answers *"how much space can I spare?"* — it removes oldest-first until the cache fits the target. Both combine, and `--except` protects repos you want kept regardless of age:
 

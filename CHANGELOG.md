@@ -199,9 +199,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the total shows *physical* bytes, and on Windows those genuinely differ
   by the duplication. Both docs say so. An interrupted download's
   `.chunked.part` temp blobs, which live in `blobs/`, now count as well, at
-  the full size they are preallocated to, since that is what they occupy and
-  what `cache delete` frees. Before, they did not count at all, so a repo
-  mid-download read as its finished files alone. A dedicated test pins this.
+  the full length they are preallocated to. On Windows that length is
+  allocated (measured: extending a file to 4 GiB took 4 GiB of free space),
+  so it is what they occupy and what `cache delete` frees; on filesystems
+  that keep the unwritten part sparse, such as ext4, the figure runs ahead
+  of real usage until the download finishes. Before, they did not count at
+  all, so a repo mid-download read as its finished files alone. A dedicated
+  test pins this.
 
   Fixed alongside, from the same root cause: the per-file sizes
   `cache_repo_usage` reports are now resolved through the pointer, so on a
@@ -303,17 +307,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on disk, which is also what `du` reports). Its total is now the repo's bytes
   on disk, from `cache::repo_disk_usage`. When that differs from the
   listing's sum, both are shown, `123.29 MiB  listed above (3 files)` and then
-  `244.94 MiB  total on disk`, followed by a one-line note saying where the
-  extra bytes are (Windows copies, or an unfinished download's preallocated
-  temp files, which make the two differ on any platform); where they agree,
-  as on a symlinked cache, the output is byte-for-byte what it was. A
-  quant-alternatives repo states its bytes on disk under its range, and a repo
-  holding blobs but no snapshot files now says how much they occupy instead of
-  `No cached files found`. Five new CLI tests pin these cases on an isolated
-  cache: four portable ones, each failing against the previous code (the
-  fourth covers the note's partial-download wording), and a Unix one
-  guarding that the symlinked output is unchanged. The existing
-  `du_json_repo` test's invariant moves from `total_bytes` to `listed_bytes`.
+  `244.94 MiB  total on disk`, followed by a one-line note saying why. The
+  gap runs either way. Windows copies, or an unfinished download's temp
+  files, which count on any platform, put more on disk than the listing
+  holds. Symlinked revisions sharing one blob make the listing the larger,
+  since it names the same bytes twice. The note names whichever applies.
+  Where the two agree, a single `total` line is printed, as before. A
+  quant-alternatives repo states its bytes on disk under its range, with the
+  same note when they differ, and a repo holding blobs but no snapshot files
+  now says how much they occupy instead of `No cached files found`. Seven new
+  CLI tests pin these cases on an isolated cache: five portable ones, each
+  failing against the previous code (one covers the note's partial-download
+  wording, one pins every line of a single-total table), and two Unix ones,
+  guarding that the symlinked output keeps its single total line and that
+  two revisions sharing a blob get the right note. The existing
+  `du_json_repo` test's invariant moves from `total_bytes` to `listed_bytes`;
+  it no longer asserts that the total is at least the listing, which the
+  shared-blob case disproves.
 
   **For scripts reading `du --json`:** both repo-level figures now mean bytes
   on disk. Whole-cache `du --json`'s per-repo `size` changed with the fix
@@ -322,6 +332,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `files[].size`, survives as a new field, `listed_bytes`. No Rust API
   changed, and this makes the documented meaning true ("Output disk usage as
   JSON"), so it ships in a patch release rather than 0.13.0.
+
+- **`du`'s total line drifted right whenever a `GGUF` size range was
+  listed, and the size columns and footers of the `du` views still used
+  fixed widths.** The flat view (and `--age`) padded its `total` line to the
+  width of the SIZE column, which a `min to max` range cell widens, up to 24
+  characters (`460.74 MiB to 731.47 MiB`), so the total floated between the
+  margin and the column, aligned with neither. The total is a footer, not a
+  cell of that column, and now takes its own width. In the usual case,
+  where the total is as wide as the widest size, the output is unchanged.
+  The same pass removed the fixed widths that v0.9.6's dynamic-width
+  convention had missed in the `du` views' sizes: the tree's footer (a fixed
+  10) and `du <repo>`'s SIZE column and footer lines (a fixed 10). They only
+  padded small figures, since `format_size` fits in 10 characters except
+  around a unit boundary (`1000.00 MiB` is 11). `du <repo>`'s SIZE column is
+  now as wide as its widest cell, so its table is slightly narrower, and its
+  two footer figures align to the wider of the two. The flat view's rule
+  also ran 6 characters past its rows, from a miscounted comment, and now
+  spans them exactly, as the tree's and `du <repo>`'s rules do. Column
+  minimums are kept: the flat view's REPO column is at least 48 wide, the
+  tree's repo and size columns at least 10 and 8, and AGE at least 15 in
+  both.
+  New CLI tests pin the footer in all three whole-cache views beside a
+  range, and every line of a single-total `du <repo>` table; two existing
+  `du <repo>` tests now pin the column and two-line footer widths. `status`,
+  `cache verify`, `quants` and `inspect` still use fixed size widths, which
+  are out of this change's scope.
 
 - **`clippy::assert_is_empty`, new in Rust 1.99, failed the `-D warnings`
   gate in three places.** The lint's point is sound: `assert!(x.is_empty())`

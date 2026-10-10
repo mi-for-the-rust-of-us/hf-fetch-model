@@ -1182,8 +1182,9 @@ fn du_json_repo() {
     // Rock-solid invariant: listed_bytes == Σ files[].size (same source).
     // Before v0.12.2 this was total_bytes; total_bytes is now bytes on disk
     // (#16), which the isolated `du_repo_*` tests below pin exactly. Here, on
-    // the shared global cache, only the layout-independent bound is safe:
-    // the repo occupies at least the bytes its files hold.
+    // the shared global cache, its relation to listed_bytes depends on the
+    // layout (copies make it larger, revisions sharing a symlinked blob make
+    // it smaller), so only its presence is asserted.
     let sum: u64 = files
         .iter()
         .map(|f| f.get("size").and_then(Value::as_u64).expect("size u64"))
@@ -1198,8 +1199,8 @@ fn du_json_repo() {
         .and_then(Value::as_u64)
         .expect("total_bytes u64");
     assert!(
-        total >= sum,
-        "total_bytes (on disk) {total} must be at least listed_bytes {sum}"
+        total > 0,
+        "total_bytes (on disk) should be positive for a downloaded repo"
     );
     assert_eq!(
         v.get("file_count").and_then(Value::as_u64),
@@ -3879,6 +3880,10 @@ fn du_repo_counts_a_blob_and_its_snapshot_copy() {
         stdout.contains("(on Windows, typically a second copy of each)."),
         "with no partial download, the note points at the copies, got:\n{stdout}"
     );
+    assert!(
+        stdout.lines().any(|l| l == "    1  3.0 KiB  model.bin"),
+        "the SIZE column should be as wide as its widest cell, got:\n{stdout}"
+    );
 
     let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/dup-repo");
     assert_eq!(total, 6144, "total_bytes is bytes on disk: blob + copy");
@@ -3893,7 +3898,7 @@ fn du_repo_counts_a_blob_and_its_snapshot_copy() {
 #[test]
 fn du_repo_with_a_symlinked_pointer_keeps_its_single_total_line() {
     // The usual Unix layout: the bytes exist once, so listing and disk agree,
-    // and the output must be exactly what it was before v0.12.2.
+    // and `du <repo>` keeps its single `total` line, with no second figure.
     let dir = temp_hf_home();
     let repo = dir.path().join("hub").join("models--test-org--link-repo");
     let blobs = repo.join("blobs");
@@ -3912,7 +3917,7 @@ fn du_repo_with_a_symlinked_pointer_keeps_its_single_total_line() {
     assert!(success, "du <repo> should succeed: {stderr}");
     assert!(
         stdout.contains("3.0 KiB  total (1 file)"),
-        "one figure, in the pre-v0.12.2 form, got:\n{stdout}"
+        "one figure, in the single-total form, got:\n{stdout}"
     );
     assert!(
         !stdout.contains("total on disk"),
@@ -3923,11 +3928,59 @@ fn du_repo_with_a_symlinked_pointer_keeps_its_single_total_line() {
     assert_eq!((total, listed, whole_cache), (3072, 3072, 3072));
 }
 
+#[cfg(unix)]
+#[test]
+fn du_repo_with_two_revisions_sharing_a_blob_says_so() {
+    // Two cached revisions whose pointers are symlinks to one blob: the
+    // listing names the file twice, but its bytes are on disk once, so the
+    // listing exceeds the total, and the note must say why rather than
+    // claim that `blobs/` holds more.
+    let dir = temp_hf_home();
+    let repo = dir.path().join("hub").join("models--test-org--rev-repo");
+    let blobs = repo.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join("e1"), vec![0u8; 3072]).expect("write blob");
+    for commit in [
+        "aaaa000000000000000000000000000000000000",
+        "bbbb000000000000000000000000000000000000",
+    ] {
+        let snapshot = repo.join("snapshots").join(commit);
+        std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+        std::os::unix::fs::symlink("../../blobs/e1", snapshot.join("model.bin"))
+            .expect("symlink pointer");
+    }
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/rev-repo"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.windows(2).any(|w| w
+            == [
+                "  6.0 KiB  listed above (2 files)",
+                "  3.0 KiB  total on disk"
+            ]),
+        "both figures should be shown, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("share their bytes on disk"),
+        "the note should explain the shared blob, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("holds bytes beyond"),
+        "blobs/ does not hold more here, got:\n{stdout}"
+    );
+
+    let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/rev-repo");
+    assert_eq!((total, listed, whole_cache), (3072, 6144, 3072));
+}
+
 #[test]
 fn du_repo_with_a_partial_download_names_it_in_the_note() {
-    // An unfinished download's temp blob sits in `blobs/` at its full
-    // preallocated size on every platform, symlinked caches included, so the
-    // note must name it rather than point only at Windows copies.
+    // An unfinished download's temp blob sits in `blobs/`, counted at its
+    // full preallocated length on every platform, symlinked caches included,
+    // so the note must name it rather than point only at Windows copies.
     let dir = temp_hf_home();
     stage_blob_and_copy(
         dir.path(),
@@ -3954,6 +4007,15 @@ fn du_repo_with_a_partial_download_names_it_in_the_note() {
     assert!(
         stdout.contains("10.0 KiB  total on disk"),
         "but it is bytes on disk, got:\n{stdout}"
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.windows(2).any(|w| w
+            == [
+                "   1.0 KiB  listed above (1 file)",
+                "  10.0 KiB  total on disk"
+            ]),
+        "the two figures should right-align to the wider one, got:\n{stdout}"
     );
     assert!(
         stdout.contains("an unfinished download's temp files"),
@@ -4025,9 +4087,92 @@ fn du_repo_with_quant_alternatives_states_its_bytes_on_disk() {
         "the quant range should still be shown, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("24.0 KiB  total on disk"),
+        stdout.lines().any(|l| l == "  24.0 KiB  total on disk"),
         "the bytes on disk should be stated under the range, got:\n{stdout}"
     );
+    assert!(
+        stdout.contains("Note: blobs/ holds bytes beyond the files listed above"),
+        "the range hides the listing's sum, not the gap, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_repo_with_one_copy_of_each_file_prints_a_single_total() {
+    // A snapshot file with no blob behind it holds its bytes once, so the
+    // listing and the bytes on disk agree: one total line, no note. Every
+    // line of the table is pinned, so a fixed width would show.
+    let dir = temp_hf_home();
+    let snapshot = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--single-repo")
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    std::fs::write(snapshot.join("model.bin"), vec![0u8; 3072]).expect("write file");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/single-repo"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    // 3 (#) + 2 + 7 ("3.0 KiB") + 2 + 9 ("model.bin")
+    let rule = format!("  {}", "\u{2500}".repeat(3 + 2 + 7 + 2 + 9));
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.windows(4).any(|w| w
+            == [
+                "    #     SIZE  FILE",
+                "    1  3.0 KiB  model.bin",
+                rule.as_str(),
+                "  3.0 KiB  total (1 file)"
+            ]),
+        "header, row, rule and total should all be sized from the data, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Note:"),
+        "no note when listing and disk agree, got:\n{stdout}"
+    );
+
+    let (total, listed, whole_cache) = du_repo_figures(dir.path(), "test-org/single-repo");
+    assert_eq!((total, listed, whole_cache), (3072, 3072, 3072));
+}
+
+#[test]
+fn du_total_line_takes_its_own_width_beside_a_quant_range() {
+    // A `min to max` range cell widens the whole-cache SIZE column. The
+    // total line is a footer, not a cell of that column, so it must not be
+    // padded to the column's width; before v0.12.2 the flat view did that
+    // and the total drifted right, and the tree padded it to a fixed 10.
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--quant-dup",
+        "e1",
+        "model-Q4_K_M.gguf",
+        4096,
+    );
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--quant-dup",
+        "e2",
+        "model-Q8_0.gguf",
+        8192,
+    );
+
+    for args in [&["du"][..], &["du", "--age"], &["du", "--tree"]] {
+        let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(args));
+        assert!(success, "{args:?} should succeed: {stderr}");
+        assert!(
+            stdout.contains("4.0 KiB to 8.0 KiB"),
+            "{args:?} should show the range, got:\n{stdout}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "  24.0 KiB  total (1 repo, 2 files)"),
+            "{args:?}: the total line should start at the margin, got:\n{stdout}"
+        );
+    }
 }
 
 #[test]

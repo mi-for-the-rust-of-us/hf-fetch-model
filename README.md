@@ -286,13 +286,13 @@ $ hf-fm du
 $ hf-fm du 2
   EleutherAI/pythia-1.4b:
 
-   #        SIZE  FILE
-   1    2.50 GiB  model-00001-of-00002.safetensors
-   2    0.26 GiB  model-00002-of-00002.safetensors
+    #        SIZE  FILE
+    1    2.50 GiB  model-00001-of-00002.safetensors
+    2  266.24 MiB  model-00002-of-00002.safetensors
    ...
-  ──────────────────────────────────────────────────────────────────
-   2.80 GiB  listed above (12 files)
-   3.80 GiB  total on disk
+  ─────────────────────────────────────────────────
+  2.80 GiB  listed above (12 files)
+  3.80 GiB  total on disk
 
   Note: blobs/ holds bytes beyond the files listed above (an unfinished download's temp files, and on Windows typically a second copy of each listed file).
 

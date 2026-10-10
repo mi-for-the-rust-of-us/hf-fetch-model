@@ -3409,7 +3409,6 @@ fn resolve_du_arg(arg: &str) -> Result<String, FetchError> {
     )))
 }
 
-/// Shows disk usage summary for all cached repos, sorted by size descending.
 /// Renders one repo's size cell: the plain formatted total, or a `min to
 /// max` range when `gguf_size_range` is `Some` (the repo's `.gguf` files
 /// are mutually-exclusive quant alternatives — see
@@ -3421,6 +3420,7 @@ fn format_repo_size_cell(total_size: u64, gguf_size_range: Option<(u64, u64)>) -
     }
 }
 
+/// Shows disk usage summary for all cached repos, sorted by size descending.
 fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
 
@@ -3481,6 +3481,7 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let mut any_partial = false;
     let mut any_quant_alternatives = false;
 
+    // EXPLICIT: accumulates the footer's totals and flags while printing each row.
     for (i, (s, size_cell)) in summaries.iter().zip(size_cells.iter()).enumerate() {
         total_size = total_size.saturating_add(s.total_size);
         total_files = total_files.saturating_add(s.file_count);
@@ -3518,16 +3519,21 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         }
     }
 
-    // 3 (pad) + 2 + 3 (#) + 2 + sw (SIZE) + 2 + repo_width + 2 + 5 (FILES) = repo_width + sw + 19
-    // When --age is active, add 2 (gap) + 15 (AGE column) = 17 extra.
+    // The rule spans a row after its 2-space margin, as in the tree and
+    // `du <repo>` views: 3 (#) + 2 + sw (SIZE) + 2 + repo_width + 1 + 5
+    // (FILES) = repo_width + sw + 13, plus 2 (gap) + 15 (AGE) with --age. A
+    // trailing partial-download marker is not counted, as in the tree.
     let rule_width = if age {
-        repo_width + sw + 36
+        repo_width + sw + 30
     } else {
-        repo_width + sw + 19
+        repo_width + sw + 13
     };
     println!("  {}", "\u{2500}".repeat(rule_width));
+    // The total is a footer, not a cell of the SIZE column, so it takes its
+    // own width: borrowing `sw` let a wide `min to max` range cell push it
+    // out of place.
     println!(
-        "  {:>sw$}  total ({} {}, {} {})",
+        "  {}  total ({} {}, {} {})",
         format_size(total_size),
         summaries.len(),
         pluralize(summaries.len(), "repo", "repos"),
@@ -3556,11 +3562,14 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
 /// per-file listing is the repo's *logical* files, from
 /// [`cache::cache_repo_usage`]. The total is the bytes the repo occupies *on
 /// disk*, from [`cache::repo_disk_usage`]: every physical file under `blobs/`
-/// and `snapshots/`, counted once. That is the same figure the whole-cache
-/// `du` shows for this repo, and what `cache delete` frees. Where snapshot
-/// entries are copies of their blobs (always for files `hf-hub` writes on
-/// Windows) the repo holds the bytes twice, so the total exceeds the sum of
-/// the listing. Until v0.12.2 the total was that sum, which is how
+/// and `snapshots/`, counted once. That is the figure the whole-cache `du`
+/// sorts by and reports as this repo's `size` in `--json` (its text view
+/// shows a range instead for quant alternatives), and what `cache delete`
+/// frees. Where snapshot entries are copies of their blobs (always for files
+/// `hf-hub` writes on Windows) the repo holds the bytes twice, so the total
+/// exceeds the sum of the listing. Where they are symlinks shared by several
+/// cached revisions, it is the other way round; [`du_repo_gap_note`] says
+/// which. Until v0.12.2 the total was that sum, which is how
 /// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)'s
 /// own example printed `5.18 GiB total` for a 10.36 GiB directory.
 fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
@@ -3600,19 +3609,18 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
         .max()
         .unwrap_or(4)
         .max(4); // BORROW: "FILE".len()
-    let row_width = 3 + 2 + 10 + 2 + fw;
-    println!("  {:>3}  {:>10}  FILE", "#", "SIZE");
+    // Sized from the data, like every other hf-fm table (v0.9.6).
+    let size_cells: Vec<String> = files.iter().map(|f| format_size(f.size)).collect();
+    let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // BORROW: "SIZE".len()
+    let row_width = 3 + 2 + sw + 2 + fw;
+    println!("  {:>3}  {:>sw$}  FILE", "#", "SIZE");
 
     let mut listed_bytes: u64 = 0;
 
-    for (i, f) in files.iter().enumerate() {
+    // EXPLICIT: accumulates the listing's sum while printing each row.
+    for (i, (f, size_cell)) in files.iter().zip(&size_cells).enumerate() {
         listed_bytes = listed_bytes.saturating_add(f.size);
-        println!(
-            "  {:>3}  {:>10}  {}",
-            i + 1,
-            format_size(f.size),
-            f.filename
-        );
+        println!("  {:>3}  {:>sw$}  {}", i + 1, size_cell, f.filename);
     }
 
     println!("  {}", "\u{2500}".repeat(row_width));
@@ -3633,31 +3641,32 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
             format_size(max),
             files.len(),
         );
-        println!("  {:>10}  total on disk", format_size(disk_bytes));
+        println!("  {}  total on disk", format_size(disk_bytes));
     } else if disk_bytes == listed_bytes {
-        // The usual case wherever pointers are symlinks: one figure, and the
-        // output is byte-identical to what it was before v0.12.2.
+        // One figure, in the same footer form as the whole-cache view, at its
+        // own width: each listed file's bytes are on disk exactly once.
         println!(
-            "  {:>10}  total ({} {file_word})",
+            "  {}  total ({} {file_word})",
             format_size(listed_bytes),
             files.len(),
         );
     } else {
+        // Two figures, right-aligned to each other at the wider one's width.
+        let listed = format_size(listed_bytes);
+        let disk = format_size(disk_bytes);
+        let tw = listed.len().max(disk.len());
         println!(
-            "  {:>10}  listed above ({} {file_word})",
-            format_size(listed_bytes),
-            files.len(),
+            "  {listed:>tw$}  listed above ({} {file_word})",
+            files.len()
         );
-        println!("  {:>10}  total on disk", format_size(disk_bytes));
-        // An unfinished download's temp blobs sit in `blobs/` at their full
-        // preallocated size on every platform, so they are named first.
-        let beyond = if has_partial {
-            "an unfinished download's temp files, and on Windows typically \
-             a second copy of each listed file"
-        } else {
-            "on Windows, typically a second copy of each"
-        };
-        println!("\n  Note: blobs/ holds bytes beyond the files listed above ({beyond}).");
+        println!("  {disk:>tw$}  total on disk");
+    }
+    // Under the range too: it hides the listing's sum, not the gap.
+    if disk_bytes != listed_bytes {
+        println!(
+            "\n  Note: {}",
+            du_repo_gap_note(listed_bytes, disk_bytes, has_partial)
+        );
     }
 
     // Hint the user when this repo has partial downloads (computed above).
@@ -3666,6 +3675,28 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     }
 
     Ok(())
+}
+
+/// Says why `du <repo>`'s bytes on disk differ from its listing's sum.
+///
+/// The gap runs either way. More on disk: a snapshot entry that copies its
+/// blob holds the bytes twice, which is how `hf-hub` writes on Windows, and
+/// an unfinished download's `.chunked.part` temp blobs count at their full
+/// length while listing nothing. Less on disk: snapshot entries that are
+/// symlinks share their blob, so a repo cached at several revisions, or
+/// holding identical files, lists the same bytes more than once.
+fn du_repo_gap_note(listed_bytes: u64, disk_bytes: u64, has_partial: bool) -> &'static str {
+    if disk_bytes < listed_bytes {
+        "some files listed above share their bytes on disk (one blob behind \
+         several cached revisions, or behind identical files)."
+    } else if has_partial {
+        "blobs/ holds bytes beyond the files listed above (an unfinished \
+         download's temp files, and on Windows typically a second copy of \
+         each listed file)."
+    } else {
+        "blobs/ holds bytes beyond the files listed above (on Windows, \
+         typically a second copy of each)."
+    }
 }
 
 /// Serializes `value` as pretty JSON to stdout.
@@ -3760,7 +3791,8 @@ struct DuRepoDetailJson {
     /// Sum of `files[].size`, the repo's logical files (new in v0.12.2).
     /// Smaller than `total_bytes` where snapshot entries are copies of their
     /// blobs rather than links to them, which is always the case for files
-    /// `hf-hub` writes on Windows.
+    /// `hf-hub` writes on Windows, and larger where symlinked entries share
+    /// one blob, as across several cached revisions.
     listed_bytes: u64,
     /// Number of files.
     file_count: usize,
@@ -3978,9 +4010,11 @@ fn dot_filler(width: usize) -> String {
 struct CacheTreeRepo {
     /// Repository identifier (e.g., `"google/gemma-2-2b-it"`).
     repo_id: String,
-    /// Total size on disk across all snapshot files, in bytes.
+    /// Bytes the repo occupies on disk, from
+    /// [`cache::CachedModelSummary::total_size`]: every physical file under
+    /// `blobs/` and `snapshots/`, counted once.
     total_size: u64,
-    /// Number of files counted in the snapshot directory.
+    /// Number of files listed across the repo's snapshots.
     file_count: usize,
     /// Whether the repo has any `.chunked.part` partial downloads.
     has_partial: bool,
@@ -4094,14 +4128,16 @@ impl CacheTreeWidths {
     /// `2 + 4 + repo + 2` and on leaf lines at `2 + 4 + 4 + file_name + 2`,
     /// so `repo = file_name + 4` keeps them flush.
     fn compute(repos: &[CacheTreeRepo], age: bool) -> Self {
-        // Floors are tuned to match the visual minimums used by the flat
-        // `du` view, so the eye picks up the same shape across both.
+        // Floors are minimum widths that keep a small cache's tree from
+        // collapsing. The tree has no header row to size them, so they are
+        // its own (the flat view's minimums are REPO 48 and SIZE 4); only
+        // AGE's 15 is shared with the flat view.
         let natural_repo = repos
             .iter()
             .map(|r| r.repo_id.len())
             .max()
             .unwrap_or(0)
-            .max(10); // floor: "Repository".len()
+            .max(10); // floor: a short repo ID's width
 
         let natural_size = repos
             .iter()
@@ -4294,8 +4330,9 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     let any_quant_alternatives = repos.iter().any(|r| r.gguf_size_range.is_some());
 
     println!("\n  {}", "\u{2500}".repeat(widths.rule_width()));
+    // A footer, as in the flat view: it takes its own width.
     println!(
-        "  {:>10}  total ({} {}, {} {})",
+        "  {}  total ({} {}, {} {})",
         format_size(total_size),
         repos.len(),
         pluralize(repos.len(), "repo", "repos"),
