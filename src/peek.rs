@@ -564,44 +564,43 @@ const fn unit_label(unit: PeekUnit) -> &'static str {
 /// `format_size` into the library API for one module's error strings.
 ///
 /// **Must stay byte-for-byte identical to `format_size`'s buckets and
-/// precision** (including the `< 1000 MiB` / `< 1000 GiB` flip thresholds,
-/// not `< 1024`, and the `.1`-vs-`.2` decimal-place split) — the same
-/// quantity should render the same way regardless of which `hf-fm`
-/// subcommand's message the user is reading. An earlier version of this
+/// precision** (the unit chosen after rounding, the `1000` flip thresholds
+/// above KiB rather than `1024`, the `.1`-vs-`.2` decimal-place split, and
+/// the units up to EiB): the same quantity should render the same way
+/// regardless of which `hf-fm` subcommand's message the user is reading. Its
+/// body is a verbatim copy of `format_size`'s. An earlier version of this
 /// function drifted (`.2` KiB precision instead of `.1`, pure-1024
 /// thresholds instead of 1000, and no `TiB` tier at all), caught by review
 /// before release; `format_bytes_approx_matches_format_size_test_cases`
 /// below cross-checks the two against the same sample values as
 /// `src/format.rs`'s own test suite so a future drift fails loudly.
 fn format_bytes_approx(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const TIB: u64 = 1024 * GIB;
+    // Each unit below EiB, with its decimals and the displayed value at
+    // which the next unit takes over.
+    const STEPS: [(&str, usize, f64); 5] = [
+        ("KiB", 1, 1024.0),
+        ("MiB", 2, 1000.0),
+        ("GiB", 2, 1000.0),
+        ("TiB", 2, 1000.0),
+        ("PiB", 2, 1000.0),
+    ];
 
-    if bytes >= 1000 * GIB {
-        // CAST: u64 → f64, precision loss acceptable; value is a display-only size scalar
-        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
-        let val = bytes as f64 / TIB as f64;
-        format!("{val:.2} TiB")
-    } else if bytes >= 1000 * MIB {
-        // CAST: u64 → f64, precision loss acceptable; value is a display-only size scalar
-        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
-        let val = bytes as f64 / GIB as f64;
-        format!("{val:.2} GiB")
-    } else if bytes >= MIB {
-        // CAST: u64 → f64, precision loss acceptable; value is a display-only size scalar
-        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
-        let val = bytes as f64 / MIB as f64;
-        format!("{val:.2} MiB")
-    } else if bytes >= KIB {
-        // CAST: u64 → f64, precision loss acceptable; value is a display-only size scalar
-        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
-        let val = bytes as f64 / KIB as f64;
-        format!("{val:.1} KiB")
-    } else {
-        format!("{bytes} B")
+    if bytes < 1024 {
+        return format!("{bytes} B");
     }
+    // CAST: u64 → f64, precision loss acceptable; value is a display-only size scalar
+    #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+    let mut val = bytes as f64 / 1024.0;
+    for (unit, decimals, next_at) in STEPS {
+        let shown = format!("{val:.decimals$}");
+        // Decided on the rounded string itself, so it cannot disagree with
+        // what is printed.
+        if !shown.parse::<f64>().is_ok_and(|v| v >= next_at) {
+            return format!("{shown} {unit}");
+        }
+        val /= 1024.0;
+    }
+    format!("{val:.2} EiB")
 }
 
 /// Sizes the transport's own safety budgets ([`MAX_RANGE_REQUESTS`],
@@ -741,6 +740,23 @@ mod tests {
         assert_eq!(format_bytes_approx(999 * gib), "999.00 GiB");
         let tib = 1024 * gib;
         assert_eq!(format_bytes_approx(tib), "1.00 TiB");
+        // `format_size`'s `unit_is_chosen_after_rounding` samples.
+        assert_eq!(format_bytes_approx(1_048_524), "1023.9 KiB");
+        assert_eq!(format_bytes_approx(1_048_525), "1.00 MiB");
+        assert_eq!(format_bytes_approx((1 << 20) - 1), "1.00 MiB");
+        assert_eq!(format_bytes_approx(1_048_570_757), "999.99 MiB");
+        assert_eq!(format_bytes_approx(1_048_570_758), "0.98 GiB");
+        assert_eq!(format_bytes_approx(1000 * (1 << 20) - 1), "0.98 GiB");
+        assert_eq!(format_bytes_approx(1_073_736_455_290), "999.99 GiB");
+        assert_eq!(format_bytes_approx(1_073_736_455_291), "0.98 TiB");
+        assert_eq!(format_bytes_approx(1000 * (1 << 30) - 1), "0.98 TiB");
+        // `format_size`'s `units_above_tib` samples.
+        assert_eq!(format_bytes_approx(1_099_506_130_217_861), "999.99 TiB");
+        assert_eq!(format_bytes_approx(1000 << 40), "0.98 PiB");
+        assert_eq!(format_bytes_approx(1 << 50), "1.00 PiB");
+        assert_eq!(format_bytes_approx(1000 << 50), "0.98 EiB");
+        assert_eq!(format_bytes_approx(1 << 60), "1.00 EiB");
+        assert_eq!(format_bytes_approx(u64::MAX), "16.00 EiB");
     }
 
     // ---------- transport_limits ----------

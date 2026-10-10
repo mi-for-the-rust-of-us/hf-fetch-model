@@ -344,8 +344,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The same pass removed the fixed widths that v0.9.6's dynamic-width
   convention had missed in the `du` views' sizes: the tree's footer (a fixed
   10) and `du <repo>`'s SIZE column and footer lines (a fixed 10). They only
-  padded small figures, since `format_size` fits in 10 characters except
-  around a unit boundary (`1000.00 MiB` is 11). `du <repo>`'s SIZE column is
+  padded small figures, since a size fits in 10 characters (always, with the
+  `format_size` fix below). `du <repo>`'s SIZE column is
   now as wide as its widest cell, so its table is slightly narrower, and its
   two footer figures align to the wider of the two. The flat view's rule
   also ran 6 characters past its rows, from a miscounted comment, and now
@@ -358,6 +358,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `du <repo>` tests now pin the column and two-line footer widths. `status`,
   `cache verify`, `quants` and `inspect` still use fixed size widths, which
   are out of this change's scope.
+
+- **A size just below a unit boundary printed as a four-digit figure in the
+  smaller unit, and sizes from 1000 TiB up had no unit to move to.** The
+  CLI's `format_size` picked the unit from the raw byte count and then
+  rounded, so 1 byte short of 1 MiB printed `1024.0 KiB`, and the counts
+  that round up to the next threshold printed `1000.00 MiB`, `1000.00 GiB`
+  or `1000.00 TiB`. That contradicted its own doc ("up to 999.99 MiB") and
+  overflowed the 10-character columns that `status`, `cache verify`,
+  `quants` and `inspect` still use. With TiB the top unit, `u64::MAX`
+  printed `16777216.00 TiB`. The unit is now chosen after rounding, decided
+  on the very string that is printed, and PiB and EiB follow TiB, so every
+  `u64` prints in at most 10 characters (`u64::MAX` is `16.00 EiB`). Only
+  those boundary counts change: everything else prints exactly as before.
+  The library keeps a private copy for `peek`'s messages
+  (`peek::format_bytes_approx`, deliberately not promoted to public API),
+  whose body must stay identical to `format_size`'s. It is now a verbatim
+  copy of the new body, and its cross-check test carries the same new
+  samples. Three new tests pin the boundary values, the units above TiB,
+  and the 10-character bound over every power of two and every unit's
+  `999`/`1000`/`1023`/`1024` multiples with their neighbours; all three
+  fail against the previous code. The pre-download disk check
+  (`Disk: 13.88 GiB to fetch, …`) prints in GiB only, by design, and is
+  unchanged.
 
 - **`clippy::assert_is_empty`, new in Rust 1.99, failed the `-D warnings`
   gate in three places.** The lint's point is sound: `assert!(x.is_empty())`
