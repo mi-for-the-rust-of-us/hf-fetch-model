@@ -2,9 +2,9 @@
 
 *See what the HuggingFace cache holds, decide what to keep, and reclaim the rest — with a dry-run before anything is deleted.*
 
-*~1,490 words · about 6 min read*
+*~1,640 words · about 7 min read*
 
-<!-- Last updated: 2026-06-12, hf-fm v0.10.5 -->
+<!-- Last updated: 2026-10-10, hf-fm v0.12.2 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -13,21 +13,24 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    the reader as "you", short paragraphs over bullet lists where prose
    works.
 2. Reproducibility: unlike the inspect tutorial, there is no revision to
-   pin — the cache is machine-local. Output blocks come from two capture
-   sessions on the same machine: the du / gc / verify / path blocks are
-   from 2026-06-11 (592 GiB, 66 repos); the partial-download blocks
-   (status PARTIAL, du ●, clean-partial, resume) are from a 2026-06-12
-   follow-up that staged an interrupted download (note 3), so they show
-   one extra repo. The reader's numbers WILL differ; the column shapes and
-   legends must not. The two sessions are deliberately not reconciled into
-   one frozen total — the narrative moves forward in time as the reader
-   downloads and interrupts a model.
+   pin — the cache is machine-local. Output blocks come from three capture
+   sessions on the same machine. The du / gc blocks are from 2026-10-10
+   (815 GiB, 75 repos), recaptured for v0.12.2, whose du counts bytes on
+   disk, blobs/ as well as snapshots/ (issue #16); the 2026-06-11 captures
+   they replace counted snapshot files only. The status / delete / verify /
+   path blocks are from 2026-06-11, and the partial-download blocks (status
+   PARTIAL, clean-partial, resume) from a 2026-06-12 follow-up that staged
+   an interrupted download (note 3). None of the 2026-06 blocks shows a
+   figure the fix changes: the delete preview's 276.5 KiB is what v0.12.2's
+   du reports for that repo too. The du ● marker block those sessions
+   produced was dropped rather than kept with a pre-fix size. The reader's
+   numbers WILL differ; the column shapes and legends must not.
 3. Safety: every destructive command appears with --dry-run, or with its
    confirmation prompt visible and answered `n`. Never paste an output
    that shows an actual deletion the reader did not see previewed first.
-   The partial-download captures (status PARTIAL rows, du ● marker,
-   clean-partial dry run, the resume run) were produced by deliberately
-   interrupting a `--preset safetensors` download of the ungated mirror
+   The partial-download captures (status PARTIAL rows, clean-partial dry
+   run, the resume run) were produced by deliberately interrupting a
+   `--preset safetensors` download of the ungated mirror
    NousResearch/Meta-Llama-3.1-8B (chosen so no license is needed to
    reproduce) and re-capturing as it resumed. The clean-partial dry run is
    framed as a counterfactual ("had you abandoned it") because in the real
@@ -74,49 +77,44 @@ hf-fm du
 ```
 Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
 
-    #        SIZE  REPO                                                        FILES
-    1  159.05 GiB  mntss/clt-gemma-2-2b-2.5M                                      53
-    2   40.62 GiB  bluelightai/clt-qwen3-1.7b-base-20k                            88
-    3   26.51 GiB  mntss/clt-gemma-2-2b-426k                                      53
-    4   23.68 GiB  bluelightai/clt-qwen3-0.6b-base-20k                            88
-    5   19.52 GiB  google/gemma-2-2b                                              37
+    #                      SIZE  REPO                                                        FILES
+    1                159.05 GiB  mntss/clt-gemma-2-2b-2.5M                                      53
+    2                 78.92 GiB  bluelightai/clt-qwen3-1.7b-base-20k                            88
+    3                 46.09 GiB  bluelightai/clt-qwen3-0.6b-base-20k                            88
+    4                 32.39 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                   87
+    5                 32.26 GiB  mntss/transcoder-Llama-3.2-1B                                  17
     …
-   65     2.3 KiB  chanind/sae-gemma-2-2b-standard                                 1
-   66       567 B  EleutherAI/pythia-70m                                           1
-  ────────────────────────────────────────────────────────────────────────────────────────
-  592.39 GiB  total (66 repos, 859 files)
+   74                   2.3 KiB  chanind/sae-gemma-2-2b-standard                                 1
+   75                     567 B  EleutherAI/pythia-70m                                           1
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────
+                815.06 GiB  total (75 repos, 932 files)
+  Note: a size range means that repo's cached `.gguf` files are mutually exclusive quant alternatives rather than shards of one file — you likely only need one of them (see `du <repo>` for the exact file sizes). The total above still reflects real bytes on disk across every cached file.
 ```
 
 ```sh
-hf-fm cache gc --older-than 90 --dry-run
+hf-fm cache gc --older-than 180 --dry-run
 ```
 
 ```
 Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
 
 Will remove:
-  Qwen/Qwen2.5-Coder-7B-Instruct         14.19 GiB  4 months ago
-  google/codegemma-7b-it                 15.92 GiB  4 months ago
-  codellama/CodeLlama-7b-hf              12.55 GiB  4 months ago
+  Qwen/Qwen2.5-Coder-7B-Instruct                                14.19 GiB  8 months ago
+  google/codegemma-7b-it                                        15.92 GiB  8 months ago
+  codellama/CodeLlama-7b-hf                                     12.55 GiB  8 months ago
   …
-  mntss/clt-gemma-2-2b-2.5M             159.05 GiB  3 months ago
-  allenai/OLMo-1B-hf                      4.39 GiB  3 months ago
+  mntss/clt-gemma-2-2b-2.5M                                    159.05 GiB  7 months ago
+  …
+  TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF                         1.16 GiB  6 months ago
 
-Cache: 592.39 GiB → 292.52 GiB (free 299.87 GiB)
+Cache: 815.06 GiB → 414.90 GiB (free 400.15 GiB)
 ```
 
-That preview says: everything untouched for 90 days, removed in one stroke, frees 299.87 GiB — half the cache. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
+That preview says: everything untouched for six months, removed in one stroke, frees 400.15 GiB, about half the cache. Pick the threshold to fit your own cache: on this one, 90 days would have taken 790.40 GiB, nearly all of it, since most of it has sat idle for three months or more. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
 
 ## Seeing: the `du` family
 
-`du` is one command with progressive flags. The `#` column is not decoration: every index it prints is accepted wherever a repo ID is — `du 23`, `cache delete 23`, `cache verify 23` — so you never type `models--microsoft--Phi-3.5-mini-instruct` or even `microsoft/Phi-3.5-mini-instruct` by hand. A `●` marker after a row flags a repo with an interrupted download. Start one, stop it, and that repo's row picks up the marker:
-
-```
-   50    1.09 GiB  NousResearch/Meta-Llama-3.1-8B                                  3  ●
-  ● = partial downloads
-```
-
-(That partial is a download we interrupt on purpose in the next section, which is why this repo is absent from the full listings above — they predate it. Its size reads as only 1.09 GiB and 3 files because `du` counts *finalized* files; the in-flight shards still live in `blobs/` as `.chunked.part` and surface as the `●`, not as counted size. `status`, below, is what shows their true progress.)
+`du` is one command with progressive flags. The `#` column is not decoration: every index it prints is accepted wherever a repo ID is (`du 17`, `cache delete 17`, `cache verify 17`), so you never type `models--microsoft--Phi-3.5-mini-instruct` or even `microsoft/Phi-3.5-mini-instruct` by hand. A `●` after a row's file count flags a repo with an interrupted download, and a `● = partial downloads` line under the total explains it. Nothing in the listing above is mid-download, so neither appears there; the next section interrupts a download on purpose. While a repo carries the marker, its size includes the in-flight shards at the full size each one is preallocated to, since that is what they occupy on disk, but its file count leaves them out until they finish. `status`, below, is what shows their true progress.
 
 `--age` adds the question GC will ask — *when did I last touch this?*
 
@@ -125,21 +123,21 @@ hf-fm du --age
 ```
 
 ```
-    #        SIZE  REPO                                                        FILES  AGE
-    1  159.05 GiB  mntss/clt-gemma-2-2b-2.5M                                      53  3 months ago
-    2   40.62 GiB  bluelightai/clt-qwen3-1.7b-base-20k                            88  19 days ago
-    3   26.51 GiB  mntss/clt-gemma-2-2b-426k                                      53  3 months ago
-    4   23.68 GiB  bluelightai/clt-qwen3-0.6b-base-20k                            88  15 days ago
-    5   19.52 GiB  google/gemma-2-2b                                              37  15 days ago
+    #                      SIZE  REPO                                                        FILES  AGE
+    1                159.05 GiB  mntss/clt-gemma-2-2b-2.5M                                      53  7 months ago
+    2                 78.92 GiB  bluelightai/clt-qwen3-1.7b-base-20k                            88  4 months ago
+    3                 46.09 GiB  bluelightai/clt-qwen3-0.6b-base-20k                            88  4 months ago
+    4                 32.39 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                   87  4 months ago
+    5                 32.26 GiB  mntss/transcoder-Llama-3.2-1B                                  17  5 months ago
     …
 ```
 
-Row 1 is the classic case this tutorial exists for: a 159 GiB sparse-crosscoder set used heavily three months ago and never since. Row 2 looks similar in size but was touched 19 days ago — an age-based sweep keeps it.
+Row 1 is the classic case this tutorial exists for: a 159 GiB set of cross-layer transcoders, fetched seven months ago and untouched since. Row 2 is half its size and three months younger, so the six-month sweep above keeps it.
 
 Drill into one repo by its index:
 
 ```sh
-hf-fm du 23
+hf-fm du 17
 ```
 
 ```
@@ -152,8 +150,13 @@ hf-fm du 23
     …
    20       195 B  generation_config.json
   ─────────────────────────────────────────────────
-    7.12 GiB  total (20 files)
+    7.12 GiB  listed above (20 files)
+   14.24 GiB  total on disk
+
+  Note: blobs/ holds bytes beyond the files listed above (on Windows, typically a second copy of each).
 ```
+
+The two totals differ, and not by rounding. The files as listed add up to 7.12 GiB, but the repo occupies 14.24 GiB, because each file is stored twice: as its blob in `blobs/`, and as a full copy under `snapshots/` where Linux and macOS would put a symlink. That is how hf-fm's downloads usually land on Windows, where creating a symlink needs Developer Mode or an elevated shell. The listing shows what the model is made of; `total on disk` is what deleting it frees, and it is the figure the whole-cache `du`, `cache gc` and `cache delete` all use. Where the two agree, as they do with symlinked entries on Linux and macOS, `du` prints a single `total` line.
 
 And `du --tree` renders the whole cache as one structural view — repos as branches, files as leaves sorted by size — which is where pathological layouts jump out (here, per-layer decoder shards stepping down from 10.97 GiB):
 
@@ -162,10 +165,10 @@ hf-fm du --tree
 ```
 
 ```
-  ├── mntss/clt-gemma-2-2b-2.5M    .  .  .  .  .  .  .  .  .  .  .  .  .159.05 GiB  (53 files)
-  │   ├── W_dec_0.safetensors                                            10.97 GiB
-  │   ├── W_dec_1.safetensors                                            10.55 GiB
-  │   ├── W_dec_2.safetensors                                            10.13 GiB
+  ├── mntss/clt-gemma-2-2b-2.5M    .  .  .  .  .  .  .  .  .  .  .  .  .              159.05 GiB  (53 files)
+  │   ├── W_dec_0.safetensors                                                          10.97 GiB
+  │   ├── W_dec_1.safetensors                                                          10.55 GiB
+  │   ├── W_dec_2.safetensors                                                          10.13 GiB
   …
 ```
 
@@ -280,14 +283,20 @@ hf-fm cache gc --max-size 400GiB --except bluelightai/clt-qwen3-1.7b-base-20k --
 ```
 
 ```
+Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
+
 Will remove:
-  Qwen/Qwen2.5-Coder-7B-Instruct   14.19 GiB  4 months ago
-  google/codegemma-7b-it           15.92 GiB  4 months ago
+  Qwen/Qwen2.5-Coder-7B-Instruct                                14.19 GiB  8 months ago
+  google/codegemma-7b-it                                        15.92 GiB  8 months ago
   …
-  mntss/clt-gemma-2-2b-2.5M       159.05 GiB  3 months ago
+  mntss/clt-gemma-2-2b-2.5M                                    159.05 GiB  7 months ago
+  …
+  mntss/transcoder-Llama-3.2-1B                                 32.26 GiB  5 months ago
 
 Protected by --except:
   bluelightai/clt-qwen3-1.7b-base-20k
+
+Cache: 815.06 GiB → 382.40 GiB (free 432.65 GiB)
 ```
 
 Two caveats worth knowing before you trust GC. "Last accessed" is approximated by the newest modification time among the repo's snapshot files — the HF cache layout does not record true access times, so a repo you *read* daily but never re-download looks old; protect it with `--except`. And repos with a partial download modified within the last hour are skipped automatically, so GC never races an `hf-fm` download running in another shell.
