@@ -26,7 +26,7 @@ hf-fetch-model   (the library; the hf-fm CLI is behind feature "cli")
          ├── reqwest 0.13    hf-fetch-model's own HTTP clients: chunked
          │                   downloads, range reads, Hub API calls
          └── hypomnesis 0.2  GPU memory for `inspect --check-gpu`
-                             (called only by the CLI)
+                             (optional: only feature "cli" builds it)
 ```
 
 ## What hf-fetch-model adds over hf-hub

@@ -15,7 +15,7 @@ default-run = "hf-fetch-model"
 [features]
 default = []
 indicatif = ["dep:indicatif"]
-cli = ["dep:clap", "dep:tracing-subscriber", "indicatif"]
+cli = ["dep:clap", "dep:tracing-subscriber", "dep:hypomnesis", "indicatif"]
 
 # docs.rs builds with default features only, and `default = []` above, so
 # without this section `progress::IndicatifProgress` (gated on `indicatif`)
@@ -53,7 +53,12 @@ hf-hub = "1.0"
 # until v0.13.0's `--check-gpu --processes`: it is Windows-only and
 # shares the `windows` crate that `dxgi` already pulls, so it costs
 # nothing here.
-hypomnesis = { version = "0.2.14", default-features = false, features = [
+#
+# Optional, enabled by `cli` only: the one caller is `src/gpu_check.rs`,
+# which only the binary compiles (`#[path]` from `src/bin/main.rs`). Library
+# consumers such as candle-mi therefore no longer build NVML / DXGI / Metal
+# bindings they never call.
+hypomnesis = { version = "0.2.14", optional = true, default-features = false, features = [
     "nvml",
     "nvidia-smi-fallback",
     "dxgi",

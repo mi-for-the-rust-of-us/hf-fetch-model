@@ -179,6 +179,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency tree all the same, because `hf-hub` → `hf-xet` → `xet-runtime`
   → `shellexpand` still requires it; the two copies share `dirs-sys` 0.5.
 
+- **`hypomnesis` is now an optional dependency, enabled by the `cli`
+  feature.** Its one caller, the `inspect --check-gpu` verdict in
+  `src/gpu_check.rs`, is compiled into the binary only, yet every library
+  build compiled `hypomnesis` and its GPU bindings too. Library consumers
+  (candle-mi builds hf-fm with `indicatif` only) no longer do: on Windows
+  that drops `hypomnesis` and `libloading` from their build. No public API
+  changes, since no library item exposed a `hypomnesis` type, and
+  `Cargo.lock` is unchanged.
+
 ### Fixed
 
 - **`du`, `status`, `cache gc` and `cache delete` all under-reported disk
