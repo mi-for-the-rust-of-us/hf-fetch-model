@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (token from `hf auth login`; --check-gpu names Metal on macOS; earlier: --cache-headers hit cost, pruning, counted by du) -->
+<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (shared blob store and .incomplete partials; token from `hf auth login`; --check-gpu names Metal on macOS; earlier: --cache-headers hit cost, pruning, counted by du) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -380,11 +380,11 @@ Four views, in order of detail:
 
 ### Where does hf-fm store downloaded files? Is the layout compatible with Python `huggingface_hub`?
 
-Yes, fully compatible. hf-fm writes to `~/.cache/huggingface/hub/` by default (or `$HF_HOME/hub/` when the environment variable is set), using the same `models--<org>--<name>/` directory layout, the same `blobs/` and `snapshots/` subfolders, and the same `refs/` ref files that Python's `huggingface_hub` produces. You can download a model with Python and inspect it with hf-fm, or vice versa, without either tool noticing the other. On Windows the path is `%USERPROFILE%\.cache\huggingface\hub\`.
+Yes, fully compatible. hf-fm writes to `~/.cache/huggingface/hub/` by default (or `$HF_HOME/hub/` when the environment variable is set), using the same `models--<org>--<name>/` directory layout, the same `blobs/` and `snapshots/` subfolders, and the same `refs/` ref files that Python's `huggingface_hub` produces. You can download a model with Python and inspect it with hf-fm, or vice versa, without either tool noticing the other. On Windows the path is `%USERPROFILE%\.cache\huggingface\hub\`. Since `huggingface_hub` 1.32, the Python tools may also keep Xet files once for the whole cache, in a shared blob store at `<cache>/blobs/` that each repo's `blobs/` links into (where symlinks are available); hf-fm reads such repos and, since v0.12.2, counts that store in `du`, while writing its own downloads the classic way.
 
 ### My disk is getting full — which models are taking the most space?
 
-Run `hf-fm du` for a size-sorted summary. Each row has a `#` index you can pass back to the command to see that repo's files one level deeper (`hf-fm du 3`), and `du --age` adds a "last modified" column that is handy for spotting models you downloaded once months ago and never touched again. When you have identified what to remove, use `hf-fm cache delete <repo-id>` (repo ID or the numeric index from `du`); it prompts for confirmation unless you pass `--yes`. For bulk reclaiming — age-based or size-budget eviction with a `--dry-run` preview — the [Clean up before your disk fills](tutorials/clean-up-before-your-disk-fills.md) tutorial walks the whole `du` → `status` → `cache gc` workflow on a real 592 GiB cache.
+Run `hf-fm du` for a size-sorted summary. Each row has a `#` index you can pass back to the command to see that repo's files one level deeper (`hf-fm du 3`), and `du --age` adds a "last modified" column that is handy for spotting models you downloaded once months ago and never touched again. When you have identified what to remove, use `hf-fm cache delete <repo-id>` (repo ID or the numeric index from `du`); it prompts for confirmation unless you pass `--yes`. For bulk reclaiming — age-based or size-budget eviction with a `--dry-run` preview — the [Clean up before your disk fills](tutorials/clean-up-before-your-disk-fills.md) tutorial walks the whole `du` → `status` → `cache gc` workflow on a real 592 GiB cache. If Python tools share the cache, files in their shared blob store stay after `cache delete` or `cache gc` (both say how much); `hf cache prune` reclaims the ones no repo links to.
 
 ### What is a `.chunked.part` file, and is it safe to delete?
 

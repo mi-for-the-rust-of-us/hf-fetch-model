@@ -893,6 +893,132 @@ fn du_marks_a_repo_whose_partial_is_an_incomplete_file() {
     );
 }
 
+/// Creates a file symlink `link` → `target`, or returns `false` where the
+/// platform refuses one (Windows without Developer Mode), so a test can skip.
+/// Linux CI runs these tests in full.
+fn try_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
+/// Lays out `huggingface_hub` 1.32's shared blob store under `hub`: one
+/// 5000-byte payload at `blobs/9a/payload`, and a repo `test-org/<name>`
+/// whose `blobs/e1` links to it and whose snapshot entry links to that.
+/// Returns the repo directory, or `None` when symlinks are unavailable.
+fn repo_linking_shared_payload(hub: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let payload = hub.join("blobs").join("9a").join("payload");
+    if !payload.exists() {
+        std::fs::create_dir_all(payload.parent()?).expect("create store dir");
+        std::fs::write(&payload, vec![b'x'; 5000]).expect("write payload");
+    }
+    let repo = hub.join(format!("models--test-org--{name}"));
+    let blobs = repo.join("blobs");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    (try_symlink(
+        std::path::Path::new("../../blobs/9a/payload"),
+        &blobs.join("e1"),
+    ) && try_symlink(
+        std::path::Path::new("../../../blobs/e1"),
+        &snapshot.join("model.safetensors"),
+    ))
+    .then_some(repo)
+}
+
+#[test]
+fn du_counts_the_shared_blob_store_once_across_repos() {
+    // Two repos link the same payload in huggingface_hub's shared store.
+    // Until v0.12.2 each repo's blob symlink was skipped, so both counted 0.
+    let dir = temp_hf_home();
+    let hub = dir.path().join("hub");
+    if repo_linking_shared_payload(&hub, "a").is_none()
+        || repo_linking_shared_payload(&hub, "b").is_none()
+    {
+        eprintln!("skipped: this platform refuses symlinks");
+        return;
+    }
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    for repo in ["test-org/a", "test-org/b"] {
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.contains(repo) && l.contains("4.9 KiB")),
+            "{repo} should count the payload it links, got:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("4.9 KiB  total (2 repos"),
+        "the total should count the shared payload once, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("shared blob store"),
+        "a note should explain, got:\n{stdout}"
+    );
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--json"]));
+    assert!(success, "du --json should succeed: {stderr}");
+    let json = parse_json(&stdout);
+    let field = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+    assert_eq!(field(&json, "total_bytes"), Some(5000), "{json}");
+    assert_eq!(field(&json, "shared_store_bytes"), Some(5000), "{json}");
+    let repos = json
+        .get("repos")
+        .and_then(Value::as_array)
+        .expect("repos array");
+    assert_eq!(repos.len(), 2, "{json}");
+    for repo in repos {
+        assert_eq!(field(repo, "size"), Some(5000), "{repo}");
+        assert_eq!(field(repo, "shared_bytes"), Some(5000), "{repo}");
+    }
+}
+
+#[test]
+fn cache_delete_frees_only_what_the_repo_owns_beside_the_shared_store() {
+    let dir = temp_hf_home();
+    let hub = dir.path().join("hub");
+    let Some(repo) = repo_linking_shared_payload(&hub, "a") else {
+        eprintln!("skipped: this platform refuses symlinks");
+        return;
+    };
+    // 1000 bytes the repo holds itself.
+    std::fs::write(repo.join("blobs").join("own"), vec![0u8; 1000]).expect("write own blob");
+
+    let (stdout, stderr, success) =
+        run(hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["cache", "delete", "test-org/a", "--yes"]));
+    assert!(success, "cache delete should succeed: {stderr}");
+    assert!(
+        stdout.contains("(5.9 KiB, 1 file)"),
+        "the preview shows the repo's whole footprint, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Freed 1000 B."),
+        "only the repo's own bytes are freed, got:\n{stdout}"
+    );
+    assert!(!repo.exists(), "the repo directory is gone");
+    assert!(
+        hub.join("blobs").join("9a").join("payload").exists(),
+        "the shared payload stays for `hf cache prune`"
+    );
+}
+
 #[test]
 fn cache_gc_help_shows_flags() {
     let (stdout, stderr, success) = run(hf_fm().args(["cache", "gc", "--help"]));

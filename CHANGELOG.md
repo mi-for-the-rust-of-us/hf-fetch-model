@@ -702,6 +702,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case; two CLI tests run `clean-partial --yes` against a held lock and
   `du` against an `.incomplete`-only partial.
 
+- **`du`, `cache delete` and `cache gc` mis-measured repos in
+  `huggingface_hub`'s shared blob store.** Since `huggingface_hub` 1.32.0
+  (2026-09-17), on Linux and macOS (anywhere symlinks are available), each
+  Xet file is stored once for the whole cache at
+  `<cache>/blobs/<2 hex>/<hash>`, and a repo's own `blobs/<etag>` becomes a
+  symlink to it. This release's bytes-on-disk walk skipped every symlink in
+  `blobs/`, on the stated assumption that "a blob is always a real file":
+  - such a repo counted almost nothing in `du`, and the store, which is
+    no `models--*` directory, counted nowhere;
+  - `cache delete` announced it freed bytes it did not;
+  - `cache gc --max-size` planned with both errors.
+
+  Now:
+  - A blob symlink that resolves *into that store* is charged at its
+    payload's size, once per repo however many of its blobs link it. Any
+    other symlink is still skipped, so a crafted cache still cannot charge a
+    repo for bytes outside the cache.
+  - The part in the store is reported as the new
+    `CachedModelSummary::shared_size` (and `RepoUsage::shared_size` from the
+    new `cache::repo_usage`). Cache-wide totals count each repo's own bytes
+    plus the store once (the new `cache::shared_store_size`), so a payload
+    several repos share, or one none links to any more, is counted exactly
+    once.
+  - `du` (flat, tree and `<repo>`) explains the store in a note, and
+    `--json` gains `shared_store_bytes` and per-repo `shared_bytes`, both
+    omitted when zero; `total_bytes` counts the store once.
+  - `cache delete` reports as freed only the repo's own bytes, and says what
+    stays in the store. hf-fm never deletes shared payloads itself:
+    `huggingface_hub` guards them with locks of its own, and a payload can
+    be momentarily unlinked while a concurrent download publishes it, so
+    the note points to `hf cache prune`.
+  - `cache gc` plans its budget with the store counted once and each
+    eviction freeing only the repo's own bytes.
+
+  Verified on Linux, where four unit tests and two CLI tests build
+  `huggingface_hub`'s exact layout with relative symlinks. On Windows
+  without Developer Mode, where Python does not use the store, they skip.
+
 ### Security
 
 - **Release pipeline hardened against registry-token theft**, the root cause

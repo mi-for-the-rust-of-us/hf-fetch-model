@@ -569,16 +569,28 @@ pub struct CachedModelSummary {
     /// directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars),
     /// counting each physical file once.
     ///
-    /// This is what `cache delete` frees, not the sum of the snapshot's
-    /// logical file sizes. Where a snapshot entry is a full copy of its blob
-    /// (always for files `hf-hub` writes on Windows, which never tries a
-    /// symlink there, and for this crate's own writes whenever creating a
-    /// symlink is refused), the repo holds those bytes twice, so this figure
-    /// can reach double the snapshot's own size. Where the pointers are
-    /// symlinks, or hard links on Unix, only the blob's bytes count (a hard
-    /// link on Windows is counted twice; see `physical_id`). See
-    /// `walk_repo_files` for why both directories are walked.
+    /// It is not the sum of the snapshot's logical file sizes. Where a
+    /// snapshot entry is a full copy of its blob (always for files `hf-hub`
+    /// writes on Windows, which never tries a symlink there, and for this
+    /// crate's own writes whenever creating a symlink is refused), the repo
+    /// holds those bytes twice, so this figure can reach double the
+    /// snapshot's own size. Where the pointers are symlinks, or hard links on
+    /// Unix, only the blob's bytes count (a hard link on Windows is counted
+    /// twice; see `physical_id`). See `walk_repo_files` for why both
+    /// directories are walked.
+    ///
+    /// It includes the payloads the repo links to in `huggingface_hub`'s
+    /// shared blob store; see [`shared_size`](Self::shared_size). What
+    /// `cache delete` frees is `total_size - shared_size`.
     pub total_size: u64,
+    /// The part of [`total_size`](Self::total_size) that lives in
+    /// `huggingface_hub`'s cache-wide shared blob store (`<cache>/blobs/`,
+    /// see [`crate::cache_layout::shared_blobs_dir`]) rather than in the repo
+    /// directory: the payloads its `blobs/<etag>` symlinks point to (new in
+    /// v0.12.2). Other repos may link the same payloads, so a cache-wide total
+    /// counts the store once, through [`shared_store_size`], and deleting
+    /// this repo does not free them. `0` for a repo that links nothing there.
+    pub shared_size: u64,
     /// Whether the repo holds a partial download's temp file: this crate's
     /// `.chunked.part`, or (since v0.12.2) an `.incomplete` left by `hf-hub`
     /// or `huggingface_hub`.
@@ -650,6 +662,7 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
         let RepoFileWalk {
             files: cached_files,
             total_size,
+            shared_size,
             last_modified,
         } = walk_repo_files(&repo_dir);
         let file_count = cached_files.len();
@@ -675,6 +688,7 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
             repo_id,
             file_count,
             total_size,
+            shared_size,
             has_partial,
             partial_modified,
             last_modified,
@@ -690,26 +704,88 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
 /// Returns the snapshot file count and the physical bytes on disk for a
 /// single cached repo.
 ///
-/// Avoids scanning the entire cache when only one repo's metrics are needed
-/// (e.g., for the `cache delete` preview).
+/// Avoids scanning the entire cache when only one repo's metrics are needed.
 ///
 /// The size is [`CachedModelSummary::total_size`]'s figure: every physical
-/// file in the repo's directory, counted once. That is what
-/// `cache delete`'s `remove_dir_all` goes on to free, so its preview and its
-/// `Freed ...` line agree with what leaves the disk. Before the fix for
+/// file in the repo's directory, counted once, plus the shared-store
+/// payloads its blobs link to. Before the fix for
 /// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)
 /// this counted snapshot entries only and so under-reported every repo whose
 /// pointers are copies, and nearly all of every repo whose pointers are
-/// symlinks.
+/// symlinks. [`repo_usage`] also reports the shared part, which is what a
+/// caller needs to know what deleting the repo frees.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::Io`] if the cache directory cannot be determined.
 pub fn repo_disk_usage(repo_id: &str) -> Result<(usize, u64), FetchError> {
+    let usage = repo_usage(repo_id)?;
+    Ok((usage.file_count, usage.total_size))
+}
+
+/// One cached repo's footprint, from [`repo_usage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RepoUsage {
+    /// Number of files listed across the repo's snapshots.
+    pub file_count: usize,
+    /// Bytes on disk, as [`CachedModelSummary::total_size`] counts them.
+    pub total_size: u64,
+    /// The part of `total_size` in the shared blob store, as
+    /// [`CachedModelSummary::shared_size`] counts it. `cache delete` frees
+    /// `total_size - shared_size`.
+    pub shared_size: u64,
+}
+
+/// Returns one cached repo's file count, bytes on disk, and the part of
+/// those bytes in `huggingface_hub`'s shared blob store (new in v0.12.2).
+///
+/// The `cache delete` preview uses it: deleting a repo frees
+/// `total_size - shared_size`, its links into the store being removed but
+/// not the payloads they point to.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+pub fn repo_usage(repo_id: &str) -> Result<RepoUsage, FetchError> {
     let cache_dir = hf_cache_dir()?;
     let repo_dir = crate::cache_layout::repo_dir(&cache_dir, repo_id);
     let walk = walk_repo_files(&repo_dir);
-    Ok((walk.files.len(), walk.total_size))
+    Ok(RepoUsage {
+        file_count: walk.files.len(),
+        total_size: walk.total_size,
+        shared_size: walk.shared_size,
+    })
+}
+
+/// Bytes `huggingface_hub`'s cache-wide shared blob store occupies:
+/// every regular file under `<cache>/blobs/` (the payloads, their `.refs`
+/// manifests and lock files), each physical file once, symlinks not followed
+/// (new in v0.12.2). `0` when the cache has no store.
+///
+/// A cache-wide total counts each repo's own bytes
+/// (`total_size - shared_size`) plus this, so a payload several repos link
+/// to is counted once, and one no repo links to any more (which
+/// `hf cache prune` reclaims) is counted too.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+pub fn shared_store_size() -> Result<u64, FetchError> {
+    let cache_dir = hf_cache_dir()?;
+    Ok(dir_bytes(&crate::cache_layout::shared_blobs_dir(
+        &cache_dir,
+    )))
+}
+
+/// Bytes every regular file under `dir` occupies, each physical file once,
+/// symlinks not followed; `0` when `dir` does not exist.
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut newest: Option<std::time::SystemTime> = None;
+    walk_other_files(dir, &mut total, &mut seen, &mut newest);
+    total
 }
 
 /// Checks whether a single cached repo holds a partial download's temp
@@ -1178,8 +1254,14 @@ struct RepoFileWalk {
     /// Deliberately not the sum of `files`: where a snapshot entry is a
     /// *copy* of its blob (the Windows layout) both occupy their own bytes
     /// and both are counted, and where it is a symlink or a hard link only
-    /// the blob is.
+    /// the blob is. Includes the shared-store payloads the repo's blobs link
+    /// to; see `shared_size`.
     total_size: u64,
+    /// The part of `total_size` that lives in `huggingface_hub`'s cache-wide
+    /// shared blob store rather than in the repo directory: the payloads the
+    /// repo's `blobs/<etag>` symlinks point to (see [`walk_blob_files`]).
+    /// Deleting the repo does not free these bytes.
+    shared_size: u64,
     /// The newest modification time across every snapshot file, or, for a
     /// repo with none, across its other files (blobs, sidecars, `refs/`).
     /// `None` only when the directory holds no readable file at all.
@@ -1217,25 +1299,50 @@ struct RepoFileWalk {
 /// `snapshots/`, where a symlink contributes no bytes of its own and a hard
 /// link to an already-counted blob contributes none either, then every
 /// other file in the repo directory: `refs/`, and hf-fm's own sidecars
-/// (`.hf-fm-header-cache/`, `.hf-fm-snapshot.json`). The result is exactly
-/// what `cache delete`'s `remove_dir_all` frees.
+/// (`.hf-fm-header-cache/`, `.hf-fm-snapshot.json`). Without a shared
+/// blob store (below), the result is exactly what `cache delete`'s
+/// `remove_dir_all` frees.
+///
+/// # The shared blob store
+///
+/// Since 1.32.0, `huggingface_hub` keeps each Xet file once for the whole
+/// cache, at `<cache>/blobs/<2 hex>/<hash>`, and makes the repo's own
+/// `blobs/<etag>` a relative symlink to it (wherever symlinks are
+/// available). Skipping every symlink in `blobs/` would count such a repo at
+/// almost nothing. A blob symlink that resolves *into that store* is
+/// therefore charged at its payload's size, in `total_size` and in
+/// `shared_size`; any other symlink is still skipped, so a crafted cache
+/// cannot charge a repo for bytes outside the cache. Deleting the repo
+/// removes the links, not the payloads, which other repos may share:
+/// `total_size - shared_size` is what deleting it frees.
 fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     let mut files: Vec<CacheFileUsage> = Vec::new();
     let mut total_size: u64 = 0;
+    let mut shared_size: u64 = 0;
     let mut last_modified: Option<std::time::SystemTime> = None;
     // Identities of the physical files already charged to `total_size`.
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     // Newest mtime outside `snapshots/`: the age of a repo that has no
     // snapshot files at all.
     let mut other_modified: Option<std::time::SystemTime> = None;
+    // `huggingface_hub`'s shared blob store, a sibling of the repo directory,
+    // resolved once so each blob symlink's target can be compared with it.
+    let shared_store = repo_dir
+        .parent()
+        .map(crate::cache_layout::shared_blobs_dir)
+        .and_then(|store| std::fs::canonicalize(store).ok());
 
     // Blobs first, so a snapshot entry that hard-links to one is recognised
     // as already counted rather than charged a second time.
     walk_blob_files(
         &crate::cache_layout::blobs_dir(repo_dir),
-        &mut total_size,
-        &mut seen,
-        &mut other_modified,
+        shared_store.as_deref(),
+        &mut BlobTotals {
+            total_size: &mut total_size,
+            shared_size: &mut shared_size,
+            seen: &mut seen,
+            newest: &mut other_modified,
+        },
     );
 
     // A repo can legitimately hold blobs with no readable `snapshots/` (an
@@ -1280,6 +1387,7 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     RepoFileWalk {
         files,
         total_size,
+        shared_size,
         // A downloaded repo is aged by its snapshot files, as `cache gc`
         // documents. One with none, such as an interrupted first download or
         // a repo holding only hf-fm's header cache, would otherwise have no
@@ -1289,39 +1397,76 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     }
 }
 
-/// Charges every regular file directly under `blobs/` to `total_size`,
-/// recording each one's [`physical_id`] in `seen`.
+/// The running totals [`walk_blob_files`] adds to.
+struct BlobTotals<'a> {
+    /// The repo's bytes on disk, shared-store payloads included.
+    total_size: &'a mut u64,
+    /// The part of `total_size` that lives in the shared blob store.
+    shared_size: &'a mut u64,
+    /// Identities of the physical files already charged.
+    seen: &'a mut HashSet<(u64, u64)>,
+    /// Newest mtime seen outside `snapshots/`.
+    newest: &'a mut Option<std::time::SystemTime>,
+}
+
+/// Charges every regular file directly under `blobs/` to the repo's total,
+/// recording each one's [`physical_id`], and every blob symlink that
+/// resolves into the shared blob store (`shared_store`, canonicalised) at
+/// its payload's size, to the shared total as well.
 ///
 /// `blobs/` is flat in the `HuggingFace` layout, so this does not recurse.
-/// Symlinks are skipped rather than followed: a blob is always a real file,
-/// and following one would let a crafted cache charge this repo for bytes
-/// that live outside it.
-fn walk_blob_files(
-    blobs_dir: &Path,
-    total_size: &mut u64,
-    seen: &mut HashSet<(u64, u64)>,
-    newest: &mut Option<std::time::SystemTime>,
-) {
+/// Any other symlink is skipped rather than followed: following one would
+/// let a crafted cache charge this repo for bytes that live outside it. A
+/// payload two of the repo's blobs link to is charged once.
+fn walk_blob_files(blobs_dir: &Path, shared_store: Option<&Path>, totals: &mut BlobTotals<'_>) {
     let Ok(entries) = std::fs::read_dir(blobs_dir) else {
         return;
     };
+    // Shared payloads already charged to this repo, by resolved path:
+    // `physical_id` is unavailable on Windows, where the store can exist too.
+    let mut shared_seen: HashSet<PathBuf> = HashSet::new();
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
-        // `is_file()` on `symlink_metadata` is false for a symlink, which is
-        // what skips one here.
-        if !meta.is_file() {
+        if meta.is_file() {
+            note_newest_mtime(totals.newest, &meta);
+            if let Some(id) = physical_id(&meta)
+                && !totals.seen.insert(id)
+            {
+                continue;
+            }
+            *totals.total_size = totals.total_size.saturating_add(meta.len());
             continue;
         }
-        note_newest_mtime(newest, &meta);
-        if let Some(id) = physical_id(&meta)
-            && !seen.insert(id)
-        {
+        // Not a regular file: only a symlink into the shared store counts. A
+        // dangling link fails to resolve and is charged nothing.
+        if !meta.file_type().is_symlink() {
             continue;
         }
-        *total_size = total_size.saturating_add(meta.len());
+        let Some(store) = shared_store else { continue };
+        let Ok(target) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if !target.starts_with(store) {
+            continue;
+        }
+        let Ok(target_meta) = std::fs::metadata(&target) else {
+            continue;
+        };
+        if !target_meta.is_file() {
+            continue;
+        }
+        note_newest_mtime(totals.newest, &target_meta);
+        if let Some(id) = physical_id(&target_meta) {
+            totals.seen.insert(id);
+        }
+        if !shared_seen.insert(target) {
+            continue;
+        }
+        *totals.total_size = totals.total_size.saturating_add(target_meta.len());
+        *totals.shared_size = totals.shared_size.saturating_add(target_meta.len());
     }
 }
 
@@ -1866,6 +2011,123 @@ mod tests {
                 "{bad:?} should be refused"
             );
         }
+    }
+
+    /// Creates a file symlink `link` → `target`, or returns `false` where
+    /// the platform refuses one (Windows without Developer Mode), so a test
+    /// can skip instead of failing. Linux CI runs these tests in full.
+    fn try_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    /// `huggingface_hub` 1.32's layout for one repo whose file lives in the
+    /// shared store: `<root>/blobs/9a/<hash>` holds the bytes,
+    /// `models--org--<name>/blobs/<etag>` links to it, and the snapshot entry
+    /// links to that, all with relative targets as Python writes them.
+    /// Returns the repo directory, or `None` when symlinks are unavailable.
+    fn repo_linking_shared_payload(root: &Path, name: &str, etags: &[&str]) -> Option<PathBuf> {
+        let payload = crate::cache_layout::shared_blobs_dir(root)
+            .join("9a")
+            .join("payload");
+        if !payload.exists() {
+            std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+            std::fs::write(&payload, vec![b'x'; 5000]).unwrap();
+        }
+        let repo_dir = root.join(format!("models--org--{name}"));
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        let snap = crate::cache_layout::snapshot_dir(&repo_dir, "c0ffee");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        for (i, etag) in etags.iter().enumerate() {
+            if !try_symlink(Path::new("../../blobs/9a/payload"), &blobs.join(etag)) {
+                return None;
+            }
+            let pointer = snap.join(format!("file{i}.safetensors"));
+            if !try_symlink(&Path::new("../../blobs").join(etag), &pointer) {
+                return None;
+            }
+        }
+        Some(repo_dir)
+    }
+
+    #[test]
+    fn walk_charges_a_blob_linked_into_the_shared_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(repo_dir) = repo_linking_shared_payload(tmp.path(), "a", &["e1"]) else {
+            eprintln!("skipped: this platform refuses symlinks");
+            return;
+        };
+        let walk = walk_repo_files(&repo_dir);
+        // Until v0.12.2 the blob symlink was skipped and the repo counted 0.
+        assert_eq!(walk.total_size, 5000);
+        assert_eq!(walk.shared_size, 5000);
+        assert_eq!(walk.files.len(), 1);
+        assert_eq!(walk.files.first().map(|f| f.size), Some(5000));
+    }
+
+    #[test]
+    fn walk_charges_one_shared_payload_once_however_many_blobs_link_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(repo_dir) = repo_linking_shared_payload(tmp.path(), "a", &["e1", "e2"]) else {
+            eprintln!("skipped: this platform refuses symlinks");
+            return;
+        };
+        let walk = walk_repo_files(&repo_dir);
+        assert_eq!(walk.total_size, 5000);
+        assert_eq!(walk.shared_size, 5000);
+        assert_eq!(walk.files.len(), 2, "both files are listed at full size");
+    }
+
+    #[test]
+    fn two_repos_each_count_a_shared_payload_and_the_store_counts_it_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (Some(a), Some(b)) = (
+            repo_linking_shared_payload(tmp.path(), "a", &["e1"]),
+            repo_linking_shared_payload(tmp.path(), "b", &["e1"]),
+        ) else {
+            eprintln!("skipped: this platform refuses symlinks");
+            return;
+        };
+        assert_eq!(walk_repo_files(&a).total_size, 5000);
+        assert_eq!(walk_repo_files(&b).total_size, 5000);
+        assert_eq!(
+            dir_bytes(&crate::cache_layout::shared_blobs_dir(tmp.path())),
+            5000
+        );
+    }
+
+    #[test]
+    fn walk_still_skips_a_blob_symlink_that_leaves_the_cache_or_dangles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let foreign = outside.path().join("foreign.bin");
+        std::fs::write(&foreign, vec![b'x'; 7000]).unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        std::fs::create_dir_all(&blobs).unwrap();
+        // A store exists, but neither link points into it.
+        std::fs::create_dir_all(crate::cache_layout::shared_blobs_dir(tmp.path())).unwrap();
+        if !try_symlink(&foreign, &blobs.join("outside"))
+            || !try_symlink(Path::new("../../blobs/9a/gone"), &blobs.join("dangling"))
+        {
+            eprintln!("skipped: this platform refuses symlinks");
+            return;
+        }
+        let walk = walk_repo_files(&repo_dir);
+        assert_eq!(walk.total_size, 0, "nothing outside the cache is charged");
+        assert_eq!(walk.shared_size, 0);
     }
 
     #[test]

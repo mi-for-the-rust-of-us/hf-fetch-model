@@ -3510,6 +3510,32 @@ fn count_column_width(counts: impl Iterator<Item = usize>, floor: usize) -> usiz
         .max(floor)
 }
 
+/// The cache's bytes on disk, with `huggingface_hub`'s shared blob store
+/// counted once: each repo's own bytes (its total less what it links in the
+/// store), plus the store's own size. Summing the repo totals instead would
+/// count a payload once per repo linking to it.
+fn cache_bytes_on_disk<'a>(repos: impl Iterator<Item = (u64, u64)> + 'a, store: u64) -> u64 {
+    repos
+        .map(|(total, shared)| total.saturating_sub(shared))
+        .fold(store, u64::saturating_add)
+}
+
+/// The footer note for a cache holding `huggingface_hub`'s shared blob
+/// store, or `None` when it has none.
+fn shared_store_note(store: u64, cache_dir: &std::path::Path) -> Option<String> {
+    (store > 0).then(|| {
+        format!(
+            "  Note: {} sit in huggingface_hub's shared blob store ({}), which \
+             keeps each file once however many repos link to it. A repo's size \
+             counts the files it links there; the total counts the store once. \
+             Deleting a repo leaves them in place: `hf cache prune` reclaims \
+             what no repo links to.",
+            format_size(store),
+            hf_fetch_model::cache_layout::shared_blobs_dir(cache_dir).display()
+        )
+    })
+}
+
 /// Shows disk usage summary for all cached repos, sorted by size descending.
 fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
@@ -3525,9 +3551,10 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     // listed: `du` is where a user finds it.
     summaries.retain(|s| s.total_size > 0 || s.file_count > 0 || s.has_partial);
     summaries.sort_by_key(|s| std::cmp::Reverse(s.total_size));
+    let store = cache::shared_store_size()?;
 
     if json {
-        return print_du_json(&summaries, &cache_dir);
+        return print_du_json(&summaries, store, &cache_dir);
     }
 
     println!("Cache: {}\n", cache_dir.display());
@@ -3572,14 +3599,12 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         );
     }
 
-    let mut total_size: u64 = 0;
     let mut total_files: usize = 0;
     let mut any_partial = false;
     let mut any_quant_alternatives = false;
 
     // EXPLICIT: accumulates the footer's totals and flags while printing each row.
     for (i, (s, size_cell)) in summaries.iter().zip(size_cells.iter()).enumerate() {
-        total_size = total_size.saturating_add(s.total_size);
         total_files = total_files.saturating_add(s.file_count);
         any_quant_alternatives |= s.gguf_size_range.is_some();
 
@@ -3622,6 +3647,10 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     let row_width = iw + 2 + sw + 2 + repo_width + 1 + fw;
     let rule_width = if age { row_width + 2 + 15 } else { row_width };
     println!("  {}", "\u{2500}".repeat(rule_width));
+    let total_size = cache_bytes_on_disk(
+        summaries.iter().map(|s| (s.total_size, s.shared_size)),
+        store,
+    );
     // The total is a footer, not a cell of the SIZE column, so it takes its
     // own width: borrowing `sw` let a wide `min to max` range cell push it
     // out of place.
@@ -3644,6 +3673,9 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
              exact file sizes). The total above still reflects real bytes on \
              disk across every cached file."
         );
+    }
+    if let Some(note) = shared_store_note(store, &cache_dir) {
+        println!("{note}");
     }
 
     Ok(())
@@ -3669,10 +3701,11 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
     let files = cache::cache_repo_usage(repo_id)?;
     let has_partial = cache::repo_has_partial(repo_id)?;
-    let (_, disk_bytes) = cache::repo_disk_usage(repo_id)?;
+    let usage = cache::repo_usage(repo_id)?;
+    let disk_bytes = usage.total_size;
 
     if json {
-        return print_du_repo_json(repo_id, &files, disk_bytes, has_partial, &cache_dir);
+        return print_du_repo_json(repo_id, &files, usage, has_partial, &cache_dir);
     }
 
     println!("Cache: {}\n", cache_dir.display());
@@ -3765,6 +3798,14 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
             du_repo_gap_note(listed_bytes, disk_bytes, has_partial)
         );
     }
+    if usage.shared_size > 0 {
+        println!(
+            "\n  Note: {} of this sits in huggingface_hub's shared blob store, \
+             where other repos may link the same files. Deleting this repo \
+             does not free it; `hf cache prune` reclaims what no repo links to.",
+            format_size(usage.shared_size)
+        );
+    }
 
     // Hint the user when this repo has partial downloads (computed above).
     if has_partial {
@@ -3834,11 +3875,16 @@ struct DuFileJson {
 struct DuRepoJson {
     /// Repository identifier.
     repo_id: String,
-    /// Total size on disk in bytes.
+    /// Total size on disk in bytes, shared-store payloads it links included.
     size: u64,
+    /// The part of `size` in `huggingface_hub`'s shared blob store, which
+    /// deleting the repo does not free (new in v0.12.2). Omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_bytes: Option<u64>,
     /// Number of files listed across the repo's snapshots.
     file_count: usize,
-    /// Whether the repo has incomplete `.chunked.part` downloads.
+    /// Whether the repo holds a partial download's temp file (`.chunked.part`,
+    /// or the `.incomplete` of `hf-hub` / `huggingface_hub`).
     has_partial: bool,
     /// Most recent file mtime as Unix epoch seconds (`null` if unknown).
     last_modified: Option<u64>,
@@ -3865,12 +3911,20 @@ struct DuJson {
     cache_dir: String,
     /// Per-repo entries, sorted by size descending.
     repos: Vec<DuRepoJson>,
-    /// Total bytes across all cached repos.
+    /// Bytes on disk across the cache: each repo's own bytes, plus
+    /// `huggingface_hub`'s shared blob store counted once (see
+    /// `shared_store_bytes`).
     total_bytes: u64,
     /// Total file count across all cached repos.
     total_files: usize,
     /// Number of cached repos.
     repo_count: usize,
+    /// Bytes in `huggingface_hub`'s shared blob store (`<cache>/blobs/`),
+    /// counted once in `total_bytes` although several repos' `size` may
+    /// include the same payloads (new in v0.12.2). Omitted when the cache
+    /// has no store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_store_bytes: Option<u64>,
 }
 
 /// Top-level shape for `du <repo> --json` (per-file drill-down).
@@ -3894,9 +3948,15 @@ struct DuRepoDetailJson {
     /// `hf-hub` writes on Windows, and larger where symlinked entries share
     /// one blob, as across several cached revisions.
     listed_bytes: u64,
+    /// The part of `total_bytes` in `huggingface_hub`'s shared blob store,
+    /// which deleting the repo does not free (new in v0.12.2). Omitted when
+    /// zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_bytes: Option<u64>,
     /// Number of files.
     file_count: usize,
-    /// Whether the repo has incomplete `.chunked.part` downloads.
+    /// Whether the repo holds a partial download's temp file (`.chunked.part`,
+    /// or the `.incomplete` of `hf-hub` / `huggingface_hub`).
     has_partial: bool,
     /// `true` when this repo's `.gguf` files are mutually-exclusive quant
     /// alternatives rather than shards of one logical file (see
@@ -3913,19 +3973,19 @@ struct DuRepoDetailJson {
 /// Prints the `du` all-repos summary as JSON (flat — no per-file leaves).
 fn print_du_json(
     summaries: &[cache::CachedModelSummary],
+    store: u64,
     cache_dir: &std::path::Path,
 ) -> Result<(), FetchError> {
-    let mut total_bytes: u64 = 0;
     let mut total_files: usize = 0;
     let mut repos: Vec<DuRepoJson> = Vec::with_capacity(summaries.len());
     // EXPLICIT: accumulates totals alongside entry construction.
     for s in summaries {
-        total_bytes = total_bytes.saturating_add(s.total_size);
         total_files = total_files.saturating_add(s.file_count);
         repos.push(DuRepoJson {
             // BORROW: explicit .clone() for owned String field
             repo_id: s.repo_id.clone(),
             size: s.total_size,
+            shared_bytes: (s.shared_size > 0).then_some(s.shared_size),
             file_count: s.file_count,
             has_partial: s.has_partial,
             last_modified: system_time_to_unix(s.last_modified),
@@ -3939,9 +3999,13 @@ fn print_du_json(
         // BORROW: explicit .to_string() for Path → String
         cache_dir: cache_dir.display().to_string(),
         repo_count: repos.len(),
+        total_bytes: cache_bytes_on_disk(
+            summaries.iter().map(|s| (s.total_size, s.shared_size)),
+            store,
+        ),
         repos,
-        total_bytes,
         total_files,
+        shared_store_bytes: (store > 0).then_some(store),
     };
     emit_json(&result)
 }
@@ -3949,14 +4013,13 @@ fn print_du_json(
 /// Prints the `du --tree` view as JSON (nested — each repo carries its files).
 fn print_du_tree_json(
     repos: &[CacheTreeRepo],
+    store: u64,
     cache_dir: &std::path::Path,
 ) -> Result<(), FetchError> {
-    let mut total_bytes: u64 = 0;
     let mut total_files: usize = 0;
     let mut out: Vec<DuRepoJson> = Vec::with_capacity(repos.len());
     // EXPLICIT: accumulates totals alongside entry construction.
     for r in repos {
-        total_bytes = total_bytes.saturating_add(r.total_size);
         total_files = total_files.saturating_add(r.file_count);
         let files = r
             .files
@@ -3971,6 +4034,7 @@ fn print_du_tree_json(
             // BORROW: explicit .clone() for owned String field
             repo_id: r.repo_id.clone(),
             size: r.total_size,
+            shared_bytes: (r.shared_size > 0).then_some(r.shared_size),
             file_count: r.file_count,
             has_partial: r.has_partial,
             last_modified: system_time_to_unix(r.last_modified),
@@ -3985,8 +4049,12 @@ fn print_du_tree_json(
         cache_dir: cache_dir.display().to_string(),
         repo_count: out.len(),
         repos: out,
-        total_bytes,
+        total_bytes: cache_bytes_on_disk(
+            repos.iter().map(|r| (r.total_size, r.shared_size)),
+            store,
+        ),
         total_files,
+        shared_store_bytes: (store > 0).then_some(store),
     };
     emit_json(&result)
 }
@@ -3999,7 +4067,7 @@ fn print_du_tree_json(
 fn print_du_repo_json(
     repo_id: &str,
     files: &[cache::CacheFileUsage],
-    disk_bytes: u64,
+    usage: cache::RepoUsage,
     has_partial: bool,
     cache_dir: &std::path::Path,
 ) -> Result<(), FetchError> {
@@ -4030,8 +4098,9 @@ fn print_du_repo_json(
         repo_id: repo_id.to_owned(),
         file_count: entries.len(),
         files: entries,
-        total_bytes: disk_bytes,
+        total_bytes: usage.total_size,
         listed_bytes,
+        shared_bytes: (usage.shared_size > 0).then_some(usage.shared_size),
         has_partial,
         quant_alternatives,
         size_min,
@@ -4112,8 +4181,12 @@ struct CacheTreeRepo {
     repo_id: String,
     /// Bytes the repo occupies on disk, from
     /// [`cache::CachedModelSummary::total_size`]: every physical file in
-    /// the repo's directory, counted once.
+    /// the repo's directory, counted once, plus the shared-store payloads it
+    /// links to.
     total_size: u64,
+    /// The part of `total_size` in `huggingface_hub`'s shared blob store,
+    /// from [`cache::CachedModelSummary::shared_size`].
+    shared_size: u64,
     /// Number of files listed across the repo's snapshots.
     file_count: usize,
     /// Whether the repo has any `.chunked.part` partial downloads.
@@ -4162,6 +4235,7 @@ fn build_cache_tree() -> Result<Vec<CacheTreeRepo>, FetchError> {
         repos.push(CacheTreeRepo {
             repo_id: s.repo_id,
             total_size: s.total_size,
+            shared_size: s.shared_size,
             file_count: s.file_count,
             has_partial: s.has_partial,
             last_modified: s.last_modified,
@@ -4405,9 +4479,10 @@ fn render_file_leaves(files: &[CacheTreeFile], indent: &str, widths: &CacheTreeW
 fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
     let repos = build_cache_tree()?;
+    let store = cache::shared_store_size()?;
 
     if json {
-        return print_du_tree_json(&repos, &cache_dir);
+        return print_du_tree_json(&repos, store, &cache_dir);
     }
 
     println!("Cache: {}\n", cache_dir.display());
@@ -4420,10 +4495,8 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     let widths = CacheTreeWidths::compute(&repos, age);
     render_cache_tree(&repos, &widths, age);
 
-    let total_size: u64 = repos
-        .iter()
-        .map(|r| r.total_size)
-        .fold(0_u64, u64::saturating_add);
+    let total_size =
+        cache_bytes_on_disk(repos.iter().map(|r| (r.total_size, r.shared_size)), store);
     let total_files: usize = repos
         .iter()
         .map(|r| r.file_count)
@@ -4451,6 +4524,9 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
              file — you likely only need one of them. The total above still \
              reflects real bytes on disk across every cached file."
         );
+    }
+    if let Some(note) = shared_store_note(store, &cache_dir) {
+        println!("{note}");
     }
 
     Ok(())
@@ -4634,14 +4710,24 @@ fn run_cache_delete(repo_id: &str, yes: bool) -> Result<(), FetchError> {
     }
 
     // Get size and file count for the preview (targeted scan, not full cache).
-    let (file_count, size) = cache::repo_disk_usage(repo_id)?;
+    let usage = cache::repo_usage(repo_id)?;
+    // Removing the directory removes the repo's links into huggingface_hub's
+    // shared blob store, not the payloads they point to.
+    let freed = usage.total_size.saturating_sub(usage.shared_size);
 
     println!(
         "  {repo_id}  ({}, {} {})",
-        format_size(size),
-        file_count,
-        pluralize(file_count, "file", "files")
+        format_size(usage.total_size),
+        usage.file_count,
+        pluralize(usage.file_count, "file", "files")
     );
+    if usage.shared_size > 0 {
+        println!(
+            "  {} of it sits in huggingface_hub's shared blob store and stays \
+             there; `hf cache prune` reclaims what no repo links to.",
+            format_size(usage.shared_size)
+        );
+    }
 
     if !yes && !confirm_prompt("  Delete? [y/N]") {
         println!("  Aborted.");
@@ -4649,7 +4735,7 @@ fn run_cache_delete(repo_id: &str, yes: bool) -> Result<(), FetchError> {
     }
 
     delete_repo_dir(repo_id)?;
-    println!("  Deleted. Freed {}.", format_size(size));
+    println!("  Deleted. Freed {}.", format_size(freed));
     Ok(())
 }
 
@@ -4900,7 +4986,8 @@ const FRESH_PARTIAL_WINDOW_SECS: u64 = 60 * 60;
 struct EvictionEntry {
     /// Repository identifier (e.g., `"google/gemma-2-2b-it"`).
     repo_id: String,
-    /// Total size on disk in bytes.
+    /// Bytes deleting the repo frees: its size on disk less what it links in
+    /// `huggingface_hub`'s shared blob store (see `own_bytes`).
     size: u64,
     /// Most recent file mtime in the snapshot dir, if available.
     last_modified: Option<std::time::SystemTime>,
@@ -4911,10 +4998,16 @@ impl From<&cache::CachedModelSummary> for EvictionEntry {
         Self {
             // BORROW: explicit .clone() for owned String
             repo_id: s.repo_id.clone(),
-            size: s.total_size,
+            size: own_bytes(s),
             last_modified: s.last_modified,
         }
     }
+}
+
+/// The bytes deleting a cached repo frees: its total less what it links in
+/// `huggingface_hub`'s shared blob store, which stays on disk.
+fn own_bytes(s: &cache::CachedModelSummary) -> u64 {
+    s.total_size.saturating_sub(s.shared_size)
 }
 
 /// User-supplied gc criteria, normalised from CLI flags.
@@ -4947,8 +5040,11 @@ struct GcPlan {
     /// Total cache size after gc, in bytes (computed).
     size_after: u64,
     /// `true` when `--max-size` was requested but the budget can't be met
-    /// because protected repos exceed it.
+    /// because protected repos, or the shared blob store, exceed it.
     budget_shortfall: bool,
+    /// Bytes in `huggingface_hub`'s shared blob store, counted once in
+    /// `size_before` / `size_after`; gc never removes them.
+    shared_store: u64,
 }
 
 /// Returns the set of repo IDs from `summaries` that are older than
@@ -4996,11 +5092,15 @@ fn compute_gc_plan(
     criteria: &GcCriteria,
     now: std::time::SystemTime,
     list_kept: bool,
+    shared_store: u64,
 ) -> GcPlan {
-    let size_before: u64 = summaries
-        .iter()
-        .map(|s| s.total_size)
-        .fold(0_u64, u64::saturating_add);
+    // The shared blob store counts once, and evicting a repo frees only its
+    // own bytes (`own_bytes`): gc removes a repo's links into the store, never
+    // the payloads, which other repos may share.
+    let size_before = cache_bytes_on_disk(
+        summaries.iter().map(|s| (s.total_size, s.shared_size)),
+        shared_store,
+    );
 
     // BORROW: this function uses .as_str() throughout for HashSet lookups
     // and tuple sort keys — all owned `repo_id: String` → `&str` borrows
@@ -5049,7 +5149,7 @@ fn compute_gc_plan(
     if let Some(max_size) = criteria.max_size {
         let already_evicting: u64 = to_evict
             .iter()
-            .map(|s| s.total_size)
+            .map(|s| own_bytes(s))
             .fold(0_u64, u64::saturating_add);
         let mut remaining_after = size_before.saturating_sub(already_evicting);
         if remaining_after > max_size {
@@ -5065,7 +5165,7 @@ fn compute_gc_plan(
                     break;
                 }
                 to_evict.push(s);
-                remaining_after = remaining_after.saturating_sub(s.total_size);
+                remaining_after = remaining_after.saturating_sub(own_bytes(s));
                 split_idx = split_idx.saturating_add(1);
             }
             budget_shortfall = remaining_after > max_size;
@@ -5101,6 +5201,7 @@ fn compute_gc_plan(
         size_before,
         size_after,
         budget_shortfall,
+        shared_store,
     }
 }
 
@@ -5169,8 +5270,26 @@ fn render_gc_plan_preview(plan: &GcPlan) {
         format_size(freed)
     );
 
+    if plan.shared_store > 0 {
+        println!(
+            "Note: {} sit in huggingface_hub's shared blob store, counted once \
+             above. gc removes repos' links to it, never the files: \
+             `hf cache prune` reclaims what no repo links to.",
+            format_size(plan.shared_store)
+        );
+    }
+
     if plan.budget_shortfall {
-        eprintln!("warning: --max-size budget cannot be reached; protected repos exceed the cap");
+        if plan.shared_store > 0 {
+            eprintln!(
+                "warning: --max-size budget cannot be reached; protected repos \
+                 and the shared blob store exceed the cap"
+            );
+        } else {
+            eprintln!(
+                "warning: --max-size budget cannot be reached; protected repos exceed the cap"
+            );
+        }
     }
 }
 
@@ -5232,6 +5351,7 @@ fn run_cache_gc(
         &criteria,
         std::time::SystemTime::now(),
         list_kept,
+        cache::shared_store_size()?,
     );
 
     if !plan.skipped_partials.is_empty() {
@@ -11310,6 +11430,7 @@ mod tests {
             repo_id: repo_id.to_owned(),
             file_count: 1,
             total_size: size,
+            shared_size: 0,
             has_partial,
             // A partial is taken to be as fresh as the repo, which is how
             // these fixtures model an active download.
@@ -11404,7 +11525,7 @@ mod tests {
         ];
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         assert_eq!(plan.evict.len(), 1);
         assert_eq!(plan.evict[0].repo_id, "old/a");
         assert_eq!(plan.size_before, 3_000);
@@ -11437,7 +11558,7 @@ mod tests {
         ];
         let mut crit = empty_criteria();
         crit.max_size = Some(700); // total 1200, must drop ≥ 500.
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         // Oldest evicted first, then middle (300+400=700 freed; 1200-700=500 ≤ 700).
         assert_eq!(plan.evict.len(), 2);
         assert_eq!(plan.evict[0].repo_id, "oldest/a");
@@ -11478,7 +11599,7 @@ mod tests {
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30); // catches ancient + old.
         crit.max_size = Some(500); // after age: total 1000-200=800; need 800-500=300 more.
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         // Age step removes ancient + old (200 freed). Budget step adds midage (400)
         // → cache_after = 1000-200-400 = 400 ≤ 500.
         let evicted_ids: Vec<&str> = plan.evict.iter().map(|e| e.repo_id.as_str()).collect();
@@ -11507,7 +11628,7 @@ mod tests {
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
         crit.except = HashSet::from(["old/a".to_owned()]);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         assert_eq!(plan.evict.len(), 1);
         assert_eq!(plan.evict[0].repo_id, "old/b");
         assert_eq!(plan.protected.len(), 1);
@@ -11534,7 +11655,7 @@ mod tests {
         let mut crit = empty_criteria();
         crit.max_size = Some(500); // unreachable while huge/a is protected.
         crit.except = HashSet::from(["huge/a".to_owned()]);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         // tiny/b gets evicted; huge/a stays → cache = 1000 > 500.
         assert_eq!(plan.evict.len(), 1);
         assert!(plan.budget_shortfall);
@@ -11551,7 +11672,7 @@ mod tests {
         )];
         let mut crit = empty_criteria();
         crit.max_size = Some(0);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         assert!(plan.evict.is_empty());
         assert_eq!(plan.skipped_partials.len(), 1);
         assert!(plan.budget_shortfall);
@@ -11568,7 +11689,7 @@ mod tests {
         )];
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         assert_eq!(plan.evict.len(), 1);
         assert!(plan.skipped_partials.is_empty());
     }
@@ -11588,7 +11709,7 @@ mod tests {
         summary.partial_modified = Some(now - Duration::from_secs(60 * 5));
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
-        let plan = compute_gc_plan(&[summary], &crit, now, false);
+        let plan = compute_gc_plan(&[summary], &crit, now, false, 0);
         assert!(
             plan.evict.is_empty(),
             "an active download must not be evicted"
@@ -11608,7 +11729,7 @@ mod tests {
         ];
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         let order: Vec<&str> = plan.evict.iter().map(|e| e.repo_id.as_str()).collect();
         assert_eq!(order, vec!["aaa/first", "mmm/middle", "zzz/last"]);
     }
@@ -11627,7 +11748,7 @@ mod tests {
         ];
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
-        let plan = compute_gc_plan(&summaries, &crit, now, true);
+        let plan = compute_gc_plan(&summaries, &crit, now, true, 0);
         assert_eq!(plan.kept.len(), 1);
         assert_eq!(plan.kept[0].repo_id, "new/b");
     }
@@ -11646,7 +11767,7 @@ mod tests {
         ];
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         assert!(
             plan.kept.is_empty(),
             "kept list should be empty when list_kept=false"
@@ -11672,7 +11793,7 @@ mod tests {
         ];
         let mut crit = empty_criteria();
         crit.older_than_secs = Some(86_400 * 30);
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         assert_eq!(plan.evict.len(), 2);
         assert_eq!(plan.size_before, 100);
         assert_eq!(plan.size_after, 0);
@@ -11692,7 +11813,7 @@ mod tests {
         ];
         let mut crit = empty_criteria();
         crit.max_size = Some(500); // total 800, drop ≥ 300.
-        let plan = compute_gc_plan(&summaries, &crit, now, false);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         // unknown/b evicted first (None < Some).
         assert_eq!(plan.evict.len(), 1);
         assert_eq!(plan.evict[0].repo_id, "unknown/b");

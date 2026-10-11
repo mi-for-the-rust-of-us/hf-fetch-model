@@ -111,6 +111,18 @@ pub fn ref_path(repo_dir: &Path, revision: &str) -> PathBuf {
     refs_dir(repo_dir).join(revision)
 }
 
+/// The cache-wide shared blob store: `{cache_root}/blobs/`.
+///
+/// Not part of the `hf-hub` layout: `huggingface_hub` 1.32.0 and later keeps
+/// each Xet file once here, at `blobs/{2 hex digits}/{xet hash}`, and makes
+/// every repo's `blobs/{etag}` a relative symlink to it (wherever symlinks
+/// are available). A sibling of the `models--*` directories, never one of
+/// them.
+#[must_use]
+pub fn shared_blobs_dir(cache_root: &Path) -> PathBuf {
+    cache_root.join("blobs")
+}
+
 /// Download lock path: `{cache_root}/.locks/{repo_folder}/{etag}.lock`.
 ///
 /// `hf-hub` 1.0 and `huggingface_hub` both hold an exclusive OS lock on this
