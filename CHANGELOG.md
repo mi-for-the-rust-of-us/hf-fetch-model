@@ -677,6 +677,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns `FetchError::RepoNotFound` and `RevisionNotFound` an error naming
   the revision.
 
+- **Partial downloads by `hf-hub` and `huggingface_hub` were invisible.**
+  Both download into `blobs/<etag>.incomplete` (`huggingface_hub` 1.18 and
+  later into `blobs/<etag>.<attempt>.incomplete`), and `hf-hub` leaves the
+  file behind when a download fails or is aborted, including hf-fm's own
+  single-connection downloads, which go through it. hf-fm knew only its
+  `.chunked.part`. These files are now partials everywhere hf-fm looks:
+  - `du` marks the repo with `●`, and `status` reports the file as
+    `Partial` with the bytes downloaded so far (matched on its LFS
+    `sha256`, read in one pass per call).
+  - `cache clean-partial` removes them, skipping any whose download lock
+    (`.locks/<repo>/<etag>.lock`, held by `hf-hub` and `huggingface_hub`
+    while they write) is still held, and lists what it skipped. The new
+    `PartialFile::is_in_use` makes that check. hf-fm's own chunked
+    downloads take no such lock, so `clean-partial` still cannot tell a
+    running hf-fm download from an abandoned one.
+- **`cache gc` could evict a repo in the middle of a download.** Its guard
+  spares a repo with a partial written in the last hour, but it read the
+  repo's `last_modified`, which is the age of its snapshot files. A new
+  download into a repo whose existing files were old therefore looked
+  stale. The guard now reads the new `CachedModelSummary::partial_modified`,
+  the newest partial temp file's mtime. Unit tests cover both `.incomplete`
+  namings, the lock check (holding a real OS lock), the scan and the gc
+  case; two CLI tests run `clean-partial --yes` against a held lock and
+  `du` against an `.incomplete`-only partial.
+
 ### Security
 
 - **Release pipeline hardened against registry-token theft**, the root cause

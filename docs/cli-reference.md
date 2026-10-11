@@ -48,7 +48,7 @@ cargo install hf-fetch-model --features cli
 | `info <REPO_ID>` | Show model card metadata and README text |
 | `download-file <REPO_ID> <FILENAME>` | Download a single file (or glob pattern) and print its cache path |
 | `du [REPO_ID\|N]` | Show cache disk usage — per-repo breakdown (by name or `#` index), or cache-wide summary |
-| `cache clean-partial [REPO_ID\|N]` | Remove `.chunked.part` files from interrupted downloads |
+| `cache clean-partial [REPO_ID\|N]` | Remove interrupted downloads' temp files (`.chunked.part`, and `hf-hub` / `huggingface_hub`'s `.incomplete`) |
 | `cache delete <REPO_ID\|N>` | Delete a cached model (entire `models--org--name/` directory) |
 | `cache path <REPO_ID\|N>` | Print the snapshot directory path for scripting |
 | `cache verify <REPO_ID\|N>` | Re-verify SHA256 digests of cached files against HuggingFace LFS metadata |
@@ -429,7 +429,7 @@ hf-fm du --tree --age
 | `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,size,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,total_files,repo_count}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max`, with the same meaning as in `list-files --json`, are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down `{cache_dir,repo_id,files[{filename,size}],total_bytes,listed_bytes,file_count,has_partial,quant_alternatives,size_min,size_max}` with the same quant-range fields. A repo's `size` and `total_bytes`, and the flat view's top-level `total_bytes`, are **bytes on disk**: everything in the repo's directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars), each physical file counted once, which is what `cache delete` frees, so the flat view's `size` equals `du <REPO_ID> --json`'s `total_bytes` for the same repo. Per-file `size`, and so `size_min`/`size_max`, is each file's own size, and `listed_bytes` (since v0.12.2) is the sum of `files[].size`. It is smaller than `total_bytes` where snapshot entries are copies of their blobs, which they always are for files `hf-hub` writes on Windows, and larger where symlinked entries share one blob, as across several cached revisions. Before v0.12.2, `total_bytes` was that sum ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)). | off |
 | `--tree` | Hierarchical tree view: repos as branches, files as leaves, using box-drawing connectors. Composes with `--age` and `--json`; conflicts with the positional repo argument (the per-repo view is already covered by `du <REPO_ID>`). | off |
 
-A repo with an in-progress or interrupted download carries a `●` at the end of its row in the `du` listing, explained by a `● = partial downloads` line under the total. Its size includes the download's `.chunked.part` temp blobs at the full length they are preallocated to: on Windows that is what they occupy, while filesystems that keep the unwritten part sparse, such as ext4, allocate less until the download finishes. Run `hf-fm status <REPO_ID>` for the per-file progress.
+A repo with an in-progress or interrupted download carries a `●` at the end of its row in the `du` listing, explained by a `● = partial downloads` line under the total. Its size includes the download's temp files: hf-fm's `.chunked.part` temp blobs at the full length they are preallocated to (on Windows that is what they occupy, while filesystems that keep the unwritten part sparse, such as ext4, allocate less until the download finishes), and the `.incomplete` files of `hf-hub` / `huggingface_hub` at what they hold so far (marked since v0.12.2). Run `hf-fm status <REPO_ID>` for the per-file progress.
 
 ## Other commands
 
@@ -476,6 +476,8 @@ hf-fm cache clean-partial --yes
 ```
 
 ## Cache clean-partial flags
+
+Removes hf-fm's `.chunked.part` temp blobs with their `.state` sidecars, and since v0.12.2 the `.incomplete` files that `hf-hub` and `huggingface_hub` download into. An `.incomplete` file whose download lock (`.locks/<repo>/<etag>.lock`) is still held belongs to a running download: it is listed as skipped and left alone. hf-fm's own chunked downloads take no such lock, so make sure no `hf-fm` download is running before cleaning.
 
 | Flag | Description | Default |
 |------|-------------|---------|

@@ -111,6 +111,20 @@ pub fn ref_path(repo_dir: &Path, revision: &str) -> PathBuf {
     refs_dir(repo_dir).join(revision)
 }
 
+/// Download lock path: `{cache_root}/.locks/{repo_folder}/{etag}.lock`.
+///
+/// `hf-hub` 1.0 and `huggingface_hub` both hold an exclusive OS lock on this
+/// file while they write `blobs/{etag}.incomplete`; `cache clean-partial`
+/// tests it before removing one. This crate's own chunked downloads do not
+/// take it.
+#[must_use]
+pub fn download_lock_path(cache_root: &Path, repo_folder: &str, etag: &str) -> PathBuf {
+    // BORROW: explicit .to_owned() for &str → owned String for path concatenation
+    let mut name = etag.to_owned();
+    name.push_str(".lock");
+    cache_root.join(".locks").join(repo_folder).join(name)
+}
+
 /// Header-cache directory: `{repo_dir}/.hf-fm-header-cache/`.
 ///
 /// An `hf-fm`-private sidecar directory, not part of the standard `hf-hub`

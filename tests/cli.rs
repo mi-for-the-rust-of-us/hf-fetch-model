@@ -816,6 +816,84 @@ fn cache_clean_partial_dry_run_is_nondestructive() {
 }
 
 #[test]
+fn cache_clean_partial_removes_incomplete_files_but_not_one_still_downloading() {
+    // `hf-hub` and `huggingface_hub` download into `blobs/<etag>.incomplete`
+    // (or `<etag>.<attempt>.incomplete`) while holding an OS lock on
+    // `.locks/<repo>/<etag>.lock`. Until v0.12.2 clean-partial saw only
+    // hf-fm's own `.chunked.part`. Isolated HF_HOME, so `--yes` is safe here.
+    let dir = temp_hf_home();
+    let hub = dir.path().join("hub");
+    let blobs = hub.join("models--test-org--partials").join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join("beef.incomplete"), vec![0u8; 100]).expect("write abandoned");
+    std::fs::write(blobs.join("cafe.chunked.part"), vec![0u8; 200]).expect("write chunked");
+    std::fs::write(blobs.join("cafe.chunked.part.state"), b"{}").expect("write sidecar");
+    std::fs::write(blobs.join("dead.1a2b3c4d.incomplete"), vec![0u8; 300]).expect("write active");
+
+    // A download still running holds the lock for `dead`.
+    let locks = hub.join(".locks").join("models--test-org--partials");
+    std::fs::create_dir_all(&locks).expect("create locks dir");
+    let lock = std::fs::File::create(locks.join("dead.lock")).expect("create lock file");
+    lock.lock().expect("take the download lock");
+
+    let (stdout, stderr, success) =
+        run(hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["cache", "clean-partial", "--yes"]));
+    lock.unlock().expect("release the download lock");
+
+    assert!(success, "cache clean-partial should succeed: {stderr}");
+    assert!(
+        !blobs.join("beef.incomplete").exists(),
+        "abandoned .incomplete removed:\n{stdout}"
+    );
+    assert!(
+        !blobs.join("cafe.chunked.part").exists(),
+        "chunked part removed:\n{stdout}"
+    );
+    assert!(
+        !blobs.join("cafe.chunked.part.state").exists(),
+        "its sidecar removed:\n{stdout}"
+    );
+    assert!(
+        blobs.join("dead.1a2b3c4d.incomplete").exists(),
+        "the file a running download is writing must be kept:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Skipping 1 file still being written by a running download")
+            && stdout.contains("dead.1a2b3c4d.incomplete"),
+        "the skipped file should be named, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Removed 2 files"),
+        "two files should be removed (the sidecar is not counted), got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_marks_a_repo_whose_partial_is_an_incomplete_file() {
+    let dir = temp_hf_home();
+    let repo = dir.path().join("hub").join("models--test-org--py-partial");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    std::fs::write(snapshot.join("config.json"), b"{}").expect("write file");
+    std::fs::create_dir_all(repo.join("blobs")).expect("create blobs dir");
+    std::fs::write(repo.join("blobs").join("beef.incomplete"), vec![0u8; 64])
+        .expect("write .incomplete");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("test-org/py-partial") && l.ends_with('\u{25cf}')),
+        "the repo row should carry the partial marker, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn cache_gc_help_shows_flags() {
     let (stdout, stderr, success) = run(hf_fm().args(["cache", "gc", "--help"]));
     assert!(success, "cache gc --help failed: {stderr}");

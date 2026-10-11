@@ -388,7 +388,7 @@ Run `hf-fm du` for a size-sorted summary. Each row has a `#` index you can pass 
 
 ### What is a `.chunked.part` file, and is it safe to delete?
 
-`.chunked.part` files are temporary staging files for multi-connection downloads — hf-fm writes downloaded bytes there before renaming them into the final blob. From v0.9.8 onwards they also persist across interruptions so the next invocation can resume from them, paired with a small `.chunked.part.state` JSON sidecar that tracks per-chunk progress. They are safe to delete when you have abandoned a download for good — run `hf-fm cache clean-partial` for a prompted cleanup (add `--dry-run` to preview, `--yes` to skip confirmation); the sweep removes the partial and its sidecar together. A repo with a stale partial also shows up as a `●` marker in `hf-fm du`.
+`.chunked.part` files are temporary staging files for multi-connection downloads — hf-fm writes downloaded bytes there before renaming them into the final blob. From v0.9.8 onwards they also persist across interruptions so the next invocation can resume from them, paired with a small `.chunked.part.state` JSON sidecar that tracks per-chunk progress. They are safe to delete when you have abandoned a download for good — run `hf-fm cache clean-partial` for a prompted cleanup (add `--dry-run` to preview, `--yes` to skip confirmation); the sweep removes the partial and its sidecar together. A repo with a stale partial also shows up as a `●` marker in `hf-fm du`. Since v0.12.2 the same holds for the `.incomplete` files that `hf-hub` and Python's `huggingface_hub` download into: `du` marks them, `status` attributes them to their file, and `clean-partial` removes them, skipping any whose download is still running.
 
 ---
 

@@ -735,7 +735,8 @@ See also: hf-fm list-families, hf-fm discover")]
 // EXHAUSTIVE: internal CLI dispatch enum; crate owns all variants
 #[derive(Subcommand)]
 enum CacheCommands {
-    /// Remove `.chunked.part` files from interrupted downloads.
+    /// Remove interrupted downloads' temp files (`.chunked.part`, and the
+    /// `.incomplete` files of `hf-hub` / `huggingface_hub`).
     CleanPartial {
         /// Repository identifier or numeric index (omit to clean all repos).
         repo_id: Option<String>,
@@ -4455,7 +4456,13 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// Removes `.chunked.part` temp files from the `HuggingFace` cache.
+/// Removes partial downloads' temp files from the `HuggingFace` cache:
+/// hf-fm's `.chunked.part` files (with their sidecars), and the
+/// `.incomplete` files `hf-hub` and `huggingface_hub` leave behind.
+///
+/// An `.incomplete` file whose download lock is still held belongs to a
+/// running download; it is listed as skipped and never removed (see
+/// `cache::PartialFile::is_in_use`).
 ///
 /// When `repo_filter` is `Some`, only that repo is scanned.
 /// With `--dry-run`, prints what would be removed without deleting.
@@ -4474,10 +4481,29 @@ fn run_cache_clean_partial(
 
     println!("Cache: {}\n", cache_dir.display());
 
-    let partials = cache::find_partial_files(repo_filter)?;
+    let (in_use, partials): (Vec<cache::PartialFile>, Vec<cache::PartialFile>) =
+        cache::find_partial_files(repo_filter)?
+            .into_iter()
+            .partition(cache::PartialFile::is_in_use);
+
+    if !in_use.is_empty() {
+        println!(
+            "Skipping {} {} still being written by a running download:",
+            in_use.len(),
+            pluralize(in_use.len(), "file", "files"),
+        );
+        for p in &in_use {
+            println!("  {}: {}  ({})", p.repo_id, p.filename, format_size(p.size));
+        }
+        println!();
+    }
 
     if partials.is_empty() {
-        println!("No partial downloads found.");
+        if in_use.is_empty() {
+            println!("No partial downloads found.");
+        } else {
+            println!("No other partial downloads found.");
+        }
         return Ok(());
     }
 
@@ -4861,10 +4887,12 @@ fn run_cache_verify(
 // cache gc: age- and budget-based eviction
 // ============================================================================
 
-/// A cached repo `has_partial == true` whose mtime falls within this window
-/// is treated as actively downloading and skipped from gc to avoid racing
-/// with `hf-fm download`. Stale partials (older than the window) remain
-/// eligible — `cache clean-partial` is the right tool for those.
+/// A cached repo whose newest partial-download temp file
+/// (`CachedModelSummary::partial_modified`) was written within this window
+/// is treated as actively downloading and skipped from gc, to avoid racing
+/// with a download in progress (hf-fm's, `hf-hub`'s or `huggingface_hub`'s).
+/// Stale partials (older than the window) remain eligible — `cache
+/// clean-partial` is the right tool for those.
 const FRESH_PARTIAL_WINDOW_SECS: u64 = 60 * 60;
 
 /// Snapshot of a single cached repo for gc planning and preview rendering.
@@ -4987,8 +5015,11 @@ fn compute_gc_plan(
             protected.push(EvictionEntry::from(s));
             continue;
         }
+        // Judged by the partial's own mtime: `last_modified` is the age of
+        // the snapshot files, which says nothing about a download in progress
+        // in a repo whose existing files are old.
         let is_fresh_partial = s.has_partial
-            && s.last_modified.is_some_and(|m| {
+            && s.partial_modified.is_some_and(|m| {
                 now.duration_since(m)
                     .is_ok_and(|d| d.as_secs() < FRESH_PARTIAL_WINDOW_SECS)
             });
@@ -11280,6 +11311,9 @@ mod tests {
             file_count: 1,
             total_size: size,
             has_partial,
+            // A partial is taken to be as fresh as the repo, which is how
+            // these fixtures model an active download.
+            partial_modified: if has_partial { mtime } else { None },
             last_modified: mtime,
             gguf_size_range: None,
         }
@@ -11537,6 +11571,29 @@ mod tests {
         let plan = compute_gc_plan(&summaries, &crit, now, false);
         assert_eq!(plan.evict.len(), 1);
         assert!(plan.skipped_partials.is_empty());
+    }
+
+    #[test]
+    fn compute_gc_plan_spares_a_fresh_partial_in_a_repo_with_old_snapshots() {
+        // The repo's snapshot files are 60 days old, but a download into it
+        // wrote its temp file 5 minutes ago. Until v0.12.2 the guard read
+        // the snapshot age, saw a stale repo, and evicted it mid-download.
+        let now = fixed_now();
+        let mut summary = make_summary(
+            "old/but-downloading",
+            1_000,
+            Some(now - Duration::from_secs(86_400 * 60)),
+            true,
+        );
+        summary.partial_modified = Some(now - Duration::from_secs(60 * 5));
+        let mut crit = empty_criteria();
+        crit.older_than_secs = Some(86_400 * 30);
+        let plan = compute_gc_plan(&[summary], &crit, now, false);
+        assert!(
+            plan.evict.is_empty(),
+            "an active download must not be evicted"
+        );
+        assert_eq!(plan.skipped_partials.len(), 1);
     }
 
     #[test]

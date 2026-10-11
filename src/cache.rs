@@ -10,7 +10,7 @@
 //! [`verify_cache()`] re-checks `SHA256` digests of cached files against
 //! `HuggingFace` LFS metadata.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -328,8 +328,10 @@ pub enum FileStatus {
         local_size: u64,
     },
     /// File exists but is smaller than expected (interrupted download),
-    /// or the file's own `blobs/<sha256>.chunked.part` temp blob exists
-    /// (keyed on the file's LFS `sha256` — per-file attribution).
+    /// or the file's own temp file exists in `blobs/`: this crate's
+    /// `<sha256>.chunked.part`, or the `<sha256>.incomplete` of `hf-hub` /
+    /// `huggingface_hub` (keyed on the file's LFS `sha256` — per-file
+    /// attribution).
     Partial {
         /// Local file size in bytes.
         local_size: u64,
@@ -427,12 +429,13 @@ impl RepoStatus {
 /// # Notes
 ///
 /// Partial-download detection is per-file: a file absent from the snapshot
-/// directory is reported [`FileStatus::Partial`] only when its own
-/// chunked-download temp blob (`blobs/<sha256>.chunked.part`, keyed on the
-/// file's LFS `sha256`) exists on disk, and `local_size` is that temp
-/// blob's current byte count. Non-LFS files carry no `sha256`, so an
-/// interrupted non-chunked download reports [`FileStatus::Missing`] until
-/// it finalizes.
+/// directory is reported [`FileStatus::Partial`] only when its own temp file
+/// exists on disk, keyed on the file's LFS `sha256`: this crate's
+/// `blobs/<sha256>.chunked.part`, or the `blobs/<sha256>.incomplete` (or
+/// `<sha256>.<attempt>.incomplete`) that `hf-hub` and `huggingface_hub`
+/// write. `local_size` is that temp file's progress. Non-LFS files carry no
+/// `sha256`, so an interrupted download of one reports
+/// [`FileStatus::Missing`] until it finalizes.
 ///
 /// # Errors
 ///
@@ -475,6 +478,10 @@ pub async fn repo_status(
         None
     };
 
+    // The `.incomplete` temp files of `hf-hub` / `huggingface_hub`, read once
+    // here rather than once per listed file: a repo can list thousands.
+    let incomplete = incomplete_sizes(&crate::cache_layout::blobs_dir(&repo_dir));
+
     // Cross-reference remote files against local state.
     let mut files: Vec<(String, FileStatus)> = Vec::with_capacity(remote_files.len());
 
@@ -512,6 +519,15 @@ pub async fn repo_status(
         {
             // This file's own chunked-download temp blob is on disk: attribute
             // exactly its byte count to this file (keyed on the LFS sha256).
+            FileStatus::Partial {
+                local_size: part_size,
+                expected_size,
+            }
+        } else if let Some(&part_size) =
+            remote.sha256.as_deref().and_then(|sha| incomplete.get(sha))
+        {
+            // An `hf-hub` / `huggingface_hub` temp file for this etag: it
+            // grows as it downloads, so its length is the progress.
             FileStatus::Partial {
                 local_size: part_size,
                 expected_size,
@@ -563,8 +579,18 @@ pub struct CachedModelSummary {
     /// link on Windows is counted twice; see `physical_id`). See
     /// `walk_repo_files` for why both directories are walked.
     pub total_size: u64,
-    /// Whether there are incomplete `.chunked.part` temp files.
+    /// Whether the repo holds a partial download's temp file: this crate's
+    /// `.chunked.part`, or (since v0.12.2) an `.incomplete` left by `hf-hub`
+    /// or `huggingface_hub`.
     pub has_partial: bool,
+    /// Newest modification time among those temp files; `None` when
+    /// `has_partial` is `false` (new in v0.12.2).
+    ///
+    /// `cache gc` reads it to spare a download in progress. The repo's
+    /// [`last_modified`](Self::last_modified) cannot tell: it is the age of
+    /// the snapshot files, so a new download into a repo whose existing
+    /// files are old looked stale, and could be evicted mid-transfer.
+    pub partial_modified: Option<std::time::SystemTime>,
     /// Most recent modification time among the repo's snapshot files, across
     /// every snapshot; a symlinked entry reports its blob's. A repo with no
     /// snapshot files (an interrupted first download, or only hf-fm's header
@@ -634,8 +660,9 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
             .collect();
         let gguf_size_range = crate::discover::gguf_size_range(sized);
 
-        // Check for partial downloads.
-        let has_partial = find_partial_blob_size(&crate::cache_layout::blobs_dir(&repo_dir)) > 0;
+        // Check for partial downloads, and how recently one was written.
+        let (has_partial, partial_modified) =
+            scan_partials(&crate::cache_layout::blobs_dir(&repo_dir));
 
         // Deliberately NOT filtering out zero-byte, non-partial repos here
         // (e.g. an empty repo directory): `cache gc` and `status` both
@@ -649,6 +676,7 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
             file_count,
             total_size,
             has_partial,
+            partial_modified,
             last_modified,
             gguf_size_range,
         });
@@ -684,7 +712,9 @@ pub fn repo_disk_usage(repo_id: &str) -> Result<(usize, u64), FetchError> {
     Ok((walk.files.len(), walk.total_size))
 }
 
-/// Checks whether a single cached repo has `.chunked.part` temp files.
+/// Checks whether a single cached repo holds a partial download's temp
+/// file: a `.chunked.part`, or an `.incomplete` left by `hf-hub` or
+/// `huggingface_hub`.
 ///
 /// Avoids scanning the entire cache when only one repo's partial status
 /// is needed (e.g., for the `du <REPO>` partial-download hint).
@@ -696,7 +726,7 @@ pub fn repo_has_partial(repo_id: &str) -> Result<bool, FetchError> {
     let cache_dir = hf_cache_dir()?;
     let repo_dir = crate::cache_layout::repo_dir(&cache_dir, repo_id);
     let blobs_dir = crate::cache_layout::blobs_dir(&repo_dir);
-    Ok(find_partial_blob_size(&blobs_dir) > 0)
+    Ok(scan_partials(&blobs_dir).0)
 }
 
 /// Reads the commit hash from a refs file, if it exists.
@@ -754,35 +784,138 @@ fn partial_chunk_size(repo_dir: &Path, sha256: Option<&str>) -> Option<u64> {
     Some(sidecar_sum.unwrap_or(part_len))
 }
 
-/// Returns the size of the first `.chunked.part` file found in the blobs directory.
-fn find_partial_blob_size(blobs_dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(blobs_dir) else {
-        return 0;
-    };
+/// Suffix of this crate's chunked-download temp blob:
+/// `blobs/<etag>.chunked.part` (see [`crate::cache_layout::temp_blob_path`]).
+const CHUNKED_PART_SUFFIX: &str = ".chunked.part";
 
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        // BORROW: explicit .to_string_lossy() for OsString → str conversion
-        if name.to_string_lossy().ends_with(".chunked.part") {
-            // `DirEntry::metadata` is correct here, unlike in a snapshot walk
-            // (see `resolved_file_size`): a `.chunked.part` temp blob is
-            // always a real file this crate wrote itself, never a pointer.
-            return entry.metadata().map_or(0, |m| m.len());
-        }
+/// Suffix of the temp file `hf-hub` and `huggingface_hub` download into:
+/// `blobs/<etag>.incomplete`, or `blobs/<etag>.<8 hex digits>.incomplete`
+/// since `huggingface_hub` 1.18, which gives every attempt its own name.
+const INCOMPLETE_SUFFIX: &str = ".incomplete";
+
+/// The etag an `.incomplete` temp file belongs to, or `None` when `name` is
+/// not one.
+///
+/// Recognises both namings: `<etag>.incomplete` (`hf-hub`, and
+/// `huggingface_hub` before 1.18) and `<etag>.<8 hex>.incomplete`
+/// (`huggingface_hub` 1.18 and later). The Hub's etags are hex digests with
+/// no period, so the 8-digit attempt suffix cannot be mistaken for part of
+/// one.
+fn incomplete_etag(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(INCOMPLETE_SUFFIX)?;
+    if let Some((etag, attempt)) = stem.rsplit_once('.')
+        && attempt.len() == 8
+        && attempt.bytes().all(|b| b.is_ascii_hexdigit())
+        && !etag.is_empty()
+    {
+        return Some(etag);
     }
-
-    0
+    (!stem.is_empty()).then_some(stem)
 }
 
-/// A `.chunked.part` temp file left by an interrupted chunked download.
+/// Whether `name` is a partial download's temp file in `blobs/`: this
+/// crate's `.chunked.part`, or the `.incomplete` file `hf-hub` and
+/// `huggingface_hub` leave when a download is interrupted. The chunked
+/// download's `.chunked.part.state` sidecar is not one.
+fn is_partial_name(name: &str) -> bool {
+    name.ends_with(CHUNKED_PART_SUFFIX) || incomplete_etag(name).is_some()
+}
+
+/// Whether `blobs_dir` holds any partial download, and the newest
+/// modification time among them (`None` when there are none).
+///
+/// `DirEntry::metadata` is right here, unlike in a snapshot walk (see
+/// [`resolved_file_size`]): a temp file is always a real file its
+/// downloader wrote, never a pointer.
+fn scan_partials(blobs_dir: &Path) -> (bool, Option<std::time::SystemTime>) {
+    let Ok(entries) = std::fs::read_dir(blobs_dir) else {
+        return (false, None);
+    };
+    let mut any = false;
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        // BORROW: explicit .to_string_lossy() for OsString → str conversion
+        if !is_partial_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        any = true;
+        if let Ok(meta) = entry.metadata() {
+            note_newest_mtime(&mut newest, &meta);
+        }
+    }
+    (any, newest)
+}
+
+/// Bytes downloaded so far into each `.incomplete` temp file in
+/// `blobs_dir`, keyed by the etag it belongs to.
+///
+/// These files grow as they download (unlike a `.chunked.part`, which is
+/// preallocated), so a file's length is its progress. Where several attempts
+/// left one each, the largest is kept.
+fn incomplete_sizes(blobs_dir: &Path) -> HashMap<String, u64> {
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(blobs_dir) else {
+        return sizes;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        // BORROW: explicit .to_string_lossy() for OsString → str conversion
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(etag) = incomplete_etag(&name) else {
+            continue;
+        };
+        let len = entry.metadata().map_or(0, |m| m.len());
+        // BORROW: explicit .to_owned() for &str → owned String key
+        let slot = sizes.entry(etag.to_owned()).or_insert(0);
+        *slot = (*slot).max(len);
+    }
+    sizes
+}
+
+/// Whether another process holds the download lock at `lock_path`.
+///
+/// `hf-hub` and `huggingface_hub` both hold an exclusive OS lock on
+/// `<cache>/.locks/<repo folder>/<etag>.lock` while they write that etag's
+/// `.incomplete` file. This opens an existing lock file, without creating
+/// one, and tries to take the lock without waiting. A missing lock file means
+/// no download is running; a lock that is busy, or a file that cannot be
+/// opened or tested, counts as held, so the partial it guards is kept.
+/// Locks a filesystem cannot provide (on some network filesystems
+/// `huggingface_hub` falls back to a lock file's mere existence) are not
+/// detected.
+fn download_lock_held(lock_path: &Path) -> bool {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            // Dropping the file releases the lock too; unlocking first just
+            // makes the release explicit.
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// A partial download's temp file in a repo's `blobs/`: this crate's
+/// `.chunked.part`, or the `.incomplete` file `hf-hub` and `huggingface_hub`
+/// download into.
 #[derive(Debug, Clone)]
 pub struct PartialFile {
     /// The repository identifier (e.g., `"meta-llama/Llama-3.2-1B"`).
     pub repo_id: String,
-    /// The `.chunked.part` filename (e.g., `"abc123def456.chunked.part"`).
+    /// The temp file's name (e.g., `"abc123def456.chunked.part"` or
+    /// `"abc123def456.incomplete"`).
     pub filename: String,
-    /// Absolute path to the `.chunked.part` file.
+    /// Absolute path to the temp file.
     pub path: PathBuf,
     /// Size of the partial file in bytes.
     pub size: u64,
@@ -790,14 +923,19 @@ pub struct PartialFile {
 
 impl PartialFile {
     /// Returns sibling sidecar paths that should be removed alongside this
-    /// partial: the resume-state sidecar `{etag}.chunked.part.state` and
-    /// any orphan write-tmp `{etag}.chunked.part.state.tmp` left by an
-    /// interrupted atomic save.
+    /// partial: for a `.chunked.part`, the resume-state sidecar
+    /// `{etag}.chunked.part.state` and any orphan write-tmp
+    /// `{etag}.chunked.part.state.tmp` left by an interrupted atomic save.
+    /// An `.incomplete` file has none.
     ///
     /// The paths are returned even when the underlying files do not exist
     /// — callers (`run_cache_clean_partial`) attempt removal best-effort.
     #[must_use]
     pub fn sidecar_paths(&self) -> Vec<PathBuf> {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        if !self.filename.as_str().ends_with(CHUNKED_PART_SUFFIX) {
+            return Vec::new();
+        }
         let Some(parent) = self.path.parent() else {
             return Vec::new();
         };
@@ -812,12 +950,50 @@ impl PartialFile {
         tmp_name.push_str(".state.tmp");
         vec![parent.join(state_name), parent.join(tmp_name)]
     }
+
+    /// Whether a running download is still writing this file, so removing it
+    /// would break that download.
+    ///
+    /// For an `.incomplete` file this asks the download lock that `hf-hub`
+    /// and `huggingface_hub` hold while writing it,
+    /// `<cache>/.locks/<repo folder>/<etag>.lock`. Where a filesystem cannot
+    /// provide that lock (on some network filesystems `huggingface_hub`
+    /// falls back to the lock file's mere existence), a running download is
+    /// not detected. This crate's own chunked downloads take no such lock, so a
+    /// `.chunked.part` always reads as not in use: make sure no `hf-fm`
+    /// download is running before cleaning one.
+    #[must_use]
+    pub fn is_in_use(&self) -> bool {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        let Some(etag) = incomplete_etag(self.filename.as_str()) else {
+            return false;
+        };
+        // `<cache>/<repo folder>/blobs/<file>`: walk back up to the cache root.
+        let Some(repo_dir) = self.path.parent().and_then(Path::parent) else {
+            return false;
+        };
+        let (Some(cache_root), Some(repo_folder)) = (repo_dir.parent(), repo_dir.file_name())
+        else {
+            return false;
+        };
+        // BORROW: explicit .to_string_lossy() for OsStr → str conversion
+        let lock = crate::cache_layout::download_lock_path(
+            cache_root,
+            &repo_folder.to_string_lossy(),
+            etag,
+        );
+        download_lock_held(&lock)
+    }
 }
 
-/// Finds all `.chunked.part` temp files in the `HuggingFace` cache.
+/// Finds every partial download's temp file in the `HuggingFace` cache:
+/// this crate's `.chunked.part` files, and since v0.12.2 the `.incomplete`
+/// files `hf-hub` and `huggingface_hub` leave behind.
 ///
 /// Walks `models--*/blobs/` directories and collects partial files.
-/// When `repo_filter` is `Some`, only the matching repo is scanned.
+/// When `repo_filter` is `Some`, only the matching repo is scanned. Files a
+/// running download is still writing are included; ask
+/// [`PartialFile::is_in_use`] before removing one.
 ///
 /// Returns an empty `Vec` if the cache directory does not exist.
 ///
@@ -867,9 +1043,9 @@ pub fn find_partial_files(repo_filter: Option<&str>) -> Result<Vec<PartialFile>,
             let name = blob_entry.file_name();
             // BORROW: explicit .to_string_lossy() for OsString → str conversion
             let name_str = name.to_string_lossy();
-            if name_str.ends_with(".chunked.part") {
+            if is_partial_name(&name_str) {
                 // Real file, never a pointer: same reasoning as
-                // `find_partial_blob_size` above.
+                // `scan_partials` above.
                 let size = blob_entry.metadata().map_or(0, |m| m.len());
                 partials.push(PartialFile {
                     // BORROW: explicit .clone() for owned String
@@ -1690,6 +1866,115 @@ mod tests {
                 "{bad:?} should be refused"
             );
         }
+    }
+
+    #[test]
+    fn incomplete_etag_reads_both_namings() {
+        let sha = "9a3f7c1e0b2d4f6a8c0e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a";
+        // hf-hub, and huggingface_hub before 1.18.
+        assert_eq!(incomplete_etag(&format!("{sha}.incomplete")), Some(sha));
+        // huggingface_hub 1.18 and later: one name per attempt.
+        assert_eq!(
+            incomplete_etag(&format!("{sha}.1a2b3c4d.incomplete")),
+            Some(sha)
+        );
+        // An etag with a period, as in this crate's own tests, stays whole.
+        assert_eq!(incomplete_etag("abc.def.incomplete"), Some("abc.def"));
+        for other in [
+            sha,
+            ".incomplete",
+            "x.chunked.part",
+            "x.chunked.part.state",
+            "x.incomplete.lock",
+        ] {
+            assert_eq!(incomplete_etag(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn scan_partials_finds_both_kinds_but_not_the_resume_sidecar() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(1);
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        assert_eq!(scan_partials(&blobs), (false, None));
+
+        std::fs::write(blobs.join("cafe.chunked.part.state"), b"{}").unwrap();
+        assert!(!scan_partials(&blobs).0, "a sidecar alone is not a partial");
+
+        let older = write_aged(&blobs.join("cafe.chunked.part"), 8, 2);
+        let newer = write_aged(&blobs.join("beef.1a2b3c4d.incomplete"), 8, 1);
+        let (any, newest) = scan_partials(&blobs);
+        assert!(any);
+        assert_eq!(newest, Some(newer));
+        assert!(newest > Some(older));
+    }
+
+    #[test]
+    fn incomplete_sizes_keeps_each_etags_largest_attempt() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(1);
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        std::fs::write(blobs.join("beef.incomplete"), vec![0u8; 10]).unwrap();
+        std::fs::write(blobs.join("beef.1a2b3c4d.incomplete"), vec![0u8; 30]).unwrap();
+        std::fs::write(blobs.join("cafe.chunked.part"), vec![0u8; 99]).unwrap();
+        let sizes = incomplete_sizes(&blobs);
+        assert_eq!(sizes.len(), 1, "only .incomplete files: {sizes:?}");
+        assert_eq!(sizes.get("beef"), Some(&30));
+    }
+
+    #[test]
+    fn an_incomplete_file_is_in_use_while_its_download_lock_is_held() {
+        let (tmp, repo_dir, _blob, _snap) = repo_with_blob(1);
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        let path = blobs.join("beef.incomplete");
+        std::fs::write(&path, vec![0u8; 4]).unwrap();
+        let partial = PartialFile {
+            repo_id: "org/model".to_owned(),
+            filename: "beef.incomplete".to_owned(),
+            path,
+            size: 4,
+        };
+        let lock_path =
+            crate::cache_layout::download_lock_path(tmp.path(), "models--org--model", "beef");
+
+        // No lock file: no download is running.
+        assert!(!partial.is_in_use());
+
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = std::fs::File::create(&lock_path).unwrap();
+        // A lock file nobody holds, as a finished download leaves it.
+        assert!(!partial.is_in_use());
+
+        lock.lock().unwrap();
+        assert!(partial.is_in_use(), "a held lock means a running download");
+        lock.unlock().unwrap();
+        assert!(!partial.is_in_use());
+        assert!(
+            lock_path.exists(),
+            "the check must not remove the lock file"
+        );
+    }
+
+    #[test]
+    fn a_chunked_part_is_never_in_use_and_keeps_its_sidecars() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(1);
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        let chunked = PartialFile {
+            repo_id: "org/model".to_owned(),
+            filename: "cafe.chunked.part".to_owned(),
+            path: blobs.join("cafe.chunked.part"),
+            size: 0,
+        };
+        assert!(!chunked.is_in_use());
+        assert_eq!(chunked.sidecar_paths().len(), 2);
+        let incomplete = PartialFile {
+            repo_id: "org/model".to_owned(),
+            filename: "beef.incomplete".to_owned(),
+            path: blobs.join("beef.incomplete"),
+            size: 0,
+        };
+        assert!(
+            incomplete.sidecar_paths().is_empty(),
+            "an .incomplete has no sidecar"
+        );
     }
 
     /// A `sha256` from the Hub's listing names a temp-blob path, so one that

@@ -57,7 +57,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 | Command | Description |
 |---------|-------------|
 | `hf-fm <REPO_ID>` *(default)* | Download a model (multi-connection, auto-tuned) |
-| `hf-fm cache clean-partial` | Remove `.chunked.part` files from interrupted downloads |
+| `hf-fm cache clean-partial` | Remove interrupted downloads' temp files: hf-fm's `.chunked.part`, and the `.incomplete` files `hf-hub` / `huggingface_hub` leave (a download still running is skipped) |
 | `hf-fm cache delete <REPO_ID\|N>` | Delete a cached model |
 | `hf-fm cache gc --older-than/--max-size` | Garbage-collect cached models by age and/or size budget |
 | `hf-fm cache path <REPO_ID\|N>` | Print snapshot directory path (for scripting) |
