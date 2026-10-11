@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--fits` requirement and the help text; the end-to-end runs were done by
   hand, being too heavy for the test suite.
 
+- **`auth::resolve_token(explicit)`**, the token a request carries: the
+  explicit one, or else the implicit one the Python tools would use (see
+  Changed below). Every client in the crate resolves its token through it,
+  so it answers "which token will hf-fm send?" exactly; downstream code that
+  reads `HF_TOKEN` itself can call it instead.
+
 ### Changed
 
 - **`anamnesis` bumped `0.7.7` → `0.7.10`.** Three releases, and not a routine
@@ -187,6 +193,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that drops `hypomnesis` and `libloading` from their build. No public API
   changes, since no library item exposed a `hypomnesis` type, and
   `Cargo.lock` is unchanged.
+
+- **Without a token, requests now carry the one the Python tools would
+  use.** When no token is given (`--token`, `FetchConfigBuilder::token`),
+  the token comes from `HF_TOKEN`; else the legacy `HUGGING_FACE_HUB_TOKEN`;
+  else the token file, which is `HF_TOKEN_PATH`, or `token` under `HF_HOME`
+  (default `$XDG_CACHE_HOME/huggingface`, then `~/.cache/huggingface`), where
+  `hf auth login` writes it. `HF_HUB_DISABLE_IMPLICIT_TOKEN` set to
+  `1`/`on`/`yes`/`true` turns the lookup off; an explicit token is still
+  sent. These are `huggingface_hub`'s rules, read in its 2.2.0 source, minus
+  its OIDC, Colab and OAuth-refresh sources (`auth` module docs).
+  - **Why.** hf-fm used to hand `hf-hub` no token when none was given, and
+    `hf-hub` 1.0 then looked for one with rules of its own while hf-fm's own
+    clients stayed anonymous. One download could therefore mix authenticated
+    `hf-hub` requests (the listing, single-connection downloads) with
+    anonymous ones (metadata, chunked downloads, inspect). A gated download
+    was refused up front, since the pre-flight saw no token, even with a
+    stored `hf auth login` token. A *private* repo, on Linux and macOS,
+    downloaded only by accident: hf-fm's anonymous metadata request failed,
+    which turned chunked downloads off, and every file then went through
+    `hf-hub`, which had found the token file. On Windows `hf-hub` never
+    found the token file at all, since it looks under `HOME`. `hf-hub` 1.1,
+    merged upstream but not yet released and accepted by `hf-hub = "1.0"`,
+    reads no environment whatsoever, which would have turned that accident
+    into failed downloads.
+  - **Now** the token is resolved once by these rules and given to every
+    client, `hf-hub`'s included, and `hf-hub`'s endpoint is pinned to
+    `https://huggingface.co`, where hf-fm's own requests go: `HF_ENDPOINT`
+    no longer redirects half of a download to a mirror. The gated-model
+    pre-flight and the CLI's gated-repo diagnosis judge the token that will
+    actually be sent, and suggest `hf auth login` alongside `HF_TOKEN` and
+    `--token`.
+  - **What changes for a user:** with a stored `hf auth login` token and no
+    `HF_TOKEN`, hf-fm is now authenticated where it used to be anonymous,
+    which also lifts the anonymous rate limit. Library callers that pass no
+    token now send one whenever one is configured, as the Python library
+    does. `token_from_env()` keeps reading `HF_TOKEN` explicitly, which
+    matters only under `HF_HUB_DISABLE_IMPLICIT_TOKEN`. An explicit token is
+    sent exactly as given, never cleaned, so a malformed one still fails
+    loudly. Eleven unit tests pin every rule, with the environment
+    injected, since changing the process environment needs `unsafe`, which
+    this crate forbids.
 
 ### Fixed
 
@@ -602,6 +649,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     they have been remote since v0.11.1.
   - Rustdoc: `TensorInfo` and two neighbours named anamnesis as a consumer of
     this crate; the dependency runs the other way.
+
+- **The repo listing and single-connection downloads had no connect
+  timeout.** They go through `hf-hub`, whose default `reqwest` client sets
+  none, so a dead peer stalled them until the operating system gave up
+  (two minutes or more on Linux). hf-fm now gives `hf-hub` a client with
+  the same 30-second connect timeout as its own clients. One `hf-hub` request
+  still goes without: the `HEAD` it sends through a second, internal client
+  before a single-connection download, which callers cannot replace; the
+  per-file timeout (300 s by default) bounds that download as a whole. Every
+  request also now identifies itself as `hf-fetch-model/<version>`
+  (previously a bare `hf-fetch-model`, and `hf-hub/1.0.0` for `hf-hub`'s).
+
+- **A mistyped repo or revision read as "this repo has no `config.json`".**
+  The optional-file fetches behind `diff-config`, `inspect --check-gpu
+  --context`, sharded aggregation and adapter detection (`config.json`,
+  `model.safetensors.index.json`, `adapter_config.json`) took every `404`
+  for a missing file. The Hub says which is missing in its `X-Error-Code`
+  header, as checked on 2026-10-11: `EntryNotFound` for a file,
+  `RevisionNotFound` for a revision (so a mistyped `--revision` was
+  misreported even anonymously), and `RepoNotFound` for a repo. That last
+  one only an authenticated request receives; an anonymous one gets a
+  `401`, which already failed loudly. Since requests now carry a stored
+  token, a mistyped repo would have been misreported too; a CLI test caught
+  it the first time it ran authenticated. Now only `EntryNotFound` (or a
+  `404` with no code, as before) means the file is absent; `RepoNotFound`
+  returns `FetchError::RepoNotFound` and `RevisionNotFound` an error naming
+  the revision.
 
 ### Security
 

@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (--check-gpu names Metal on macOS; earlier: --cache-headers hit cost, pruning, counted by du) -->
+<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (token from `hf auth login`; --check-gpu names Metal on macOS; earlier: --cache-headers hit cost, pruning, counted by du) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -149,7 +149,7 @@ hf-fm ships as a **library crate by default** — no command-line binaries unles
 
 ### How do I pass a HuggingFace token? Why does a gated model fail?
 
-Either pass `--token <value>` on the command line, or set the `HF_TOKEN` environment variable once and forget about it — every subcommand reads it automatically. Gated models (like Meta's Llama releases or Google's Gemma family) require both a valid token and that you have accepted the licence on the model's HuggingFace page. When either is missing, `download`, `inspect`, and `diff` report an `authentication failed: <repo> is a gated model …` error carrying the license URL and token guidance (`download` checks the gate up front, since v0.9.3; `inspect` and `diff` diagnose the underlying 401/403 from their Range requests, since v0.10.5 — `diff` names whichever side is gated).
+Pass `--token <value>`, set the `HF_TOKEN` environment variable, or log in once with the Python CLI's `hf auth login`. Without `--token`, every subcommand uses `HF_TOKEN`, else the token file `hf auth login` wrote (`~/.cache/huggingface/token`, or `token` under `HF_HOME`), the same order the Python tools follow (since v0.12.2). Set `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` to run anonymously even when a token is configured. Gated models (like Meta's Llama releases or Google's Gemma family) require both a valid token and that you have accepted the licence on the model's HuggingFace page. When either is missing, `download`, `inspect`, and `diff` report an `authentication failed: <repo> is a gated model …` error carrying the license URL and token guidance (`download` checks the gate up front, since v0.9.3; `inspect` and `diff` diagnose the underlying 401/403 from their Range requests, since v0.10.5 — `diff` names whichever side is gated).
 
 Three traps worth knowing:
 

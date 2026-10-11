@@ -166,6 +166,11 @@ impl FetchConfigBuilder {
     }
 
     /// Sets the authentication token.
+    ///
+    /// Without one, requests carry the implicit token
+    /// [`crate::auth::resolve_token`] finds: `HF_TOKEN`, else the token file
+    /// `hf auth login` writes, unless `HF_HUB_DISABLE_IMPLICIT_TOKEN` is set.
+    /// An explicit token is sent even then.
     #[must_use]
     pub fn token(mut self, token: &str) -> Self {
         // BORROW: explicit .to_owned() for &str → owned String
@@ -174,6 +179,11 @@ impl FetchConfigBuilder {
     }
 
     /// Reads the authentication token from the `HF_TOKEN` environment variable.
+    ///
+    /// Since v0.12.2 an unset token resolves `HF_TOKEN` implicitly anyway
+    /// (see [`token`](Self::token)), so this is needed only to send
+    /// `HF_TOKEN` while `HF_HUB_DISABLE_IMPLICIT_TOKEN` is set, which turns the
+    /// implicit lookup off but not an explicit token.
     #[must_use]
     pub fn token_from_env(mut self) -> Self {
         self.token = std::env::var("HF_TOKEN").ok();

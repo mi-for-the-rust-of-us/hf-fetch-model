@@ -42,9 +42,9 @@ hf-fetch-model keeps an interrupted chunked download's `.chunked.part` file, wit
 
 `hf-hub` 1.0 builds its `reqwest::Client` with no connect timeout, and `hf_transfer` sets none either. A dead peer (SYN sent, no SYN-ACK) then stalls until the OS gives up, typically after two minutes or more on Linux and longer on Windows. `huggingface_hub` is not affected: its single 10-second timeout covers the connect phase too.
 
-hf-fetch-model sets a 30-second connect timeout on its own two HTTP clients (`build_client`, `build_no_redirect_client`), which serve chunked downloads, the metadata listing, the range probes, remote `inspect` and `info`. Single-connection downloads go through `hf-hub`'s client instead, so they have no connect timeout of their own; the per-file timeout (300 seconds by default) bounds them.
+hf-fetch-model sets a 30-second connect timeout on its own two HTTP clients (`build_client`, `build_no_redirect_client`), which serve chunked downloads, the metadata listing, the range probes, remote `inspect` and `info`. Since v0.12.2 it also hands `hf-hub` a client with the same timeout (`build_hf_hub_client`), so `hf-hub`'s repo listing and single-connection download requests have it too. One request still goes without: the `HEAD` that `hf-hub` sends through a second, internal client before a single-connection download, which a caller cannot replace; the per-file timeout (300 seconds by default) bounds that download as a whole.
 
-**File:** `chunked.rs` (`CONNECT_TIMEOUT`).
+**File:** `chunked.rs` (`CONNECT_TIMEOUT`, `build_hf_hub_client`).
 
 ---
 

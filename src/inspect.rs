@@ -1706,7 +1706,7 @@ pub async fn fetch_shard_index(
             FetchError::Http(format!("failed to fetch shard index for {repo_id}: {e}"))
         })?;
 
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    if chunked::resolve_says_file_absent(response.status(), response.headers(), repo_id, rev)? {
         return Ok(None);
     }
 
@@ -1863,7 +1863,7 @@ pub async fn fetch_adapter_config(
         FetchError::Http(format!("failed to fetch adapter config for {repo_id}: {e}"))
     })?;
 
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    if chunked::resolve_says_file_absent(response.status(), response.headers(), repo_id, rev)? {
         return Ok(None);
     }
 
@@ -2081,7 +2081,7 @@ pub async fn fetch_model_config(
         FetchError::Http(format!("failed to fetch model config for {repo_id}: {e}"))
     })?;
 
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    if chunked::resolve_says_file_absent(response.status(), response.headers(), repo_id, rev)? {
         return Ok(None);
     }
 

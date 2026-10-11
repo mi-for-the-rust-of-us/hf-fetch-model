@@ -23,8 +23,8 @@ let outcome = hf_fetch_model::download_with_config(
 | Method | Description | Default |
 |--------|-------------|---------|
 | `.revision(rev)` | Git revision (branch, tag, SHA) | `"main"` |
-| `.token(tok)` | Auth token | — |
-| `.token_from_env()` | Read `HF_TOKEN` env var | — |
+| `.token(tok)` | Auth token | `HF_TOKEN`, else the `hf auth login` token file (see below) |
+| `.token_from_env()` | Read `HF_TOKEN` env var explicitly | — |
 | `.filter(glob)` | Include pattern (repeatable) | all files |
 | `.exclude(glob)` | Exclude pattern (repeatable) | none |
 | `.concurrency(n)` | Parallel file downloads | auto-tuned |
@@ -37,6 +37,10 @@ let outcome = hf_fetch_model::download_with_config(
 | `.connections_per_file(n)` | Parallel connections per large file | auto-tuned |
 | `.on_progress(closure)` | Progress callback (sync) | — |
 | `.progress_channel()` | Returns `(self, ProgressReceiver)` for async consumers | — |
+
+## Authentication
+
+Without `.token(..)`, every request carries the token the Python tools would use: `HF_TOKEN` (or the legacy `HUGGING_FACE_HUB_TOKEN`), else the token file, which is `HF_TOKEN_PATH` or `token` in the HuggingFace home (`HF_HOME`, else `$XDG_CACHE_HOME/huggingface`, else `~/.cache/huggingface`), where `hf auth login` writes it. `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` turns that lookup off; an explicit token is still sent. `hf_fetch_model::auth::resolve_token(None)` returns the token a request would carry.
 
 ## Filter presets
 

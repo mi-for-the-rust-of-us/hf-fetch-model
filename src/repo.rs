@@ -193,7 +193,9 @@ pub async fn list_repo_files_with_commit(
 
     // BORROW: explicit .as_str() instead of Deref coercion
     let mut request = client.get(url.as_str());
-    if let Some(t) = token {
+    // The caller's client may carry no token of its own, so the request
+    // resolves one exactly as this crate's clients do.
+    if let Some(t) = crate::auth::resolve_token(token) {
         request = request.bearer_auth(t);
     }
 

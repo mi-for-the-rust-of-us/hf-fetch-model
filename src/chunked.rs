@@ -37,11 +37,39 @@ const SIDECAR_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 // TRAIT_OBJECT: heterogeneous progress handlers from different callers
 type ProgressCallback = Arc<dyn Fn(&ProgressEvent) + Send + Sync>;
 
-/// Default `HuggingFace` API endpoint.
-const HF_ENDPOINT: &str = "https://huggingface.co";
+/// The `HuggingFace` endpoint every request goes to, this crate's own and,
+/// since v0.12.2, `hf-hub`'s too (see `build_model_repo` in `lib.rs`).
+pub(crate) const HF_ENDPOINT: &str = "https://huggingface.co";
 
 /// Maximum time to establish a TCP connection to the remote server.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The `User-Agent` of every request this crate sends, `hf-hub`'s included.
+const USER_AGENT: &str = concat!("hf-fetch-model/", env!("CARGO_PKG_VERSION"));
+
+/// Default headers for this crate's own clients: the [`USER_AGENT`], and an
+/// `Authorization` header when [`crate::auth::resolve_token`] finds a token.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the token is not a valid header value.
+fn default_headers(token: Option<&str>) -> Result<reqwest::header::HeaderMap, FetchError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
+    if let Some(tok) = crate::auth::resolve_token(token) {
+        let auth_value = format!("Bearer {tok}");
+        // BORROW: explicit .as_str() for String → &str conversion
+        let mut header_val = reqwest::header::HeaderValue::from_str(auth_value.as_str())
+            .map_err(|e| FetchError::Http(e.to_string()))?;
+        // Keeps the token out of `Debug` output of the client and its requests.
+        header_val.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, header_val);
+    }
+    Ok(headers)
+}
 
 /// Result of probing a URL for HTTP Range support and cache metadata.
 pub(crate) struct RangeInfo {
@@ -72,36 +100,72 @@ pub(crate) fn build_download_url(repo_id: &str, revision: &str, filename: &str) 
     format!("{HF_ENDPOINT}/{repo_id}/resolve/{url_revision}/{filename}")
 }
 
+/// Reads a `/resolve` response for an optional file (a `config.json`, a
+/// shard index, an adapter config): `Ok(true)` when the *file* is absent,
+/// `Ok(false)` when the response is not a 404, and an error when the 404
+/// means something else is missing.
+///
+/// The Hub tells the cases apart with its `X-Error-Code` header, which is
+/// how `huggingface_hub` reads them too: `EntryNotFound` for a missing file,
+/// `RevisionNotFound` for a missing revision, and `RepoNotFound` for a
+/// missing repo. That last one reaches only an authenticated request; an
+/// anonymous one gets a `401` instead. Treating every `404` as a missing
+/// file reported a mistyped repo, or a mistyped `--revision`, as "this repo
+/// ships no `config.json`". A `404` with no error code still counts as a
+/// missing file, as it always did.
+///
+/// # Errors
+///
+/// Returns [`FetchError::RepoNotFound`] for `RepoNotFound`, and
+/// [`FetchError::Http`] naming the revision for `RevisionNotFound`.
+pub(crate) fn resolve_says_file_absent(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    repo_id: &str,
+    revision: &str,
+) -> Result<bool, FetchError> {
+    if status != reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    match headers.get("x-error-code").and_then(|v| v.to_str().ok()) {
+        Some("RepoNotFound") => Err(FetchError::RepoNotFound {
+            // BORROW: explicit .to_owned() for &str → owned String field
+            repo_id: repo_id.to_owned(),
+        }),
+        Some("RevisionNotFound") => Err(FetchError::Http(format!(
+            "revision \"{revision}\" not found in {repo_id}"
+        ))),
+        // EXPLICIT: `EntryNotFound`, an unknown code, or none at all
+        _ => Ok(true),
+    }
+}
+
 /// Builds a `reqwest::Client` with no-redirect policy for probing.
 ///
-/// The client enforces a 30-second TCP connect timeout ([`CONNECT_TIMEOUT`]).
+/// The client enforces a 30-second TCP connect timeout ([`CONNECT_TIMEOUT`]),
+/// and carries `token`, or when it is `None` the implicit token
+/// [`crate::auth::resolve_token`] finds.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the client or auth header cannot be constructed.
 pub(crate) fn build_no_redirect_client(token: Option<&str>) -> Result<Client, FetchError> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static("hf-fetch-model"),
-    );
-    if let Some(tok) = token {
-        let auth_value = format!("Bearer {tok}");
-        // BORROW: explicit .as_str() for String → &str conversion
-        let header_val = reqwest::header::HeaderValue::from_str(auth_value.as_str())
-            .map_err(|e| FetchError::Http(e.to_string()))?;
-        headers.insert(reqwest::header::AUTHORIZATION, header_val);
-    }
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
-        .default_headers(headers)
+        .default_headers(default_headers(token)?)
         .build()
         .map_err(|e| FetchError::Http(e.to_string()))
 }
 
 /// Builds a `reqwest::Client` with auth token, user-agent, and 30-second
 /// TCP connect timeout.
+///
+/// The client carries `token`, or, when it is `None`, the implicit token
+/// [`crate::auth::resolve_token`] finds (`HF_TOKEN`, then the token file
+/// `hf auth login` writes), so `build_client(None)` sends a token whenever
+/// the Python tools on the same machine would. Set
+/// `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` for an anonymous client.
 ///
 /// Use this to create a shared client for [`crate::repo::list_repo_files_with_metadata`]
 /// and other API calls that benefit from connection reuse.
@@ -110,18 +174,38 @@ pub(crate) fn build_no_redirect_client(token: Option<&str>) -> Result<Client, Fe
 ///
 /// Returns [`FetchError::Http`] if the client or auth header cannot be constructed.
 pub fn build_client(token: Option<&str>) -> Result<Client, FetchError> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .default_headers(default_headers(token)?)
+        .build()
+        .map_err(|e| FetchError::Http(e.to_string()))
+}
+
+/// Builds the `reqwest::Client` that `hf-hub` sends its requests through:
+/// the repo listing and every single-connection download.
+///
+/// `hf-hub` 1.0 builds its own client with no connect timeout, so a dead
+/// peer stalled those requests until the operating system gave up. This one
+/// has the same 30-second [`CONNECT_TIMEOUT`] as this crate's own clients and
+/// the same [`USER_AGENT`]. It deliberately carries no `Authorization`
+/// header: `hf-hub` adds its token to each request itself, and
+/// `build_model_repo` hands it the token [`crate::auth::resolve_token`]
+/// chose.
+///
+/// One `hf-hub` request still goes without the timeout: the `HEAD` that
+/// resolves a file's metadata before a single-connection download, which
+/// `hf-hub` sends through a second, internal client that cannot be replaced.
+/// The per-file timeout bounds that download as a whole.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the client cannot be constructed.
+pub(crate) fn build_hf_hub_client() -> Result<Client, FetchError> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static("hf-fetch-model"),
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
     );
-    if let Some(tok) = token {
-        let auth_value = format!("Bearer {tok}");
-        // BORROW: explicit .as_str() for String → &str conversion
-        let header_val = reqwest::header::HeaderValue::from_str(auth_value.as_str())
-            .map_err(|e| FetchError::Http(e.to_string()))?;
-        headers.insert(reqwest::header::AUTHORIZATION, header_val);
-    }
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .default_headers(headers)
@@ -1095,6 +1179,54 @@ mod tests {
     )]
 
     use super::*;
+
+    // ---------- resolve_says_file_absent ----------
+
+    /// Headers holding one `X-Error-Code`, as the Hub sends them.
+    fn error_code(code: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-error-code",
+            reqwest::header::HeaderValue::from_str(code).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_missing_file_is_absent_and_anything_but_a_404_is_not() {
+        let not_found = reqwest::StatusCode::NOT_FOUND;
+        // The codes and statuses the Hub returned on 2026-10-11 for a
+        // missing `config.json` in a real repo, anonymous or not.
+        assert!(
+            resolve_says_file_absent(not_found, &error_code("EntryNotFound"), "o/r", "main")
+                .unwrap()
+        );
+        // No code at all keeps the old reading.
+        assert!(
+            resolve_says_file_absent(not_found, &reqwest::header::HeaderMap::new(), "o/r", "main")
+                .unwrap()
+        );
+        for status in [reqwest::StatusCode::OK, reqwest::StatusCode::UNAUTHORIZED] {
+            assert!(
+                !resolve_says_file_absent(status, &error_code("EntryNotFound"), "o/r", "main")
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_repo_or_revision_is_an_error_not_an_absent_file() {
+        let not_found = reqwest::StatusCode::NOT_FOUND;
+        // What an authenticated request for a nonexistent repo gets.
+        assert!(matches!(
+            resolve_says_file_absent(not_found, &error_code("RepoNotFound"), "o/r", "main"),
+            Err(FetchError::RepoNotFound { repo_id }) if repo_id == "o/r"
+        ));
+        let err = resolve_says_file_absent(not_found, &error_code("RevisionNotFound"), "o/r", "v9")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"v9\"") && err.contains("o/r"), "got: {err}");
+    }
 
     // ---------- resolve_redirect_url ----------
 

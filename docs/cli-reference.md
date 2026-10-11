@@ -183,7 +183,7 @@ hf-fm search fp4 --tag bitsandbytes
 hf-fm search fp4 --tag bitsandbytes --show tags,size
 
 # Find a private repo (or size a gated one) with an auth token
-# (or set HF_TOKEN instead of passing --token explicitly)
+# (without --token, hf-fm uses HF_TOKEN, else the token file `hf auth login` writes)
 hf-fm search my-private-model --token hf_xxxxxxxxxxxxxxxxxxxx --show size
 ```
 
@@ -564,7 +564,7 @@ hf-fm cache verify google/gemma-2-2b-it --revision v1.0
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--revision` | Git revision (branch, tag, SHA) | main |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 `cache verify` fetches the expected SHA256 digests from the HuggingFace API and recomputes each cached file's digest locally. Per-file outcomes:
 
@@ -588,7 +588,7 @@ Exit code is non-zero only when at least one file mismatched; `skipped` and `mis
 | `--revision-a` | Git revision for model A | main |
 | `--revision-b` | Git revision for model B | main |
 | `--summary` | Show only the summary line (counts per category; conflicts with `--dtypes` and `--collapse`) | off |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 ## Diff-config flags
 
@@ -599,7 +599,7 @@ Exit code is non-zero only when at least one file mismatched; `skipped` and `mis
 | `--json` | Output the full diff as JSON — every `ModelConfig` field, each with a `differs` flag, regardless of `--all` | off |
 | `--revision-a` | Git revision for model A | main |
 | `--revision-b` | Git revision for model B | main |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 ## Download flags
 
@@ -620,7 +620,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--revision` | Git revision (branch, tag, SHA) | main |
 | `--timeout-per-file-secs` | Per-file transfer timeout, in seconds. The ceiling on any single file. Raise it for large files on slow links — at ~10 MiB/s the 300 s default caps progress at roughly 3 GiB, so try `1800` for files in the 5–15 GiB range. | 300 |
 | `--timeout-total-secs` | Overall wall-clock budget for the whole invocation, in seconds (including retries and, since v0.10.5, in-flight files — not just a between-files check). Independent of `--timeout-per-file-secs`; the effective cap on any file is whichever of the two elapses first. Applies to `download-file`'s single file too. | no limit |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 ## List-files flags
 
@@ -633,7 +633,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--preset` | Filter preset: `safetensors`, `gguf`, `npz`, `pth`, `config-only` | — |
 | `--revision` | Git revision (branch, tag, SHA) | main |
 | `--show-cached` | Show cache status: complete (✓), partial, or missing (✗) | off |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 ## Search flags
 
@@ -645,7 +645,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--pipeline` | Filter by pipeline task (e.g., `text-generation`, `text-classification`) | — |
 | `--tag` | Filter by model tag (e.g., `gguf`, `conversational`, `imatrix`) | — |
 | `--show` | Comma-separated columns to add: `tags` (free; from the existing API payload), `size` (one extra HTTP request per result, bounded to 8 concurrent) — a repo whose `.gguf` files are mutually-exclusive quant alternatives renders a `min to max` range instead of a misleading sum. | — |
-| `--token` | Auth token (or set `HF_TOKEN` env var). A gated repo is typically still visible without one (gating restricts content downloads, not search visibility or file-size metadata) — mainly matters for finding a private repo the token has access to, and for sizing it under `--show size`. | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes). A gated repo is typically still visible without one (gating restricts content downloads, not search visibility or file-size metadata) — mainly matters for finding a private repo the token has access to, and for sizing it under `--show size`. | — |
 
 ## Quants flags
 
@@ -655,7 +655,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--fits SIZE` | VRAM budget to fit within (e.g. `16GiB`). Adds `RESIDENT`/`PLAN` columns. Candidates already under `SIZE` minus `--reserve` are never inspected. | — |
 | `--json` | Output the full table as JSON: `{repo_id, artifacts[{artifact, size_bytes, repo, bits, verification, verification_note, fit}]}` | off |
 | `--reserve SIZE` | Bytes reserved out of `--fits` for KV cache / runtime overhead. Requires `--fits`. | none |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 ## List-families flags
 
@@ -671,7 +671,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--json` | Output the status report as JSON. All-repos: `{repos:[{repo_id,file_count,size,has_partial}],model_count}`. Per-repo: `{repo_id,revision,commit_hash,cache_path,files:[{filename,state,local_size?,expected_size?}],summary:{total,complete,partial,missing,excluded}}`, where `state` is `complete` / `partial` / `missing` / `excluded`. | off |
 | `--preset` | Re-evaluate which remote files are deliberate skips. Files not matching this preset's glob list (`safetensors`, `gguf`, `npz`, `pth`, `config-only`) are reported as `excluded` instead of `MISSING`. Overrides the value persisted in `.hf-fm-snapshot.json` by `download --preset`. | sidecar value (or none) |
 | `--revision` | Git revision (branch, tag, SHA) | main |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 ## Info flags
 
@@ -680,7 +680,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--json` | Output metadata and README as JSON | off |
 | `--lines` | Maximum lines of README to display (0 = all) | 40 |
 | `--revision` | Git revision (branch, tag, SHA) | main |
-| `--token` | Auth token (or set `HF_TOKEN` env var) | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes) | — |
 
 ## Inspect flags
 
@@ -700,7 +700,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--pick` | Pick the file to inspect interactively from a numbered list (v0.10.5+). With no `FILENAME`, offers every supported tensor file; with a `FILENAME`, treats it as a **case-insensitive substring** filter — a unique match auto-resolves (with a `Resolving to <name>` note on stderr), several matches prompt `Pick [1..N]:` on stderr. Under `--pick` the positional is never a numeric index. Requires an interactive terminal (stdin + stderr); the prompt goes to stderr, so `--json` stdout can be redirected. Empty input cancels with a non-zero exit. Composes with every rendering flag; conflicts with `--list`. | off |
 | `--tree` | Show a hierarchical tree view grouped by dotted namespace prefix; numeric sibling groups with identical sub-structure collapse to `[0..N]`, tolerating up to 3 structurally-different siblings at each edge of the range (raised from 1 in v0.12.0, motivated by DeepSeek-V3's `first_k_dense_replace=3`; the original v0.11.4 tolerance of 1 covered e.g. a first block that fuses an extra input-embedding `LayerNorm`), each outlier rendered standalone next to the collapsed majority. Composes with `--filter` and `--json`. Conflicts with `--dtypes`, `--group-by`, and `--limit`. | off |
 | `--revision` | Git revision (branch, tag, SHA) | main |
-| `--token` | Auth token (or set `HF_TOKEN` env var). Required for gated repos, together with an accepted license — each gated family (Llama 3.1 vs 3.2, …) is licensed separately. | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes). Required for gated repos, together with an accepted license — each gated family (Llama 3.1 vs 3.2, …) is licensed separately. | — |
 
 ## Peek flags
 
@@ -713,7 +713,7 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--no-gunzip` | Disable gzip auto-detection for a `.gz`-suffixed filename (read the raw compressed bytes). Conflicts with `--gunzip`. | off |
 | `--revision` | Git revision (branch, tag, SHA) | main |
 | `--tail N` | Print only the last `N` lines (backward chunk scan, doubling the window each round, bounded by `--max`) or bytes (`--bytes`; a single Range-from-end request). A short file's fewer-than-`N` lines print in full with no truncation note. Conflicts with `--head` and `--gunzip`. | — |
-| `--token` | Auth token (or set `HF_TOKEN` env var). Required for gated repos, same as `inspect`. | — |
+| `--token` | Auth token (default: `HF_TOKEN`, else the token file `hf auth login` writes). Required for gated repos, same as `inspect`. | — |
 
 No `--cached` flag — the cached equivalent is `cat $(hf-fm cache path <REPO_ID>)/<FILE>` (`Get-Content` on PowerShell), which doesn't need duplicating. No `--json`: `peek` prints raw file content, not structured data.
 

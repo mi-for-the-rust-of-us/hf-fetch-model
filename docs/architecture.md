@@ -66,6 +66,7 @@ hf-fetch-model   (the library; the hf-fm CLI is behind feature "cli")
 | `peek` | public | Small-file reads (`hf-fm peek`), with optional gzip decoding |
 | `cache` | public | Cache inspection, status, disk usage, verification and cleanup |
 | `cache_layout` | public | Path construction for the HF cache layout and hf-fetch-model's sidecars |
+| `auth` | public | `resolve_token`: the token every request carries, explicit or found the way `huggingface_hub` finds one (`HF_TOKEN`, the `hf auth login` token file) |
 | `checksum` | public | SHA256 verification |
 | `error` | public | `FetchError` and `FileFailure` |
 | `progress` | public | `ProgressEvent`, `ProgressReceiver` and `IndicatifProgress` |

@@ -94,7 +94,7 @@ struct DownloadArgs {
     #[arg(long)]
     revision: Option<String>,
 
-    /// Authentication token (or set `HF_TOKEN` env var).
+    /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
     #[arg(long)]
     token: Option<String>,
 
@@ -225,7 +225,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// per result, fanned out through a bounded semaphore.
         #[arg(long, value_delimiter = ',', value_enum)]
         show: Vec<ShowColumn>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         ///
         /// A gated repo is typically still visible in search without one
         /// (gating restricts content downloads, not search visibility or
@@ -279,7 +279,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// this flag.
         #[arg(long, requires = "fits")]
         cache_headers: bool,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Output the full table as JSON.
@@ -293,7 +293,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Git revision (branch, tag, or commit SHA).
         #[arg(long)]
         revision: Option<String>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Output metadata and README as JSON.
@@ -319,7 +319,7 @@ See also: hf-fm list-families, hf-fm discover")]
         #[arg(long)]
         revision: Option<String>,
 
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
 
@@ -369,7 +369,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Git revision (branch, tag, or commit SHA).
         #[arg(long)]
         revision: Option<String>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Re-evaluate which remote files are deliberate skips. Files not
@@ -398,7 +398,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Git revision for model B.
         #[arg(long)]
         revision_b: Option<String>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Cache-only mode: fail if files are not cached locally.
@@ -460,7 +460,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Git revision for model B.
         #[arg(long)]
         revision_b: Option<String>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Cache-only mode: fail if `config.json` is not cached locally.
@@ -534,7 +534,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Git revision (branch, tag, or commit SHA).
         #[arg(long)]
         revision: Option<String>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Cache-only mode: fail if the file is not cached locally.
@@ -666,7 +666,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Git revision (branch, tag, or commit SHA).
         #[arg(long)]
         revision: Option<String>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Print only the first N lines (or bytes, with `--bytes`).
@@ -703,7 +703,7 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Git revision (branch, tag, or commit SHA).
         #[arg(long)]
         revision: Option<String>,
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
         /// Include glob pattern (repeatable).
@@ -824,7 +824,7 @@ enum CacheCommands {
         #[arg(long)]
         revision: Option<String>,
 
-        /// Authentication token (or set `HF_TOKEN` env var).
+        /// Authentication token (default: `HF_TOKEN`, else the token file `hf auth login` writes).
         #[arg(long)]
         token: Option<String>,
     },
@@ -6825,16 +6825,15 @@ fn enrich_gated_content_error(err: FetchError, repo_id: &str, token: Option<&str
         return err;
     }
 
-    // BORROW: explicit .map(ToOwned::to_owned) for Option<&str> → Option<String>
-    let effective_token = token
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    // The token the failed request carried: the given one, or the implicit
+    // one every client of the library resolves (`HF_TOKEN`, the token file).
+    let effective_token = hf_fetch_model::auth::resolve_token(token);
 
     let reason = if effective_token.is_none() {
         format!(
             "{repo_id} is a gated model — its file listing is public but content \
-             requires access: accept the license at https://huggingface.co/{repo_id} \
-             and set HF_TOKEN or pass --token"
+             requires access: accept the license at https://huggingface.co/{repo_id}, \
+             then set HF_TOKEN, pass --token, or log in with `hf auth login`"
         )
     } else {
         format!(

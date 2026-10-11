@@ -56,8 +56,9 @@ In scope:
   gzip decoding) that reads past its size cap.
 - **Path traversal** when materializing downloaded files or reading cached
   ones (a repo whose file list contains `../` escapes).
-- **Credential leakage** — `HF_TOKEN` or `--token` appearing in logs, error
-  messages, panics, or written to disk.
+- **Credential leakage** — a token (from `--token`, `HF_TOKEN`, or the token
+  file `hf auth login` writes) appearing in logs, error messages, panics, or
+  written to disk, or sent anywhere but `https://huggingface.co`.
 - **TLS / transport** weaknesses in how requests are made.
 
 Out of scope:
@@ -73,6 +74,11 @@ Out of scope:
 - `unsafe_code = "forbid"` for the whole crate (the `[lints.rust]` table in
   `Cargo.toml`).
 - Input-size caps in the format parsers (via `anamnesis`).
+- Every request is addressed to the fixed endpoint `https://huggingface.co`,
+  whose redirects lead to its CDN, never to an `HF_ENDPOINT` from the
+  environment. The token is dropped on the cross-host redirect to the CDN,
+  and hf-fm's own clients mark the `Authorization` header sensitive so it
+  stays out of `Debug` output.
 - Names the Hub sends are checked before they become cache paths: an etag
   or commit hash must be one plain file name, and a listed filename must stay
   inside its snapshot directory (no `..`, no absolute path), or the download

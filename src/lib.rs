@@ -236,8 +236,12 @@
 //!
 //! ## Authentication
 //!
-//! Set the `HF_TOKEN` environment variable to access private or gated models,
-//! or use [`FetchConfig::builder().token()`](FetchConfigBuilder::token).
+//! Pass a token with [`FetchConfig::builder().token()`](FetchConfigBuilder::token)
+//! to access private or gated models. Without one, every request carries the
+//! token the Python tools would use (since v0.12.2): `HF_TOKEN`, else the
+//! token file `hf auth login` writes; `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` turns
+//! that off. [`auth::resolve_token`] gives the rules and tells which token
+//! will be sent.
 //!
 //! Gated repos (Meta Llama, Google Gemma, …) additionally require accepting
 //! the license on the model's `HuggingFace` page — once per gated family
@@ -252,6 +256,7 @@
 //! emits (v0.10.5).
 
 mod atomic_write;
+pub mod auth;
 pub mod cache;
 pub mod cache_layout;
 pub mod checksum;
@@ -306,17 +311,33 @@ use crate::repo::ModelRepo;
 /// [`cache::hf_cache_dir`] the single source of truth it already is for
 /// `du` / `status` / `cache *` / `inspect --cached`.
 ///
+/// **So are the endpoint, the token and the HTTP client**, for the same
+/// reason: `hf-hub` 1.0 reads `HF_ENDPOINT`, `HF_TOKEN` and the token file by
+/// rules of its own, and its unreleased 1.1 reads no environment at all.
+/// Left to it, one download would mix requests to two hosts, or
+/// authenticated and anonymous ones, with this crate's own clients. So:
+///
+/// - the endpoint is `https://huggingface.co`, where this crate's own
+///   requests go too;
+/// - the token is [`auth::resolve_token`]'s, the one every client of this
+///   crate carries;
+/// - the client is [`chunked::build_hf_hub_client`]'s, which has the same
+///   30-second connect timeout as the crate's own clients.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Api`] if the `hf-hub` client cannot be constructed.
+/// Returns [`FetchError::Http`] if its `reqwest` client cannot be built.
 /// Returns [`FetchError::Io`] if the home directory cannot be determined and
 /// no explicit `output_dir` was configured.
 fn build_model_repo(repo_id: &str, config: &FetchConfig) -> Result<ModelRepo, FetchError> {
-    let mut builder = HFClient::builder();
+    let mut builder = HFClient::builder()
+        .endpoint(chunked::HF_ENDPOINT)
+        .client(chunked::build_hf_hub_client()?);
 
-    if let Some(ref token) = config.token {
-        // BORROW: explicit .clone() to pass owned String
-        builder = builder.token(token.clone());
+    // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+    if let Some(token) = auth::resolve_token(config.token.as_deref()) {
+        builder = builder.token(token);
     }
 
     let cache_dir = match config.output_dir {
@@ -340,9 +361,10 @@ fn build_model_repo(repo_id: &str, config: &FetchConfig) -> Result<ModelRepo, Fe
 
 /// Pre-flight check for gated model access.
 ///
-/// Two cases:
-/// - **No token**: checks the model metadata (unauthenticated) for gating
-///   status and rejects with a clear message if gated.
+/// Two cases, decided on the token the download will actually carry
+/// ([`auth::resolve_token`]: the configured one, or else the implicit one):
+/// - **No token**: checks the model metadata for gating status and rejects
+///   with a clear message if gated.
 /// - **Token present**: if the model is gated, makes one authenticated
 ///   metadata request to verify the token actually grants access. Catches
 ///   invalid tokens and unaccepted licenses before the download starts.
@@ -361,20 +383,23 @@ async fn preflight_gated_check(repo_id: &str, config: &FetchConfig) -> Result<()
     }
 
     // Model is gated — check auth.
-    if config.token.is_none() {
+    // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+    let Some(token) = auth::resolve_token(config.token.as_deref()) else {
         return Err(FetchError::Auth {
             reason: format!(
                 "{repo_id} is a gated model — accept the license at \
-                 https://huggingface.co/{repo_id} and set HF_TOKEN or pass --token"
+                 https://huggingface.co/{repo_id}, then set HF_TOKEN, pass --token, \
+                 or log in with `hf auth login`"
             ),
         });
-    }
+    };
 
     // Token is present — verify it grants access with a lightweight probe.
-    let probe_client = chunked::build_client(config.token.as_deref())?;
+    // BORROW: explicit .as_str() for String → &str conversion
+    let probe_client = chunked::build_client(Some(token.as_str()))?;
     let probe = repo::list_repo_files_with_metadata(
         repo_id,
-        config.token.as_deref(),
+        Some(token.as_str()),
         config.revision.as_deref(),
         &probe_client,
     )
