@@ -136,6 +136,24 @@ pub enum FetchError {
         /// The actual extension without the leading dot, or `unknown` if none.
         extension: String,
     },
+
+    /// A name the Hub sent is not safe to turn into a path inside the cache.
+    ///
+    /// An etag or commit hash from a response header must be a single plain
+    /// file name ([`crate::cache_layout::is_safe_hub_name`]), and a filename
+    /// from a repo listing must stay inside its snapshot directory
+    /// ([`crate::cache_layout::is_safe_repo_filename`]). The Hub's own
+    /// values always qualify, so this signals a malformed or tampered
+    /// response; nothing is written when it is returned.
+    #[error(
+        "refusing the {kind} {name:?} from the Hub: it is not a safe name for a path in the cache"
+    )]
+    UnsafeName {
+        /// What the name is: `"etag"`, `"commit hash"` or `"filename"`.
+        kind: &'static str,
+        /// The value as the Hub sent it.
+        name: String,
+    },
 }
 
 /// A per-file download failure with structured context.

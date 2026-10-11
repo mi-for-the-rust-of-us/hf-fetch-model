@@ -197,6 +197,13 @@ pub(crate) async fn probe_range_support(
     // Clean extra quotes (same as hf-hub does).
     let etag = etag.replace('"', "");
 
+    // Both values become cache paths (`snapshots/{commit_hash}/`,
+    // `blobs/{etag}` and the chunked temp files beside it, the header-cache
+    // entry), so refuse anything that is not one plain file name before any
+    // of those paths is built.
+    crate::cache_layout::ensure_safe_hub_name("commit hash", commit_hash.as_str())?;
+    crate::cache_layout::ensure_safe_hub_name("etag", etag.as_str())?;
+
     // Follow redirect to CDN (or re-request directly) to get Content-Range
     // for the file size. The redirected URL itself is deliberately not
     // retained — see `RangeInfo::resolve_url`.
@@ -333,7 +340,10 @@ pub(crate) async fn download_chunked(
 ) -> Result<PathBuf, FetchError> {
     let total_size = range_info.content_length;
 
-    // Build cache paths following hf-hub layout.
+    // Build cache paths following hf-hub layout. The etag and commit hash were
+    // checked by the probe; the filename, from the repo listing, is checked
+    // here, before it is joined to the snapshot directory.
+    crate::cache_layout::ensure_safe_repo_filename(filename.as_str())?;
     let repo_dir = cache_dir.join(repo_folder.as_str());
     let blob_path = crate::cache_layout::blob_path(&repo_dir, range_info.etag.as_str());
     let pointer_path = crate::cache_layout::pointer_path(
@@ -882,6 +892,9 @@ async fn resolve_commit_hash(
     if let Ok(hash) = tokio::fs::read_to_string(&ref_path).await {
         let trimmed = hash.trim().to_owned();
         if !trimmed.is_empty() {
+            // It names `snapshots/{commit_hash}/` next; a refs file holding
+            // anything but a plain name is refused, not followed.
+            crate::cache_layout::ensure_safe_hub_name("commit hash", trimmed.as_str())?;
             return Ok(trimmed);
         }
     }
@@ -910,6 +923,7 @@ async fn resolve_commit_hash(
         .json()
         .await
         .map_err(|e| FetchError::Http(format!("resolve commit hash: {e}")))?;
+    crate::cache_layout::ensure_safe_hub_name("commit hash", info.sha.as_str())?;
 
     // Write refs file for future use.
     let refs_dir = crate::cache_layout::refs_dir(repo_dir);
@@ -950,6 +964,7 @@ pub(crate) async fn download_direct(
     filename: &str,
     cache_dir: &Path,
 ) -> Result<PathBuf, FetchError> {
+    crate::cache_layout::ensure_safe_repo_filename(filename)?;
     let repo_dir = crate::cache_layout::repo_dir(cache_dir, repo_id);
 
     // Resolve the commit hash (from refs file or HF API).

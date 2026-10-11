@@ -140,6 +140,97 @@ pub fn header_cache_path(repo_dir: &Path, filename: &str, etag: &str) -> PathBuf
     header_cache_dir(repo_dir).join(name)
 }
 
+/// Longest etag or commit hash [`is_safe_hub_name`] accepts, in bytes.
+///
+/// The Hub's values are 40 (git SHA-1) or 64 (SHA-256) hex digits. 200
+/// leaves room for the longest suffix this crate appends to an etag
+/// (`.chunked.part.state.tmp`, 23 bytes) within the 255-byte file-name limit
+/// of the common filesystems.
+const MAX_HUB_NAME_LEN: usize = 200;
+
+/// Whether `name`, an etag or a commit hash the Hub sent in a response
+/// header, is safe to use as one file or directory name inside the cache.
+///
+/// These values become `blobs/{etag}`, `blobs/{etag}.chunked.part`,
+/// `.hf-fm-header-cache/….{etag}.json` and `snapshots/{commit_hash}/`, so a
+/// value such as `../../x` would otherwise name a path outside the repo
+/// directory. The Hub's own values are hex digests, which lets the rule be an
+/// allowlist rather than a list of dangers: ASCII letters, digits, `.`, `-`
+/// and `_`, starting and ending with a letter or digit (so never `.`, `..`,
+/// or a trailing dot that Windows would silently drop), and at most 200
+/// bytes, which leaves room for the longest suffix this crate appends
+/// within the 255-byte file-name limit of the common filesystems.
+#[must_use]
+pub fn is_safe_hub_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let (Some(first), Some(last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    bytes.len() <= MAX_HUB_NAME_LEN
+        && first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// Whether `filename`, a file's path within a repo as the Hub lists it
+/// (`config.json`, `subdir/model.safetensors`), stays inside the snapshot
+/// directory it is joined to.
+///
+/// Rejects an empty name; an absolute path, which [`Path::join`] would let
+/// replace the snapshot directory outright; an empty, `.` or `..` component;
+/// a backslash, which is a separator on Windows; a colon, which names a
+/// drive or an NTFS alternate data stream there; and a NUL. The Hub keeps
+/// repos in git, which already refuses most of these, so this is defence in
+/// depth for every path this crate builds from a listed filename.
+#[must_use]
+pub fn is_safe_repo_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && !filename.contains(['\\', ':', '\0'])
+        && filename
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+/// [`is_safe_hub_name`] as a `Result`, for the call sites that must stop.
+///
+/// # Errors
+///
+/// Returns [`crate::FetchError::UnsafeName`] carrying `kind` (`"etag"` or
+/// `"commit hash"`) when `name` is not safe.
+pub(crate) fn ensure_safe_hub_name(
+    kind: &'static str,
+    name: &str,
+) -> Result<(), crate::FetchError> {
+    if is_safe_hub_name(name) {
+        Ok(())
+    } else {
+        Err(crate::FetchError::UnsafeName {
+            kind,
+            // BORROW: explicit .to_owned() for &str → owned String field
+            name: name.to_owned(),
+        })
+    }
+}
+
+/// [`is_safe_repo_filename`] as a `Result`, for the call sites that must stop.
+///
+/// # Errors
+///
+/// Returns [`crate::FetchError::UnsafeName`] when `filename` is not safe.
+pub(crate) fn ensure_safe_repo_filename(filename: &str) -> Result<(), crate::FetchError> {
+    if is_safe_repo_filename(filename) {
+        Ok(())
+    } else {
+        Err(crate::FetchError::UnsafeName {
+            kind: "filename",
+            // BORROW: explicit .to_owned() for &str → owned String field
+            name: filename.to_owned(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
@@ -218,6 +309,66 @@ mod tests {
             rd.join(".hf-fm-header-cache")
                 .join("model.gguf.abc.def.json")
         );
+    }
+
+    #[test]
+    fn hub_names_the_hub_sends_are_safe() {
+        assert!(is_safe_hub_name(
+            "9a3f7c1e0b2d4f6a8c0e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a"
+        ));
+        assert!(is_safe_hub_name("1110a243fdf4706b3f48f1d95db1a4f5529b4d41"));
+        // Etags with periods occur in the tests above and must stay valid.
+        assert!(is_safe_hub_name("abc.def"));
+        assert!(is_safe_hub_name("a-b_c.d"));
+        assert!(is_safe_hub_name(&"a".repeat(MAX_HUB_NAME_LEN)));
+    }
+
+    #[test]
+    fn hub_names_that_could_leave_their_directory_are_refused() {
+        for name in [
+            "", ".", "..", "../x", "a/b", "a\\b", "/abs", "c:x", "x.", ".hidden", "-x-", "a b",
+            "a\0b", "é",
+        ] {
+            assert!(!is_safe_hub_name(name), "{name:?} should be refused");
+        }
+        assert!(!is_safe_hub_name(&"a".repeat(MAX_HUB_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn repo_filenames_the_hub_lists_are_safe() {
+        for name in [
+            "config.json",
+            "model-00001-of-00002.safetensors",
+            "1_Pooling/config.json",
+            "layer_9/width_16k/average_l0_47/params.npz",
+            ".gitattributes",
+            "..data",
+            "a..b",
+        ] {
+            assert!(is_safe_repo_filename(name), "{name:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn repo_filenames_that_could_leave_the_snapshot_are_refused() {
+        for name in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../../x",
+            "a/./b",
+            ".",
+            "..",
+            "a//b",
+            "a/",
+            "a\\..\\b",
+            "c:\\x",
+            "C:x",
+            "file.txt:stream",
+            "a\0b",
+        ] {
+            assert!(!is_safe_repo_filename(name), "{name:?} should be refused");
+        }
     }
 
     #[test]

@@ -483,6 +483,10 @@ pub async fn repo_status(
 
         let local_path = snapshot_dir
             .as_ref()
+            // A listed name that could leave the snapshot directory is never
+            // joined to it; the file then reads as absent.
+            // BORROW: explicit .as_str() instead of Deref coercion
+            .filter(|_| crate::cache_layout::is_safe_repo_filename(remote.filename.as_str()))
             // BORROW: explicit .as_str() for path construction
             .map(|dir| dir.join(remote.filename.as_str()));
 
@@ -698,7 +702,10 @@ pub fn repo_has_partial(repo_id: &str) -> Result<bool, FetchError> {
 /// Reads the commit hash from a refs file, if it exists.
 ///
 /// Looks for `<repo_dir>/refs/<revision>` and returns the trimmed contents
-/// (a commit hash) or `None` if the file does not exist or is empty.
+/// (a commit hash) or `None` if the file does not exist, is empty, or holds
+/// anything other than one plain name
+/// ([`crate::cache_layout::is_safe_hub_name`]): every caller goes on to build
+/// `snapshots/<commit_hash>/` from it.
 #[must_use]
 pub fn read_ref(repo_dir: &Path, revision: &str) -> Option<String> {
     let ref_path = crate::cache_layout::ref_path(repo_dir, revision);
@@ -706,7 +713,8 @@ pub fn read_ref(repo_dir: &Path, revision: &str) -> Option<String> {
         .ok()
         // BORROW: explicit .to_owned() to convert trimmed &str → owned String
         .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
+        // BORROW: explicit .as_str() instead of Deref coercion
+        .filter(|s| crate::cache_layout::is_safe_hub_name(s.as_str()))
 }
 
 /// Returns the truly-downloaded byte count of a file's own chunked-download
@@ -726,7 +734,8 @@ pub fn read_ref(repo_dir: &Path, revision: &str) -> Option<String> {
 /// the blob's file length when the sidecar is absent or unparseable
 /// (pre-v0.9.8 leftovers).
 fn partial_chunk_size(repo_dir: &Path, sha256: Option<&str>) -> Option<u64> {
-    let sha = sha256?;
+    // The sha256 comes from the Hub's listing and names a path below.
+    let sha = sha256.filter(|s| crate::cache_layout::is_safe_hub_name(s))?;
     let part_path = crate::cache_layout::temp_blob_path(repo_dir, sha);
     let part_len = std::fs::metadata(part_path)
         .ok()
@@ -1444,6 +1453,10 @@ where
         let index = i + 1;
         let local_path = snapshot_dir
             .as_ref()
+            // A listed name that could leave the snapshot directory is never
+            // joined to it; the file then reads as absent.
+            // BORROW: explicit .as_str() instead of Deref coercion
+            .filter(|_| crate::cache_layout::is_safe_repo_filename(remote.filename.as_str()))
             // BORROW: explicit .as_str() for path construction
             .map(|dir| dir.join(remote.filename.as_str()));
 
@@ -1648,6 +1661,46 @@ mod tests {
             "only the finished file is listed, got {:?}",
             walk.files
         );
+    }
+
+    /// Every caller builds `snapshots/<commit>/` from what `read_ref`
+    /// returns, so a refs file that would make that path climb out of the
+    /// repo reads as no ref at all.
+    #[test]
+    fn read_ref_refuses_a_commit_hash_that_is_not_one_plain_name() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(1);
+        let refs = crate::cache_layout::refs_dir(&repo_dir);
+        std::fs::create_dir_all(&refs).unwrap();
+
+        std::fs::write(
+            refs.join("main"),
+            "1110a243fdf4706b3f48f1d95db1a4f5529b4d41\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_ref(&repo_dir, "main").as_deref(),
+            Some("1110a243fdf4706b3f48f1d95db1a4f5529b4d41")
+        );
+
+        for bad in ["../../../escape", "a/b", "", "   ", "c:\\x"] {
+            std::fs::write(refs.join("main"), bad).unwrap();
+            assert_eq!(
+                read_ref(&repo_dir, "main"),
+                None,
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    /// A `sha256` from the Hub's listing names a temp-blob path, so one that
+    /// is not a plain name is never looked up.
+    #[test]
+    fn partial_chunk_size_ignores_an_unsafe_sha256() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(1);
+        let blobs = crate::cache_layout::blobs_dir(&repo_dir);
+        std::fs::write(blobs.join("cafe.chunked.part"), vec![0u8; 64]).unwrap();
+        assert_eq!(partial_chunk_size(&repo_dir, Some("cafe")), Some(64));
+        assert_eq!(partial_chunk_size(&repo_dir, Some("../blobs/cafe")), None);
     }
 
     /// Writes `bytes` at `path` with its modification time set `days_ago`.

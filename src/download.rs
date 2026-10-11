@@ -211,6 +211,14 @@ pub async fn download_all_files_map(
         .filter(|f| file_matches(f.filename.as_str(), include, exclude))
         .collect();
 
+    // Every selected name is joined to `snapshots/{commit}/` below, first by
+    // the cache fast-path and then by the download itself, so the whole
+    // download is refused before any of them becomes a path.
+    for file in &files {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        crate::cache_layout::ensure_safe_repo_filename(file.filename.as_str())?;
+    }
+
     // Cache fast-path: every filtered remote file must exist on disk in
     // the snapshot directory. Returns `None` if any single file is
     // missing — partial caches fall through to the regular download
@@ -505,6 +513,9 @@ pub(crate) async fn download_file_by_name(
     filename: &str,
     config: &FetchConfig,
 ) -> Result<DownloadOutcome<PathBuf>, FetchError> {
+    // The name is joined to the snapshot directory below, so refuse it first.
+    crate::cache_layout::ensure_safe_repo_filename(filename)?;
+
     // Check local cache first — return immediately if the file is present.
     let cache_dir = config
         .output_dir
@@ -1082,6 +1093,9 @@ fn resolve_cached_file(
     revision: &str,
     filename: &str,
 ) -> Option<PathBuf> {
+    if !crate::cache_layout::is_safe_repo_filename(filename) {
+        return None;
+    }
     let repo_dir = cache_dir.join(repo_folder);
     let commit_hash = crate::cache::read_ref(&repo_dir, revision)?;
     let cached_path = crate::cache_layout::pointer_path(&repo_dir, &commit_hash, filename);
@@ -1174,6 +1188,12 @@ fn check_all_filenames_present(
 
     let mut file_map = HashMap::with_capacity(filenames.len());
     for filename in filenames {
+        // An unsafe name is never joined; declining the fast-path hands it to
+        // the download path, which refuses it with an error.
+        // BORROW: explicit .as_str() instead of Deref coercion
+        if !crate::cache_layout::is_safe_repo_filename(filename.as_str()) {
+            return None;
+        }
         // BORROW: explicit .as_str() instead of Deref coercion
         let path = snapshot_dir.join(filename.as_str());
         if !path.is_file() {

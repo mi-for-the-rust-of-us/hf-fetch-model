@@ -625,6 +625,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `publish.yml` and `ci.yml` that builds, packages or publishes uses
   `--locked`, except a plain `cargo test` that each workflow keeps beside its
   `--locked --all-features` run.
+- **Names the Hub sends are checked before they become cache paths.** An
+  etag and a commit hash from response headers name `blobs/<etag>`, the
+  chunked download's temp files, the header-cache entry and
+  `snapshots/<commit>/`, and a filename from a repo listing is joined to that
+  snapshot directory. None was checked, so a value such as `../../x`, or an
+  absolute path, which `Path::join` lets replace the base outright, would
+  have named a path outside the repo directory.
+  - Etags and commit hashes must now be one plain name: letters, digits,
+    `.`, `-` and `_`, starting and ending with a letter or digit, at most
+    200 bytes (`cache_layout::is_safe_hub_name`).
+  - A listed filename must stay inside the snapshot directory: no empty, `.`
+    or `..` component, no leading `/`, no backslash, colon or NUL
+    (`cache_layout::is_safe_repo_filename`).
+  - A download, or a `download-file`, holding such a name stops with the new
+    `FetchError::UnsafeName` before anything is written. A refs file holding
+    one reads as no ref, and `status` / `cache verify` report such a file as
+    missing without touching the path.
+
+  The Hub only ever sends hex digests and git paths, which always pass, and
+  the endpoint is `https://huggingface.co` over TLS, so this is defence in
+  depth rather than the fix of an exploitable flaw.
 
 ## [0.12.1] — Quant-aware fit planning
 

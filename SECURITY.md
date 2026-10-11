@@ -73,6 +73,10 @@ Out of scope:
 - `unsafe_code = "forbid"` for the whole crate (the `[lints.rust]` table in
   `Cargo.toml`).
 - Input-size caps in the format parsers (via `anamnesis`).
+- Names the Hub sends are checked before they become cache paths: an etag
+  or commit hash must be one plain file name, and a listed filename must stay
+  inside its snapshot directory (no `..`, no absolute path), or the download
+  stops with `FetchError::UnsafeName` before anything is written.
 - Caps on every remote read: a remote `inspect` stops at 32 MiB transferred
   or 256 range requests, and `peek` stops at its `--max` size (10 MiB by
   default), counted after gzip decoding.
