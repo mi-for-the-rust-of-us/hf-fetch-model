@@ -2016,7 +2016,8 @@ mod tests {
 
     /// Creates a file symlink `link` → `target`, or returns `false` where
     /// the platform refuses one (Windows without Developer Mode), so a test
-    /// can skip instead of failing. Linux CI runs these tests in full.
+    /// can skip instead of failing. CI runs these tests in full on Linux and
+    /// on Windows, whose runners may create symlinks.
     fn try_symlink(target: &Path, link: &Path) -> bool {
         #[cfg(unix)]
         {
@@ -2031,6 +2032,13 @@ mod tests {
             let _ = (target, link);
             false
         }
+    }
+
+    /// A relative symlink target built from its components, so it carries
+    /// the platform's separator: Windows stores a target verbatim and cannot
+    /// follow a relative one written with `/`.
+    fn rel(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
     }
 
     /// `huggingface_hub` 1.32's layout for one repo whose file lives in the
@@ -2052,11 +2060,14 @@ mod tests {
         std::fs::create_dir_all(&blobs).unwrap();
         std::fs::create_dir_all(&snap).unwrap();
         for (i, etag) in etags.iter().enumerate() {
-            if !try_symlink(Path::new("../../blobs/9a/payload"), &blobs.join(etag)) {
+            if !try_symlink(
+                &rel(&["..", "..", "blobs", "9a", "payload"]),
+                &blobs.join(etag),
+            ) {
                 return None;
             }
             let pointer = snap.join(format!("file{i}.safetensors"));
-            if !try_symlink(&Path::new("../../blobs").join(etag), &pointer) {
+            if !try_symlink(&rel(&["..", "..", "blobs", *etag]), &pointer) {
                 return None;
             }
         }
@@ -2121,7 +2132,10 @@ mod tests {
         // A store exists, but neither link points into it.
         std::fs::create_dir_all(crate::cache_layout::shared_blobs_dir(tmp.path())).unwrap();
         if !try_symlink(&foreign, &blobs.join("outside"))
-            || !try_symlink(Path::new("../../blobs/9a/gone"), &blobs.join("dangling"))
+            || !try_symlink(
+                &rel(&["..", "..", "blobs", "9a", "gone"]),
+                &blobs.join("dangling"),
+            )
         {
             eprintln!("skipped: this platform refuses symlinks");
             return;

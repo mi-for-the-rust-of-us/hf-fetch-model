@@ -895,7 +895,8 @@ fn du_marks_a_repo_whose_partial_is_an_incomplete_file() {
 
 /// Creates a file symlink `link` → `target`, or returns `false` where the
 /// platform refuses one (Windows without Developer Mode), so a test can skip.
-/// Linux CI runs these tests in full.
+/// CI runs these tests in full on Linux and on Windows, whose runners may
+/// create symlinks.
 fn try_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
@@ -910,6 +911,13 @@ fn try_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
         let _ = (target, link);
         false
     }
+}
+
+/// A relative symlink target built from its components, so it carries the
+/// platform's separator: Windows stores a target verbatim and cannot follow a
+/// relative one written with `/`.
+fn rel(parts: &[&str]) -> std::path::PathBuf {
+    parts.iter().collect()
 }
 
 /// Lays out `huggingface_hub` 1.32's shared blob store under `hub`: one
@@ -930,10 +938,10 @@ fn repo_linking_shared_payload(hub: &std::path::Path, name: &str) -> Option<std:
     std::fs::create_dir_all(&blobs).expect("create blobs dir");
     std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
     (try_symlink(
-        std::path::Path::new("../../blobs/9a/payload"),
+        &rel(&["..", "..", "blobs", "9a", "payload"]),
         &blobs.join("e1"),
     ) && try_symlink(
-        std::path::Path::new("../../blobs/e1"),
+        &rel(&["..", "..", "blobs", "e1"]),
         &snapshot.join("model.safetensors"),
     ))
     .then_some(repo)
