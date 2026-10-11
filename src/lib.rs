@@ -170,14 +170,21 @@
 //! interrupted downloads.
 //!
 //! Since v0.12.2, a repo's size ([`cache::CachedModelSummary::total_size`],
-//! [`cache::repo_disk_usage`]) is the bytes it occupies on disk: every
-//! physical file in its directory, each counted once, which is what deleting
-//! the directory frees. Earlier versions counted `snapshots/` alone, so a
-//! Windows cache, whose snapshot entries are copies of their blobs, read as
-//! about half its size, and a symlinked Unix cache as almost nothing
+//! [`cache::repo_usage`]) is the bytes it occupies on disk: every physical
+//! file in its directory, each counted once, plus the payloads it links to
+//! in `huggingface_hub`'s shared blob store
+//! ([`cache::CachedModelSummary::shared_size`]). Deleting the directory
+//! frees all but those, which other repos may share; a cache-wide total
+//! counts the store once, through [`cache::shared_store_size`]. Earlier
+//! versions counted `snapshots/` alone, so a Windows cache, whose snapshot
+//! entries are copies of their blobs, read as about half its size, and a
+//! symlinked Unix cache as almost nothing
 //! ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)).
 //! The per-file listing from [`cache::cache_repo_usage`] keeps each file's
-//! own size.
+//! own size. Partial downloads are recognised whichever tool left them: this
+//! crate's `.chunked.part`, or the `.incomplete` files of `hf-hub` and
+//! `huggingface_hub` ([`cache::PartialFile::is_in_use`] tells whether one is
+//! still being written).
 //!
 //! For long verifications (multi-GiB safetensors files), drive
 //! [`cache::verify_cache_with_progress`] with an [`Fn`] callback that receives
