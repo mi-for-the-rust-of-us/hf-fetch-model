@@ -3508,7 +3508,7 @@ fn count_column_width(counts: impl Iterator<Item = usize>, floor: usize) -> usiz
 /// counted once: each repo's own bytes (its total less what it links in the
 /// store), plus the store's own size. Summing the repo totals instead would
 /// count a payload once per repo linking to it.
-fn cache_bytes_on_disk<'a>(repos: impl Iterator<Item = (u64, u64)> + 'a, store: u64) -> u64 {
+fn cache_bytes_on_disk(repos: impl Iterator<Item = (u64, u64)>, store: u64) -> u64 {
     repos
         .map(|(total, shared)| total.saturating_sub(shared))
         .fold(store, u64::saturating_add)
@@ -3519,13 +3519,13 @@ fn cache_bytes_on_disk<'a>(repos: impl Iterator<Item = (u64, u64)> + 'a, store: 
 fn shared_store_note(store: u64, cache_dir: &std::path::Path) -> Option<String> {
     (store > 0).then(|| {
         format!(
-            "  Note: {} sit in huggingface_hub's shared blob store ({}), which \
-             keeps each file once however many repos link to it. A repo's size \
-             counts the files it links there; the total counts the store once. \
-             Deleting a repo leaves them in place: `hf cache prune` reclaims \
-             what no repo links to.",
-            format_size(store),
-            hf_fetch_model::cache_layout::shared_blobs_dir(cache_dir).display()
+            "  Note: huggingface_hub's shared blob store ({}) holds {}, each \
+             file once however many repos link to it. A repo's size counts the \
+             files it links there; the total counts the store once. Deleting a \
+             repo leaves them in place; `hf cache prune` reclaims what no repo \
+             links to.",
+            hf_fetch_model::cache_layout::shared_blobs_dir(cache_dir).display(),
+            format_size(store)
         )
     })
 }
@@ -3794,9 +3794,9 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     }
     if usage.shared_size > 0 {
         println!(
-            "\n  Note: {} of this sits in huggingface_hub's shared blob store, \
-             where other repos may link the same files. Deleting this repo \
-             does not free it; `hf cache prune` reclaims what no repo links to.",
+            "\n  Note: {} of this repo is in huggingface_hub's shared blob store, \
+             where other repos may link the same files. Deleting the repo does \
+             not free it; `hf cache prune` reclaims what no repo links to.",
             format_size(usage.shared_size)
         );
     }
@@ -4183,7 +4183,8 @@ struct CacheTreeRepo {
     shared_size: u64,
     /// Number of files listed across the repo's snapshots.
     file_count: usize,
-    /// Whether the repo has any `.chunked.part` partial downloads.
+    /// Whether the repo holds a partial download's temp file (`.chunked.part`,
+    /// or the `.incomplete` of `hf-hub` / `huggingface_hub`).
     has_partial: bool,
     /// Most recent file modification time, if available.
     last_modified: Option<std::time::SystemTime>,
@@ -4717,7 +4718,7 @@ fn run_cache_delete(repo_id: &str, yes: bool) -> Result<(), FetchError> {
     );
     if usage.shared_size > 0 {
         println!(
-            "  {} of it sits in huggingface_hub's shared blob store and stays \
+            "  {} of it is in huggingface_hub's shared blob store and stays \
              there; `hf cache prune` reclaims what no repo links to.",
             format_size(usage.shared_size)
         );
@@ -5265,8 +5266,8 @@ fn render_gc_plan_preview(plan: &GcPlan) {
 
     if plan.shared_store > 0 {
         println!(
-            "Note: {} sit in huggingface_hub's shared blob store, counted once \
-             above. gc removes repos' links to it, never the files: \
+            "Note: huggingface_hub's shared blob store holds {}, counted once \
+             above. gc removes repos' links to it, never the files; \
              `hf cache prune` reclaims what no repo links to.",
             format_size(plan.shared_store)
         );
@@ -11670,6 +11671,38 @@ mod tests {
         let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
         assert_eq!(plan.evict.len(), 1);
         assert!(plan.skipped_partials.is_empty());
+    }
+
+    #[test]
+    fn compute_gc_plan_counts_the_shared_store_once_and_frees_only_own_bytes() {
+        // Two repos each hold 1000 bytes of their own and link the same
+        // 5000-byte payload in huggingface_hub's shared blob store.
+        let now = fixed_now();
+        let old = Some(now - Duration::from_secs(86_400 * 60));
+        let mut a = make_summary("shared/a", 6_000, old, false);
+        a.shared_size = 5_000;
+        let mut b = make_summary("shared/b", 6_000, old, false);
+        b.shared_size = 5_000;
+        let summaries = [a, b];
+
+        let mut crit = empty_criteria();
+        crit.max_size = Some(6_000);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 5_000);
+        // 1000 + 1000 + the store once, not 6000 + 6000.
+        assert_eq!(plan.size_before, 7_000);
+        assert_eq!(plan.shared_store, 5_000);
+        // One eviction frees its 1000 own bytes, which meets the budget.
+        assert_eq!(plan.evict.len(), 1);
+        assert_eq!(plan.evict[0].size, 1_000);
+        assert_eq!(plan.size_after, 6_000);
+        assert!(!plan.budget_shortfall);
+
+        // Below the store's own size, evicting repos cannot meet the budget.
+        crit.max_size = Some(4_000);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 5_000);
+        assert_eq!(plan.evict.len(), 2);
+        assert_eq!(plan.size_after, 5_000);
+        assert!(plan.budget_shortfall);
     }
 
     #[test]

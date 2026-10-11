@@ -933,7 +933,7 @@ fn repo_linking_shared_payload(hub: &std::path::Path, name: &str) -> Option<std:
         std::path::Path::new("../../blobs/9a/payload"),
         &blobs.join("e1"),
     ) && try_symlink(
-        std::path::Path::new("../../../blobs/e1"),
+        std::path::Path::new("../../blobs/e1"),
         &snapshot.join("model.safetensors"),
     ))
     .then_some(repo)
@@ -986,6 +986,18 @@ fn du_counts_the_shared_blob_store_once_across_repos() {
         assert_eq!(field(repo, "size"), Some(5000), "{repo}");
         assert_eq!(field(repo, "shared_bytes"), Some(5000), "{repo}");
     }
+
+    // The snapshot entry resolves through the repo's blob symlink to the
+    // payload, so the file is listed at its real size, not as a dangling 0.
+    let (stdout, stderr, success) =
+        run(hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["du", "test-org/a", "--json"]));
+    assert!(success, "du <repo> --json should succeed: {stderr}");
+    let json = parse_json(&stdout);
+    assert_eq!(field(&json, "listed_bytes"), Some(5000), "{json}");
+    assert_eq!(field(&json, "total_bytes"), Some(5000), "{json}");
+    assert_eq!(field(&json, "shared_bytes"), Some(5000), "{json}");
 }
 
 #[test]

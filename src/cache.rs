@@ -567,7 +567,8 @@ pub struct CachedModelSummary {
     pub file_count: usize,
     /// Physical bytes this repo occupies on disk: every file in its
     /// directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars),
-    /// counting each physical file once.
+    /// counting each physical file once, plus the payloads it links to in
+    /// `huggingface_hub`'s shared blob store, which live outside it.
     ///
     /// It is not the sum of the snapshot's logical file sizes. Where a
     /// snapshot entry is a full copy of its blob (always for files `hf-hub`
