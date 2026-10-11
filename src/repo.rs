@@ -186,7 +186,10 @@ pub async fn list_repo_files_with_commit(
     revision: Option<&str>,
     client: &reqwest::Client,
 ) -> Result<(Vec<RepoFile>, Option<String>), FetchError> {
-    let mut url = format!("https://huggingface.co/api/models/{repo_id}?blobs=true");
+    let mut url = format!(
+        "{}/api/models/{repo_id}?blobs=true",
+        crate::chunked::HF_ENDPOINT
+    );
     if let Some(rev) = revision {
         url = format!("{url}&revision={rev}");
     }

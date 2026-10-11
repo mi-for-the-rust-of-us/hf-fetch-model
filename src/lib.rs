@@ -401,8 +401,9 @@ async fn preflight_gated_check(repo_id: &str, config: &FetchConfig) -> Result<()
         return Err(FetchError::Auth {
             reason: format!(
                 "{repo_id} is a gated model — accept the license at \
-                 https://huggingface.co/{repo_id}, then set HF_TOKEN, pass --token, \
-                 or log in with `hf auth login`"
+                 {}/{repo_id}, then set HF_TOKEN, pass --token, \
+                 or log in with `hf auth login`",
+                chunked::HF_ENDPOINT
             ),
         });
     };
@@ -425,8 +426,9 @@ async fn preflight_gated_check(repo_id: &str, config: &FetchConfig) -> Result<()
             return Err(FetchError::Auth {
                 reason: format!(
                     "{repo_id} is a gated model and your token was rejected — \
-                     accept the license at https://huggingface.co/{repo_id} \
-                     and check that your token is valid"
+                     accept the license at {}/{repo_id} \
+                     and check that your token is valid",
+                    chunked::HF_ENDPOINT
                 ),
             });
         }

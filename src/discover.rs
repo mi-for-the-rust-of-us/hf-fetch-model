@@ -164,7 +164,11 @@ impl Default for ApiGated {
 }
 
 const PAGE_SIZE: usize = 100;
-const HF_API_BASE: &str = "https://huggingface.co/api/models";
+/// The Hub's models API: `{HF_ENDPOINT}/api/models`, on the one endpoint
+/// every request of this crate goes to ([`crate::chunked::HF_ENDPOINT`]).
+fn models_api_url() -> String {
+    format!("{}/api/models", crate::chunked::HF_ENDPOINT)
+}
 
 /// Queries the `HuggingFace` Hub API for top models by downloads
 /// and returns families not present in the local cache.
@@ -210,7 +214,7 @@ pub async fn discover_new_families<S: BuildHasher>(
         }
 
         let response = client
-            .get(HF_API_BASE)
+            .get(models_api_url())
             .query(&query_params)
             .send()
             .await
@@ -360,7 +364,7 @@ pub async fn search_models(
     }
 
     let response = client
-        .get(HF_API_BASE)
+        .get(models_api_url())
         .query(&query_params)
         .query(&[("limit", limit)])
         .send()
@@ -1123,7 +1127,7 @@ pub async fn fetch_tags_concurrent(repo_ids: Vec<String>) -> HashMap<String, Vec
 /// found, or if the implicit token is not a valid header value.
 pub async fn fetch_model_card(model_id: &str) -> Result<ModelCardMetadata, FetchError> {
     let client = crate::chunked::build_client(None)?;
-    let url = format!("{HF_API_BASE}/{model_id}");
+    let url = format!("{}/{model_id}", models_api_url());
 
     let response = client
         .get(url.as_str()) // BORROW: explicit .as_str()
