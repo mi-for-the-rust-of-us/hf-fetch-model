@@ -519,6 +519,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--all-targets --all-features`. That is exactly the split `CLAUDE.md`'s
   pre-commit item 2 exists for, and running one pass would have shipped it.
 
+- **docs.rs never documented `progress::IndicatifProgress`.** docs.rs builds
+  a crate with its default features, this crate has none, and the type is
+  gated on the `indicatif` feature, so every published version's docs left it
+  out while the `progress` module's own docs pointed readers to it. A new
+  `[package.metadata.docs.rs]` section in `Cargo.toml` asks for `indicatif`.
+  `cli` is not requested: it gates only the binaries' dependencies, and
+  docs.rs documents the library. Checked locally with the docs.rs build
+  (`cargo doc --no-deps --features indicatif`, warnings denied), which now
+  emits `struct.IndicatifProgress.html`; the default-feature build does not.
+
 ### Security
 
 - **Release pipeline hardened against registry-token theft**, the root cause

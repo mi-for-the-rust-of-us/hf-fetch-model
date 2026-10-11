@@ -17,6 +17,13 @@ default = []
 indicatif = ["dep:indicatif"]
 cli = ["dep:clap", "dep:tracing-subscriber", "indicatif"]
 
+# docs.rs builds with default features only, and `default = []` above, so
+# without this section `progress::IndicatifProgress` (gated on `indicatif`)
+# would be missing from the published docs. `cli` is left out on purpose: it
+# gates only the binaries' dependencies, and docs.rs documents the library.
+[package.metadata.docs.rs]
+features = ["indicatif"]
+
 [dependencies]
 # Format-parser features enable anamnesis's metadata parsers for the
 # `inspect <repo> file.<ext>` dispatch paths — both the `--cached` path
