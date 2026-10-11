@@ -669,7 +669,7 @@ No implementation order imposed — the six items are independent (different sub
 
 ---
 
-### v0.12.2 — Honest disk accounting & header-cache follow-through
+### v0.12.2 — Honest disk accounting & header-cache follow-through ✓
 
 **Theme.** Unlike v0.12.0 and v0.12.1, this patch was not planned in this roadmap ahead of time: it is what turned up after v0.12.1 shipped, on the maintainer's own 816 GiB Windows cache. Its spine is [#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16) ([report](../issues/hf-fetch-model-16-p1.md)). `du`, `status`, `cache gc` and `cache delete` measured a repo by its `snapshots/` alone, so the Windows copy layout read as half its size and a symlinked Unix cache as almost nothing. Fixing that made every repo-level figure *bytes on disk*, and most of the release is the follow-through: making `du <repo>` agree with the whole-cache view, then counting, bounding and honestly costing v0.12.1's own `--cache-headers` sidecar, whose row 5 above had promised repeat inspection "free on the second and third call". Like v0.12.0 and v0.12.1, nothing here needs a second GPU. As the last v0.12.x release it then took in everything a full re-verification of the docs and of the surrounding ecosystem turned up: how hf-fm authenticates, the partials and shared blob store of the Python tools, and the names the Hub sends. It ships as a patch although `du --json` values change and requests without a token now carry an implicit one. Its Rust API changes are additive (`auth::resolve_token`, `cache::repo_usage`, `cache::shared_store_size`, `PartialFile::is_in_use`, `FetchError::UnsafeName`, the last on a `#[non_exhaustive]` enum), except two new fields on `CachedModelSummary`, which has no `#[non_exhaustive]` and so breaks code that builds one by hand; none of hf-fm's consumers does (`CHANGELOG.md` carries notes for scripts and library callers).
 
@@ -697,7 +697,7 @@ No implementation order imposed — the six items are independent (different sub
 
 **Deferred out of this phase:** [#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21), reclaiming the duplicated Windows copies, which first needs a way to recognise a hard link on Windows without the unstable `windows_by_handle` or an `unsafe` Win32 call; the fixed size widths still in `status`, `cache verify`, `quants` and `inspect`; v0.12.1's noted follow-on of parallelising a header's sequential range requests; and, by the maintainer's decision, the candle-mi NPZ dogfooding items and the small anamnesis-side items (`nvfp4`, `QUANT_SCHEME_BITS`), each until work turns to that repo.
 
-**Status: implemented on `main`** (through `620dc32` and this roadmap update; every commit passed the full local gauntlet, and the Linux mirror ran the `cfg(unix)` paths). Pending before tagging v0.12.2: push and CI, rename `CHANGELOG.md`'s `[Unreleased]` → `[0.12.2]`, bump `Cargo.toml`/`Cargo.lock`.
+**Status: shipped** as v0.12.2, the last v0.12.x release. Every commit passed the full local gauntlet before landing, the Linux mirror of `ci.yml` ran the `cfg(unix)` paths, and a final consistency pass over the release's Rust code (14 findings, all fixed) preceded the release commit. The first release through the hardened publish pipeline (Trusted Publishing, `release` environment).
 
 ---
 

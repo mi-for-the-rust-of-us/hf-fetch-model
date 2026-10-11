@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] — Honest disk accounting
+
 ### Added
 
 - **`quants --fits --cache-headers`**, the header cache for `--fits`'s
