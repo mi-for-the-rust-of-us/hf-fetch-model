@@ -331,6 +331,12 @@ use crate::repo::ModelRepo;
 /// - the client is [`chunked::build_hf_hub_client`]'s, which has the same
 ///   30-second connect timeout as the crate's own clients.
 ///
+/// One gap cannot be closed from here: when no token is found, the builder
+/// gets none, and `hf-hub` 1.0 then runs its own lookup. It reads the same
+/// sources, but sends a whitespace-only `HF_TOKEN` as is, where this crate
+/// treats it as no token; the builder has no way to say "anonymous".
+/// `hf-hub` 1.1 removes that lookup.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Api`] if the `hf-hub` client cannot be constructed.

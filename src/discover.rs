@@ -176,15 +176,19 @@ const HF_API_BASE: &str = "https://huggingface.co/api/models";
 /// * `tag` — Optional tag filter (e.g., `"gguf"`, `"bitsandbytes"`). When set,
 ///   only models carrying this tag contribute to family discovery.
 ///
+/// Requests carry the implicit token [`crate::auth::resolve_token`] finds,
+/// like every client this crate builds ([`crate::chunked::build_client`]).
+///
 /// # Errors
 ///
-/// Returns [`FetchError::Http`] if any API request fails.
+/// Returns [`FetchError::Http`] if any API request fails, or if the implicit
+/// token is not a valid header value.
 pub async fn discover_new_families<S: BuildHasher>(
     local_families: &std::collections::HashSet<String, S>,
     max_models: usize,
     tag: Option<&str>,
 ) -> Result<Vec<DiscoveredFamily>, FetchError> {
-    let client = reqwest::Client::new();
+    let client = crate::chunked::build_client(None)?;
     let mut remote_families: BTreeMap<String, (String, u64)> = BTreeMap::new();
     let mut offset: usize = 0;
 
@@ -1000,13 +1004,21 @@ fn zip_into_map<T: Eq + std::hash::Hash, R>(
 /// `repo_id` is absent from the map with a placeholder (`—`). The search
 /// itself is not aborted on a single failure.
 ///
+/// Requests carry the implicit token [`crate::auth::resolve_token`] finds.
+/// Should that token not be a valid header value, no client can be built and
+/// the map is empty, as if every request had failed; prefer
+/// [`fetch_repo_size_summaries_concurrent`], which reports that case as an
+/// error.
+///
 /// # Arguments
 ///
 /// * `repo_ids` — Owned list of model identifiers. Ownership is moved into
 ///   the spawned tasks so each future is `'static`.
 #[must_use]
 pub async fn fetch_repo_sizes_concurrent(repo_ids: Vec<String>) -> HashMap<String, u64> {
-    let client = reqwest::Client::new();
+    let Ok(client) = crate::chunked::build_client(None) else {
+        return HashMap::new();
+    };
     // BORROW: explicit .clone() — fan_out_bounded consumes `repo_ids`, but
     // the original ids are still needed afterward to key the returned map.
     let keys = repo_ids.clone();
@@ -1102,11 +1114,15 @@ pub async fn fetch_tags_concurrent(repo_ids: Vec<String>) -> HashMap<String, Vec
 ///
 /// * `model_id` — The full model identifier (e.g., `"mistralai/Ministral-3-3B-Instruct-2512"`).
 ///
+/// The request carries the implicit token [`crate::auth::resolve_token`]
+/// finds, so a private repo's card is readable when a token is configured.
+///
 /// # Errors
 ///
-/// Returns [`FetchError::Http`] if the API request fails or the model is not found.
+/// Returns [`FetchError::Http`] if the API request fails or the model is not
+/// found, or if the implicit token is not a valid header value.
 pub async fn fetch_model_card(model_id: &str) -> Result<ModelCardMetadata, FetchError> {
-    let client = reqwest::Client::new();
+    let client = crate::chunked::build_client(None)?;
     let url = format!("{HF_API_BASE}/{model_id}");
 
     let response = client

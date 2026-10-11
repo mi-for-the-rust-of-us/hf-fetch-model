@@ -229,7 +229,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     which also lifts the anonymous rate limit. Library callers that pass no
     token now send one whenever one is configured, as the Python library
     does. `token_from_env()` keeps reading `HF_TOKEN` explicitly, which
-    matters only under `HF_HUB_DISABLE_IMPLICIT_TOKEN`. An explicit token is
+    matters only under `HF_HUB_DISABLE_IMPLICIT_TOKEN`. The CLI, which used
+    to read `HF_TOKEN` itself and pass it on as an explicit token, now
+    passes only `--token` and leaves `HF_TOKEN` to this lookup, so
+    `HF_HUB_DISABLE_IMPLICIT_TOKEN` makes a CLI run anonymous too, as in
+    Python. The three requests that bypassed every token, with a bare
+    client (`discover::fetch_model_card`, behind `info` and the gated-model
+    checks; `discover::discover_new_families`; the legacy
+    `discover::fetch_repo_sizes_concurrent`), now use the crate's client,
+    with its token, connect timeout and `User-Agent`. An explicit token is
     sent exactly as given, never cleaned, so a malformed one still fails
     loudly. Eleven unit tests pin every rule, with the environment
     injected, since changing the process environment needs `unsafe`, which

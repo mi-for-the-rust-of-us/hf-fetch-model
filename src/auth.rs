@@ -11,11 +11,13 @@
 //!    a malformed one fails loudly instead of being silently repaired.
 //! 2. Otherwise, if `HF_HUB_DISABLE_IMPLICIT_TOKEN` holds a true value (`1`,
 //!    `ON`, `YES` or `TRUE`, in any case), no token is sent.
-//! 3. Otherwise, the first of these that yields a token: `HF_TOKEN`; the
-//!    legacy `HUGGING_FACE_HUB_TOKEN`; the token file, which is
-//!    `HF_TOKEN_PATH`, or else `token` in the `HuggingFace` home: `HF_HOME`,
-//!    or else `huggingface` under `XDG_CACHE_HOME`, or else
-//!    `~/.cache/huggingface`. The token file is where `hf auth login` writes.
+//! 3. Otherwise `HF_TOKEN`, or the legacy `HUGGING_FACE_HUB_TOKEN` when
+//!    `HF_TOKEN` is unset or empty. If the variable chosen holds no token
+//!    once cleaned (a blank `HF_TOKEN` does not fall back to the legacy
+//!    one), the token file: `HF_TOKEN_PATH`, or else `token` in the
+//!    `HuggingFace` home, which is `HF_HOME`, or else `huggingface` under
+//!    `XDG_CACHE_HOME`, or else `~/.cache/huggingface`. The token file is
+//!    where `hf auth login` writes.
 //!
 //! A token is cleaned as `huggingface_hub` cleans it: carriage returns and
 //! newlines removed, surrounding whitespace trimmed, and an empty result

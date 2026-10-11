@@ -1407,10 +1407,10 @@ fn run_download(args: DownloadArgs) -> Result<(), FetchError> {
     if let Some(rev) = args.revision.as_deref() {
         builder = builder.revision(rev);
     }
+    // Without --token, the library resolves `HF_TOKEN` or the token file
+    // itself, honouring `HF_HUB_DISABLE_IMPLICIT_TOKEN` (see `auth`).
     if let Some(tok) = args.token.as_deref() {
         builder = builder.token(tok);
-    } else {
-        builder = builder.token_from_env();
     }
     for pattern in &args.filter {
         // BORROW: explicit .as_str() instead of Deref coercion
@@ -1571,10 +1571,10 @@ fn run_dry_run(repo_id: &str, args: &DownloadArgs) -> Result<(), FetchError> {
     if let Some(rev) = args.revision.as_deref() {
         builder = builder.revision(rev);
     }
+    // Without --token, the library resolves `HF_TOKEN` or the token file
+    // itself, honouring `HF_HUB_DISABLE_IMPLICIT_TOKEN` (see `auth`).
     if let Some(tok) = args.token.as_deref() {
         builder = builder.token(tok);
-    } else {
-        builder = builder.token_from_env();
     }
     for pattern in &args.filter {
         // BORROW: explicit .as_str() instead of Deref coercion
@@ -1758,10 +1758,10 @@ fn run_download_file(params: DownloadFileParams<'_>) -> Result<(), FetchError> {
     if let Some(rev) = revision {
         builder = builder.revision(rev);
     }
+    // Without --token, the library resolves `HF_TOKEN` or the token file
+    // itself, honouring `HF_HUB_DISABLE_IMPLICIT_TOKEN` (see `auth`).
     if let Some(tok) = token {
         builder = builder.token(tok);
-    } else {
-        builder = builder.token_from_env();
     }
     if let Some(ct) = chunk_threshold_mib {
         builder = builder.chunk_threshold(ct.saturating_mul(1024 * 1024));
@@ -1854,10 +1854,10 @@ fn run_download_file_dry_run(
     if let Some(rev) = revision {
         builder = builder.revision(rev);
     }
+    // Without --token, the library resolves `HF_TOKEN` or the token file
+    // itself, honouring `HF_HUB_DISABLE_IMPLICIT_TOKEN` (see `auth`).
     if let Some(tok) = token {
         builder = builder.token(tok);
-    } else {
-        builder = builder.token_from_env();
     }
 
     // When --flat, output_dir is the flat copy target, not the HF cache root,
@@ -1933,10 +1933,10 @@ fn run_download_file_glob(params: DownloadFileParams<'_>) -> Result<(), FetchErr
     if let Some(rev) = revision {
         builder = builder.revision(rev);
     }
+    // Without --token, the library resolves `HF_TOKEN` or the token file
+    // itself, honouring `HF_HUB_DISABLE_IMPLICIT_TOKEN` (see `auth`).
     if let Some(tok) = token {
         builder = builder.token(tok);
-    } else {
-        builder = builder.token_from_env();
     }
     if let Some(ct) = chunk_threshold_mib {
         builder = builder.chunk_threshold(ct.saturating_mul(1024 * 1024));
@@ -2192,9 +2192,7 @@ fn run_search(
     })?;
 
     // BORROW: explicit String::from for Option<&str> → Option<String>
-    let token = token
-        .map(String::from)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let token = token.map(String::from);
 
     let show_tags = show.contains(&ShowColumn::Tags);
     let show_size = show.contains(&ShowColumn::Size);
@@ -2990,9 +2988,7 @@ fn run_quants(
     json: bool,
 ) -> Result<(), FetchError> {
     // BORROW: explicit String::from for Option<&str> → Option<String>
-    let owned_token = token
-        .map(String::from)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let owned_token = token.map(String::from);
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
@@ -3102,9 +3098,7 @@ fn run_info(
     }
 
     // BORROW: explicit String::from for Option<&str> → Option<String>
-    let token_owned = token
-        .map(String::from)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let token_owned = token.map(String::from);
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
@@ -4838,11 +4832,10 @@ fn run_cache_verify(
         )));
     }
 
-    // Resolve token from arg or HF_TOKEN env (mirrors run_status / run_list_files).
+    // Only an explicit --token is passed on; without one the library resolves
+    // `HF_TOKEN` or the token file itself (see `auth`).
     // BORROW: explicit String::from for Option<&str> → Option<String>
-    let resolved_token = token
-        .map(String::from)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let resolved_token = token.map(String::from);
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
@@ -5434,9 +5427,7 @@ fn collect_repo_tensors(
         inspect::inspect_repo_safetensors_cached(repo_id, revision)?
     } else {
         // BORROW: explicit String::from for Option<&str> → Option<String>
-        let token = token
-            .map(String::from)
-            .or_else(|| std::env::var("HF_TOKEN").ok());
+        let token = token.map(String::from);
 
         let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
             path: PathBuf::from("<runtime>"),
@@ -6697,9 +6688,7 @@ fn run_diff_config(
         )
     } else {
         // BORROW: explicit String::from for Option<&str> → Option<String>
-        let resolved_token = token
-            .map(String::from)
-            .or_else(|| std::env::var("HF_TOKEN").ok());
+        let resolved_token = token.map(String::from);
         let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
             path: PathBuf::from("<runtime>"),
             source: e,
@@ -6910,9 +6899,7 @@ fn run_peek(
     let options = peek::PeekOptions::new(mode, effective_gunzip, max, filename.to_owned());
 
     // BORROW: explicit String::from for Option<&str> → Option<String>
-    let owned_token = token
-        .map(String::from)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let owned_token = token.map(String::from);
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
@@ -7074,9 +7061,7 @@ fn gather_tensor_listing(
     }
 
     // BORROW: explicit .to_owned() for Option<&str> → Option<String>
-    let resolved_token = token
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let resolved_token = token.map(ToOwned::to_owned);
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
@@ -8319,9 +8304,7 @@ fn run_inspect_single(
         // Reachable only when is_safetensors, is_npz, is_gguf, or is_pth
         // (the unclassified branch returned earlier).
         // BORROW: explicit String::from for Option<&str> → Option<String>
-        let token = token
-            .map(String::from)
-            .or_else(|| std::env::var("HF_TOKEN").ok());
+        let token = token.map(String::from);
 
         let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
             path: PathBuf::from("<runtime>"),
@@ -8820,9 +8803,7 @@ fn run_inspect_repo(
 
     // Network-enabled: try shard index first, then full inspection.
     // BORROW: explicit String::from for Option<&str> → Option<String>
-    let token = token
-        .map(String::from)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let token = token.map(String::from);
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
@@ -9991,9 +9972,7 @@ fn run_status(
     json: bool,
 ) -> Result<(), FetchError> {
     // BORROW: explicit String::from (equivalent to .to_owned()) for Option<&str> → Option<String>
-    let token = token
-        .map(String::from)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let token = token.map(String::from);
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
         path: PathBuf::from("<runtime>"),
@@ -10357,11 +10336,10 @@ fn run_list_files(
     let include = compile_glob_patterns(&include_patterns)?;
     let exclude = compile_glob_patterns(exclude_patterns)?;
 
-    // Resolve token from arg or env.
+    // Only an explicit --token is passed on; without one the library resolves
+    // `HF_TOKEN` or the token file itself (see `auth`).
     // BORROW: explicit .to_owned() for Option<&str> → Option<String>
-    let resolved_token = token
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let resolved_token = token.map(ToOwned::to_owned);
 
     // Fetch remote file list with metadata.
     let rt = tokio::runtime::Runtime::new().map_err(|e| FetchError::Io {
