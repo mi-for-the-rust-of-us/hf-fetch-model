@@ -776,6 +776,8 @@ For autoregressive inference the PCIe 3.0 ×2 wiring is fine. Prefill on long se
 
 Surfaced by the June 2026 [Rust-ecosystem survey](../rust-ecosystem-comparison.md) (the `llm_hunter` entry): no Rust tool gives an *offline, load-safety* verdict on a PyTorch `.pth`, and the one forensic tool adjacent to the space explicitly disclaims pickle-opcode analysis. anamnesis already understands pickle safety — its `.pth` parser enforces a strict GLOBAL allowlist (weights-only-equivalent) and the v0.6.6 pickle-VM hardening means a crafted file can't DoS the parser. The only missing piece is *surfacing* it.
 
+**October 2026 re-check** (the survey's v0.12.2 revision): `llm_hunter`'s README and source no longer contain the disclaimer quoted above, and the survey no longer cites it. The gap is also narrower: [`assay`](https://github.com/mlab-sh/assay), a GitHub-only scanner first seen in June 2026, describes offline pickle code-execution checks for safetensors / GGUF / pickle files; that is verified from its README only.
+
 | Feature | Scope |
 |---------|-------|
 | `inspect <repo> file.pth --cached` safety line | After the tensor table, print a pickle-safety verdict from anamnesis's GLOBAL scan: `Pickle: N globals, all tensor-reconstruction (safe to load)` or `⚠ references os.system / posix — arbitrary-code-execution risk under torch.load(weights_only=False)`. `--json` gains a `pickle_safety` object (`globals` / `disallowed` / `verdict`). Binary-side rendering only — no new library API on hf-fm's side. |

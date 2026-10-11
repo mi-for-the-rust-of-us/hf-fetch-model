@@ -50,7 +50,7 @@ use crate::http_range::{HttpRangeReader, RangeStats};
 /// Metadata for a single tensor from a `.safetensors` header.
 ///
 /// This is hf-fetch-model's own type — lightweight, no quantization logic.
-/// Consumers (e.g., anamnesis) map this into their own richer types.
+/// Consumers map this into their own richer types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorInfo {
     /// Tensor name (e.g., `"model.layers.0.self_attn.q_proj.weight"`).
@@ -140,7 +140,7 @@ pub fn torch_dtype_bytes(torch_dtype: Option<&str>) -> u8 {
 ///   quant-method metadata).
 ///
 /// Decoupled from `anamnesis::QuantScheme` (a `#[non_exhaustive]` enum) so
-/// downstream library consumers (`candle-mi`, `anamnesis`) aren't forced to
+/// downstream library consumers (such as `candle-mi`) aren't forced to
 /// match every variant. The `scheme` field stores `QuantScheme`'s `Display`
 /// output (`"FineGrainedFp8"`, `"Bnb4"`, `"Gptq"`, `"Awq"`, …); consumers
 /// that need to match exact variants should call
@@ -176,8 +176,8 @@ pub struct SafetensorsHeaderInfo {
     /// Raw `__metadata__` entries, if present.
     ///
     /// For quantized models, this typically contains entries like
-    /// `quant_method`, `bits`, `group_size` that consumers like anamnesis
-    /// use to distinguish GPTQ from AWQ without downloading weights.
+    /// `quant_method`, `bits`, `group_size` that tell GPTQ from AWQ without
+    /// downloading weights.
     pub metadata: Option<HashMap<String, String>>,
     /// Size of the JSON header in bytes.
     pub header_size: u64,

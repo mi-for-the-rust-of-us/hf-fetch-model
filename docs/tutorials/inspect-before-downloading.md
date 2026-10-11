@@ -4,7 +4,7 @@
 
 *~1,900 words · about 8 min read*
 
-<!-- Last updated: 2026-08-06, hf-fm v0.11.2 (remote GGUF inspect in the quant pivot) -->
+<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (closing note: quant lines are remote since v0.11.1; --cache-headers pointer) -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -365,7 +365,7 @@ You went from "15 GiB I can't use" to "5 GiB that fits with room to spare" — c
 
 Total bytes downloaded to learn all of that: less than a megabyte. Every command above is also valid input to library callers — see [`examples/candle_inspect.rs`](../../examples/candle_inspect.rs) for the embeddable equivalent.
 
-The companion path (**inspect after you download**) still matters for quantization detection on cached safetensors (since v0.10.3) — the `Format:` / `Size:` lines are a cached-only feature. Tensor-metadata inspection itself no longer needs a download for any format: `.gguf` joined `.safetensors` / `.npz` as remote-inspectable in v0.11.2, and `.pth` closed the matrix in v0.11.4, so `inspect` now works the same way (before or after downloading) for all four tensor formats.
+The companion path, **inspect after you download** (`--cached`), reads the same headers from disk with no network at all, but nothing in this tutorial needs it any more. `.gguf` joined `.safetensors` / `.npz` as remote-inspectable in v0.11.2, and `.pth` closed the matrix in v0.11.4; the quantization lines on safetensors (`Format:` / `Size:`, v0.10.3), once cached-only, have worked remotely since v0.11.1. So `inspect` works the same way before or after downloading, for all four tensor formats. If you inspect the same remote files again and again, `--cache-headers` keeps their parsed headers on disk; the [quant tutorial](pick-a-quant-that-fits.md) shows what a second run then costs.
 
 For details on every flag in `inspect`, see the [CLI reference](../cli-reference.md). For common follow-up questions, the [FAQ](../FAQ.md) covers gating, cache layout, and the quirks of partial downloads.
 

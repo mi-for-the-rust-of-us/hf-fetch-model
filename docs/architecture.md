@@ -1,47 +1,54 @@
 # Architecture
 
+<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (stack, additions over hf-hub, every module) -->
+
 ## Stack
 
 ```
 candle-mi
-  download_model() convenience fn
-         │ optional dep (feature = "fast-download")
-hf-fetch-model
-  • repo file listing
-  • file filtering (glob patterns)
-  • download plan (dry-run, plan-to-config optimization)
+  model downloads, NPZ inspection, progress bars
+         │ dependency (feature "indicatif")
+hf-fetch-model   (the library; the hf-fm CLI is behind feature "cli")
+  • repo file listing, download plan (dry-run, plan-to-config optimization)
+  • file filtering (glob patterns, presets)
   • parallel file orchestration
-  • multi-connection Range downloads (large files)
-  • progress callbacks
-  • checksum verification
-  • resume / retry
-  • safetensors header inspection (HTTP Range)
-  • cache diagnostics, disk usage & model search
-  • model card / README display & adapter config detection
-         │ dep
-hf-hub (tokio, .high())
-  • single-connection download (.high() mode)
-  • HF cache layout compatibility
-  • auth token handling
+  • multi-connection Range downloads, resumable across runs
+  • progress callbacks, checksum verification, retry with backoff, timeouts
+  • tensor-header inspection (.safetensors / .gguf / .npz / .pth),
+    cached or remote over HTTP Range, with an opt-in header cache
+  • small-file peek, model search, model card / README, quant siblings
+  • cache disk usage, status, verify, gc, delete, clean-partial
+         │ dependencies
+         ├── hf-hub 1.0      repo info, single-connection downloads
+         │                   (plain HTTP, or Xet for Xet-backed files),
+         │                   HF cache layout, auth
+         ├── anamnesis 0.7   tensor-format parsers, quant-scheme detection
+         ├── reqwest 0.13    hf-fetch-model's own HTTP clients: chunked
+         │                   downloads, range reads, Hub API calls
+         └── hypomnesis 0.2  GPU memory for `inspect --check-gpu`
+                             (called only by the CLI)
 ```
 
 ## What hf-fetch-model adds over hf-hub
 
-`hf-hub` provides single-file downloads with HuggingFace cache compatibility. hf-fetch-model wraps it and adds:
+`hf-hub` provides repository metadata and single-file downloads with HuggingFace cache compatibility. hf-fetch-model wraps it and adds:
 
-- **Repo-level orchestration** — download all files in a model repository with one call
-- **Multi-connection chunked downloads** — large files are split into chunks downloaded in parallel via HTTP Range requests (concurrency and connection count auto-tuned by the download plan optimizer based on file size distribution)
-- **File filtering** — glob patterns and presets to select which files to download
-- **Progress reporting** — per-file callbacks with optional `indicatif` progress bars
-- **Checksum verification** — SHA256 against HuggingFace LFS metadata
-- **Retry with backoff** — exponential backoff + jitter for transient failures
-- **Timeout control** — per-file and overall time limits
-- **Safetensors header inspection** — read tensor metadata (names, shapes, dtypes, offsets) from local cache or remote repos via HTTP Range requests, without downloading full files
-- **Tensor layout comparison** — compare tensor structures between two models (only-in-A, only-in-B, dtype/shape differences, matching) via the CLI `diff` subcommand
-- **Cache diagnostics** — inspect download state (complete / partial / missing) per file; disk usage per repo and globally
-- **Model search** — query the HuggingFace Hub API for models, with multi-term filtering, model card metadata, and server-side library/pipeline filtering
-- **Model card and README display** — fetch and display model metadata and README text via the CLI `info` subcommand
-- **Adapter config detection** — auto-detect `adapter_config.json` in PEFT adapter repos during `inspect` and display base model, rank, alpha, and target modules
+- **Repo-level orchestration**: download all files in a model repository with one call
+- **Multi-connection chunked downloads**: large files are split into chunks downloaded in parallel via HTTP Range requests, each request re-resolved to a freshly signed CDN URL (concurrency and connection count auto-tuned by the download plan optimizer based on file size distribution)
+- **Resume across runs**: an interrupted chunked download keeps its partial file and a per-chunk progress sidecar, and the next run resumes each chunk where it stopped
+- **File filtering**: glob patterns and presets to select which files to download
+- **Progress reporting**: per-file callbacks, an async watch channel, and optional `indicatif` progress bars
+- **Checksum verification**: SHA256 against HuggingFace LFS metadata, at download time and later with `cache verify`
+- **Retry with backoff**: exponential backoff + jitter for transient failures
+- **Timeout control**: per-file and overall time limits
+- **Tensor-header inspection**: read tensor metadata (names, shapes, dtypes, offsets) of `.safetensors`, `.gguf`, `.npz` and `.pth` files, from the local cache or remotely via HTTP Range requests without downloading the weights, with quantization-scheme detection and an opt-in on-disk cache of parsed remote headers
+- **Tensor layout comparison**: compare tensor structures between two models (only-in-A, only-in-B, dtype/shape differences, matching) via the CLI `diff` subcommand, and `config.json` architecture fields via `diff-config`
+- **GPU-fit verdict**: whether a model fits the local GPU, from its tensor sizes and a KV-cache budget at a given context (CLI `inspect --check-gpu`), and an offload-aware fit plan across a base model's quantized siblings (CLI `quants --fits`)
+- **Small-file peek**: print a config, README or `.gz` sidecar from a repo without downloading it
+- **Cache management**: download state (complete / partial / missing / excluded) per file; disk usage per repo and globally, counted as bytes on disk; garbage collection by age and size budget; delete; partial-download cleanup
+- **Model search and discovery**: query the HuggingFace Hub API with multi-term filtering, model card metadata, and server-side library/pipeline filtering; discover new model families and a base model's quant siblings
+- **Model card and README display**: fetch and display model metadata and README text via the CLI `info` subcommand
+- **Adapter config detection**: auto-detect `adapter_config.json` in PEFT adapter repos during `inspect` and display base model, rank, alpha, and target modules
 
 ## Module layout
 
@@ -51,12 +58,20 @@ hf-hub (tokio, .high())
 | `config` | public | `FetchConfig` builder and `Filter` presets |
 | `plan` | public | `DownloadPlan`, `FilePlan`, plan-to-config optimization |
 | `download` | public | Download orchestration, `DownloadOutcome` |
-| `discover` | public | Search, model card, README fetch, `GateStatus` |
-| `cache` | public | Cache inspection, status, and disk usage |
-| `inspect` | public | Safetensors header parsing, `TensorInfo`, `SafetensorsHeaderInfo`, `ShardedIndex`, `AdapterConfig` |
+| `repo` | public | Repository file listing via the HF API |
+| `discover` | public | Search, model card, README fetch, `GateStatus`, family and quant-sibling discovery |
+| `inspect` | public | Tensor-header inspection for all four formats, cached and remote; `TensorInfo`, `SafetensorsHeaderInfo`, `ShardedIndex`, `AdapterConfig` |
+| `http_range` | public | `HttpRangeReader`: the `Read + Seek` over HTTP Range requests that remote inspection runs on, with request and byte caps |
+| `header_cache` | public | Opt-in on-disk cache of parsed remote headers (`--cache-headers`), with its one-hour trust window |
+| `peek` | public | Small-file reads (`hf-fm peek`), with optional gzip decoding |
+| `cache` | public | Cache inspection, status, disk usage, verification and cleanup |
+| `cache_layout` | public | Path construction for the HF cache layout and hf-fetch-model's sidecars |
 | `checksum` | public | SHA256 verification |
 | `error` | public | `FetchError` and `FileFailure` |
-| `progress` | public | `ProgressEvent` and `IndicatifProgress` |
-| `repo` | public | Repository file listing via HF API |
-| `chunked` | private | Multi-connection Range download engine |
+| `progress` | public | `ProgressEvent`, `ProgressReceiver` and `IndicatifProgress` |
+| `chunked` | private | Multi-connection Range download engine and the shared HTTP clients (`build_client` is re-exported) |
+| `chunked_state` | private | Per-chunk progress sidecar that makes chunked downloads resumable |
+| `atomic_write` | private | Atomic writes for the on-disk JSON sidecars |
 | `retry` | private | Retry policy with exponential backoff |
+
+Two more source files belong to the CLI binary only, which includes them from `src/bin/main.rs`: `format.rs` (display formatting shared across subcommands) and `gpu_check.rs` (the `inspect --check-gpu` verdict, the one caller of `hypomnesis`).

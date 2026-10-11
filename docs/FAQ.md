@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-10-10, hf-fm v0.12.2 (--cache-headers: what a hit costs, pruning, counted by du) -->
+<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (--check-gpu names Metal on macOS; earlier: --cache-headers hit cost, pruning, counted by du) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -291,7 +291,7 @@ Pass `--check-gpu` for a weights-vs-VRAM verdict, and add `--context N` for the 
 hf-fm inspect meta-llama/Llama-3.2-3B --cached --check-gpu --context 32768
 ```
 
-`--check-gpu` alone reads the device's total / free / used VRAM via [`hypomnesis`](https://crates.io/crates/hypomnesis) (NVML on Linux/Windows, DXGI on Windows; `nvidia-smi` fallback), sums the model's weight bytes across every shard, and prints a one-line `✓ X.YZ GiB headroom` / `✗ short by X.YZ GiB` verdict. Default device is `0`; pass `--check-gpu 1` on a multi-GPU box. Works on the cached and network paths identically. On a system with no NVIDIA GPU the verdict reports `unavailable — <reason>` and the command still exits 0 — `--check-gpu` is informational, never a gate.
+`--check-gpu` alone reads the device's total / free / used VRAM via [`hypomnesis`](https://crates.io/crates/hypomnesis) (NVML on Linux/Windows, DXGI on Windows, Metal on macOS; `nvidia-smi` fallback), sums the model's weight bytes across every shard, and prints a one-line `✓ X.YZ GiB headroom` / `✗ short by X.YZ GiB` verdict. Default device is `0`; pass `--check-gpu 1` on a multi-GPU box. Works on the cached and network paths identically. Where no backend can read the device, the verdict reports `unavailable — <reason>` and the command still exits 0 — `--check-gpu` is informational, never a gate.
 
 **`--context N` (v0.10.4) makes it real.** Weights are the easy part; on a consumer card the KV cache is what decides whether a long context fits. `--context N` reads the model's `config.json` and computes the KV bytes at sequence length `N`, then measures the fit against `weights + KV`:
 

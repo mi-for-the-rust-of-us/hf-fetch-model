@@ -40,19 +40,22 @@ let outcome = hf_fetch_model::download_with_config(
 
 ## Filter presets
 
-Four presets cover common patterns:
+Five presets cover common patterns:
 
 ```rust
-// Safetensors weights + JSON configs
+// Safetensors weights + configs (*.safetensors, *.json, *.txt)
 let config = Filter::safetensors().build()?;
 
-// GGUF quantized models
+// GGUF quantized models (*.gguf, *.json, *.txt)
 let config = Filter::gguf().build()?;
 
-// PyTorch .bin weights (pytorch_model*.bin) + JSON configs
+// NumPy weights, e.g. GemmaScope transcoders (*.npz, *.npy, config.yaml, *.json, *.txt)
+let config = Filter::npz().build()?;
+
+// PyTorch .bin weights (pytorch_model*.bin, *.json, *.txt)
 let config = Filter::pth().build()?;
 
-// Config files only (no weights)
+// Config files only, no weights (*.json, *.txt, *.md)
 let config = Filter::config_only().build()?;
 ```
 
@@ -89,7 +92,7 @@ For async consumers (GUI/TUI apps), use `progress_channel()` instead of `on_prog
 ```rust
 use hf_fetch_model::{FetchConfig, Filter};
 
-let (builder, progress_rx) = Filter::safetensors()
+let (builder, mut progress_rx) = Filter::safetensors()
     .progress_channel();
 let config = builder.build()?;
 
@@ -181,8 +184,9 @@ Read tensor metadata without downloading full weight files. The library checks t
 ```rust
 use hf_fetch_model::inspect;
 
-// Single file (cache-first, falls back to 2 HTTP Range requests)
-let (info, source) = inspect::inspect_safetensors(
+// Single file: cache-first; on a miss, typically 3–4 HTTP Range requests,
+// counted in `stats` (`None` when the header came from the cache)
+let (info, source, stats) = inspect::inspect_safetensors(
     "google/gemma-2-2b-it",
     "model-00001-of-00002.safetensors",
     None,  // token
@@ -210,9 +214,11 @@ if let Some(index) = inspect::fetch_shard_index("google/gemma-2-2b-it", None, No
 
 All types derive `serde::Serialize` for JSON output.
 
+The other three formats take the same arguments and return the same triple: `inspect::inspect_gguf`, `inspect::inspect_npz` and `inspect::inspect_pth`, each cache-first with a remote fallback over HTTP Range.
+
 ## Shared HTTP client
 
-`repo::list_repo_files_with_metadata()` now requires a `&reqwest::Client` parameter to reuse TCP/TLS connections. Use `build_client()` to create one with the standard connect timeout and auth headers:
+`repo::list_repo_files_with_metadata()` takes a `&reqwest::Client` parameter to reuse TCP/TLS connections. Use `build_client()` to create one with the standard connect timeout and auth headers:
 
 ```rust
 use hf_fetch_model::{build_client, repo};
@@ -240,3 +246,5 @@ for s in &summaries {
     println!("{}: {} bytes, {} files", s.repo_id, s.total_size, s.file_count);
 }
 ```
+
+The two answer different questions. `cache_repo_usage` lists a repo's logical files, each at its own size. Since v0.12.2, `total_size` is the bytes the repo's whole directory occupies on disk, which is what deleting it would free. The two can differ: on Windows, where snapshot files are usually copies of their blobs rather than links, the repo holds those bytes twice.

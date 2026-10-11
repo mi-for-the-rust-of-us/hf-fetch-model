@@ -171,6 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency versions are what they exist for: `cargo audit` clean, and
   `cargo deny check` reporting advisories, bans, licences and sources all ok.
 
+- **`dirs` requirement raised from `6` to `7`** ([#15](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/pull/15)).
+  The whole difference between the two releases is one Windows line:
+  `preference_dir()` moved from the local to the roaming application-data
+  folder. hf-fm calls only `dirs::home_dir()`, which resolves the HF cache
+  directory and is unchanged, so no cache moves. `dirs` 6 stays in the
+  dependency tree all the same, because `hf-hub` → `hf-xet` → `xet-runtime`
+  → `shellexpand` still requires it; the two copies share `dirs-sys` 0.5.
+
 ### Fixed
 
 - **`du`, `status`, `cache gc` and `cache delete` all under-reported disk
@@ -529,6 +537,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`cargo doc --no-deps --features indicatif`, warnings denied), which now
   emits `struct.IndicatifProgress.html`; the default-feature build does not.
 
+- **`--check-gpu`'s texts left out macOS.** `inspect --check-gpu` has read
+  Metal on macOS since the `hypomnesis` 0.2.3 bump, but when no backend could
+  read the device it still reported `no NVIDIA device detected (NVML / DXGI
+  not usable)`, and its `--help`, the README, the CLI reference and the FAQ
+  named only NVML and DXGI. The message now names the backends of the
+  platform it runs on (`no GPU detected (Metal / NVML / nvidia-smi not
+  usable)` on macOS, `nvidia-smi` added elsewhere), chosen with `cfg!` so
+  that both texts compile, and are linted, on every platform. The four
+  documents name all three backends.
+
+- **Documentation that had fallen behind the code.** Each document below was
+  checked against the code it describes, or against a real run.
+  - `docs/configuration.md`: two snippets did not compile. The progress
+    channel's receiver must be `mut`, and `inspect_safetensors` has returned a
+    triple since v0.11.1. Every snippet was then compiled against the crate.
+    The page also gains the `npz` preset, the other three formats'
+    `inspect_*` functions, the 3–4 requests a remote read really takes, and a
+    note that `cache_summary`'s `total_size` is bytes on disk since this
+    release.
+  - `docs/diagnostics.md`: rebuilt from a real `-v` run. The old example
+    showed a summary event with `files_failed` and `total_elapsed_secs`
+    fields that does not exist. The table now lists every event the library
+    emits.
+  - `docs/architecture.md`, unchanged since v0.8: the stack gains `hf-hub` 1.0,
+    `anamnesis` and `hypomnesis`; candle-mi depends on hf-fm directly, through
+    no `fast-download` feature; the module table lists every module.
+  - `docs/upstream-differences.md`: re-reviewed against `huggingface_hub`
+    2.2.0, `hf_transfer` 0.1.9 and `hf-hub` 1.0.0, reading each one's source.
+    - The CDN-expiry entry described code removed in July 2026, which
+      per-chunk URL resolution replaced.
+    - The temp-file entry had flipped on both sides: hf-fm keeps partials to
+      resume, and `huggingface_hub` deletes them since 1.18.0.
+    - Three entries are removed as no longer differences; one of them was
+      wrong when written.
+    - The connect-timeout entry now says that single-connection downloads,
+      which go through `hf-hub`'s client, have none.
+  - `docs/rust-ecosystem-comparison.md`: re-baselined from v0.10.6 to v0.12.2,
+    with every competitor re-verified. Several June claims were already wrong,
+    and four of the "gaps unique to hf-fm" are now narrower:
+    - `safetensors-browser` reads Hub headers over HTTP Range;
+    - `apr diff` compares model files;
+    - `mistral.rs` lists and deletes cache entries;
+    - anamnesis was never a consumer of hf-fm.
+    New peers, `sift` among them, are scored too.
+  - `SECURITY.md`: the supported line still read `0.10.x`. The threat model
+    now covers remote parsing and the caps on remote reads, and the hardening
+    list gains `cargo-deny`, Trusted Publishing and SHA-pinned actions.
+  - README: `.pth` added to the remote-inspect list; 3–4 requests per remote
+    safetensors file instead of 2; `--cache-headers` in the Commands table;
+    the quant tutorial in the Documentation table. Since `d2069d6` the README
+    badge and the FAQ also give the MSRV as 1.91; they had said 1.88 since
+    v0.11.3.
+  - The inspect tutorial no longer calls the quantization lines cached-only;
+    they have been remote since v0.11.1.
+  - Rustdoc: `TensorInfo` and two neighbours named anamnesis as a consumer of
+    this crate; the dependency runs the other way.
+
 ### Security
 
 - **Release pipeline hardened against registry-token theft**, the root cause
@@ -548,7 +613,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `id-token: write`. `publish.yml` is now two jobs: `verify` builds, tests and
   packages with a read-only token, and `publish` holds `id-token: write` and
   runs `cargo publish --no-verify`, which compiles nothing. Every cargo command
-  in `publish.yml` and `ci.yml` uses `--locked`.
+  in `publish.yml` and `ci.yml` that builds, packages or publishes uses
+  `--locked`, except a plain `cargo test` that each workflow keeps beside its
+  `--locked --all-features` run.
 
 ## [0.12.1] — Quant-aware fit planning
 

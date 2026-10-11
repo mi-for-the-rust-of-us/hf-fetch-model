@@ -49,8 +49,9 @@ pub struct GpuCheckResult {
 ///
 /// On every error path, the result carries `device: None, error: Some(...)`;
 /// callers should print the error string verbatim and skip the verdict block.
-/// The function never panics and is safe to call on systems with no NVIDIA
-/// GPU, no NVML / DXGI, or with the index past the device count.
+/// The function never panics and is safe to call on systems with no GPU, no
+/// usable backend (NVML / DXGI / Metal / `nvidia-smi`), or with the index
+/// past the device count.
 #[must_use]
 pub fn query_gpu(index: u32) -> GpuCheckResult {
     let spill_measurable = hypomnesis::is_spill_measurable();
@@ -77,7 +78,7 @@ pub fn query_gpu(index: u32) -> GpuCheckResult {
 /// | Variant | Message |
 /// |---------|---------|
 /// | `DeviceIndexOutOfRange { index, count }` | `"index {N} out of range (have {M} device(s))"` (with singular/plural agreement) |
-/// | `NoGpuSource` | `"no NVIDIA device detected (NVML / DXGI not usable)"` |
+/// | `NoGpuSource` | `"no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)"`, or on macOS `"no GPU detected (Metal / NVML / nvidia-smi not usable)"` |
 /// | `Nvml(s)` / `Dxgi(s)` / `NvidiaSmi(s)` | `"{backend} backend reported: {s}"` |
 /// | `Ram(_)` / `Io(_)` / `Pdh(_)` / `ProcessListDenied { .. }` | `"unexpected error: {err}"` (should not occur for `device_info`) |
 /// | future variants (`HypomnesisError` is `#[non_exhaustive]`) | `"hypomnesis error: {err}"` (generic fallthrough) |
@@ -88,7 +89,14 @@ fn friendly_error(err: &hypomnesis::HypomnesisError) -> String {
             let plural = if *count == 1 { "device" } else { "devices" };
             format!("index {index} out of range (have {count} {plural})")
         }
-        E::NoGpuSource => "no NVIDIA device detected (NVML / DXGI not usable)".to_owned(),
+        // `cfg!` rather than `#[cfg]`, so both texts compile, and are linted,
+        // on every platform. They name the backends hypomnesis tries there.
+        E::NoGpuSource => if cfg!(target_os = "macos") {
+            "no GPU detected (Metal / NVML / nvidia-smi not usable)"
+        } else {
+            "no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)"
+        }
+        .to_owned(),
         E::Nvml(s) => format!("NVML backend reported: {s}"),
         E::Dxgi(s) => format!("DXGI backend reported: {s}"),
         E::NvidiaSmi(s) => format!("nvidia-smi backend reported: {s}"),
@@ -860,7 +868,7 @@ fn kv_cache_json(kv: &KvComputed) -> serde_json::Value {
 ///     "free_bytes": 15246684160,
 ///     "used_bytes": 1933185024
 ///   },
-///   "error": "no NVIDIA device detected (NVML / DXGI not usable)",      // failure only
+///   "error": "no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)", // failure only
 ///   "model": {                                                          // always present
 ///     "weight_bytes": 10240671744,
 ///     "dtype_label": "BF16",

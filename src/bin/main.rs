@@ -519,7 +519,7 @@ See also: hf-fm list-families, hf-fm discover")]
         Indices returned by --list are stable as long as the repo has not\n\
         changed remotely between invocations. Pass --revision <sha> on both\n\
         --list and the follow-up run to lock the view end-to-end.\n\n\
-        --check-gpu reads device 0's VRAM via hypomnesis (NVML / DXGI) and\n\
+        --check-gpu reads device 0's VRAM via hypomnesis (NVML / DXGI / Metal) and\n\
         reports a one-line fit verdict against the model's weight bytes.\n\
         Pass --check-gpu N to target a specific device.\n\n\
         For a walkthrough on a real 4-shard model, see\n\
@@ -621,9 +621,9 @@ See also: hf-fm list-families, hf-fm discover")]
         /// Show a GPU-fit verdict for the model weights against device `N` (default 0).
         ///
         /// Reads the device's total/free/used VRAM via `hypomnesis` (NVML on
-        /// Linux/Windows, DXGI on Windows). On systems with no NVIDIA device
-        /// or where neither backend is usable, prints a friendly note and
-        /// skips the verdict — never fails the command. The verdict uses the
+        /// Linux/Windows, DXGI on Windows, Metal on macOS, with `nvidia-smi`
+        /// as a fallback). Where no backend can read the device, prints a
+        /// friendly note and skips the verdict — never fails the command. The verdict uses the
         /// **unfiltered** model totals; `--filter` and `--limit` only affect
         /// the printed tensor table. Composes with `--json` (adds a
         /// `gpu_check` object alongside the existing header schema).
@@ -8220,7 +8220,7 @@ fn run_inspect_single(
 
     // Probe the GPU once (after the filter/limit pass so the JSON value built
     // here can be handed directly to the early-return branches below). The
-    // probe is a few-millisecond NVML / DXGI call; no need to skip it for
+    // probe is a few-millisecond NVML / DXGI / Metal call; no need to skip it for
     // any output mode.
     let gpu_result = gpu_inputs
         .as_ref()
