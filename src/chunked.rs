@@ -958,11 +958,15 @@ struct ApiCommitInfo {
 /// Resolves the commit hash for a given revision, reading from the refs file
 /// if available or fetching from the HF API otherwise.
 ///
-/// When fetched from the API, the refs file is created for future use.
+/// When fetched from the API, the refs file is created for future use. A
+/// refs file that holds anything but one plain name is ignored and
+/// rewritten.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the API request fails.
+/// Returns [`FetchError::UnsafeName`] if the API returns a commit hash that
+/// is not one plain name.
 /// Returns [`FetchError::Io`] if the refs file cannot be written.
 async fn resolve_commit_hash(
     client: &Client,
@@ -975,10 +979,11 @@ async fn resolve_commit_hash(
     // Try reading from the refs file first (written by hf-hub for other files).
     if let Ok(hash) = tokio::fs::read_to_string(&ref_path).await {
         let trimmed = hash.trim().to_owned();
-        if !trimmed.is_empty() {
-            // It names `snapshots/{commit_hash}/` next; a refs file holding
-            // anything but a plain name is refused, not followed.
-            crate::cache_layout::ensure_safe_hub_name("commit hash", trimmed.as_str())?;
+        // It names `snapshots/{commit_hash}/` next. A refs file holding
+        // anything but a plain name is ignored, as `cache::read_ref` ignores
+        // it, and the hash is resolved from the API below, which rewrites
+        // the refs file.
+        if crate::cache_layout::is_safe_hub_name(trimmed.as_str()) {
             return Ok(trimmed);
         }
     }

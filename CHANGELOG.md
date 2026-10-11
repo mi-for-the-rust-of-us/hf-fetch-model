@@ -785,8 +785,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`cache_layout::is_safe_repo_filename`).
   - A download, or a `download-file`, holding such a name stops with the new
     `FetchError::UnsafeName` before anything is written. A refs file holding
-    one reads as no ref, and `status` / `cache verify` report such a file as
-    missing without touching the path.
+    one reads as no ref wherever it is read (a download then re-resolves the
+    commit and rewrites the file), and `status`, `cache verify` and
+    `inspect`'s cache lookup treat such a filename as absent without
+    touching the path.
 
   The Hub only ever sends hex digests and git paths, which always pass, and
   the endpoint is `https://huggingface.co` over TLS, so this is defence in

@@ -210,6 +210,11 @@ pub fn is_safe_hub_name(name: &str) -> bool {
 /// drive or an NTFS alternate data stream there; and a NUL. The Hub keeps
 /// repos in git, which already refuses most of these, so this is defence in
 /// depth for every path this crate builds from a listed filename.
+///
+/// Windows' reserved device names (`CON`, `NUL.txt`, …) and names ending in
+/// a dot or a space, which Windows does not store as written, are not
+/// refused: they cannot climb out of the directory, so they are left to the
+/// filesystem.
 #[must_use]
 pub fn is_safe_repo_filename(filename: &str) -> bool {
     !filename.is_empty()

@@ -388,8 +388,16 @@ pub struct ModelConfig {
 /// probe a reader for the file's etag before it can consult its own header
 /// cache) can preserve that same local-cache preference instead of losing
 /// it.
+///
+/// A `filename` that could leave the snapshot directory
+/// ([`cache_layout::is_safe_repo_filename`]) is never joined to it and reads
+/// as not cached: `inspect <repo> <N>` and `--pick` take the name from the
+/// repo listing.
 #[must_use]
 pub fn resolve_cached_path(repo_id: &str, revision: &str, filename: &str) -> Option<PathBuf> {
+    if !cache_layout::is_safe_repo_filename(filename) {
+        return None;
+    }
     let cache_dir = cache::hf_cache_dir().ok()?;
     let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id);
     let commit_hash = cache::read_ref(&repo_dir, revision)?;
@@ -1676,7 +1684,11 @@ struct RawShardIndex {
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Http`] if the index fetch fails.
+/// Returns [`FetchError::Http`] if the index fetch fails, including a `404`
+/// that names a missing revision.
+/// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing
+/// (an authenticated `404 RepoNotFound`; see
+/// `chunked::resolve_says_file_absent`). A missing index file is `Ok(None)`.
 /// Returns [`FetchError::SafetensorsHeader`] if the index JSON is malformed.
 pub async fn fetch_shard_index(
     repo_id: &str,
@@ -1834,7 +1846,11 @@ enum AdapterTargetModules {
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Http`] if the request fails (other than 404).
+/// Returns [`FetchError::Http`] if the request fails, including a `404`
+/// that names a missing revision.
+/// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing
+/// (an authenticated `404 RepoNotFound`; see
+/// `chunked::resolve_says_file_absent`). A missing file is `Ok(None)`.
 /// Returns [`FetchError::SafetensorsHeader`] if the JSON is malformed.
 pub async fn fetch_adapter_config(
     repo_id: &str,
@@ -2051,7 +2067,11 @@ fn parse_model_config_json(content: &str, repo_id: &str) -> Result<ModelConfig, 
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Http`] if the request fails (other than 404).
+/// Returns [`FetchError::Http`] if the request fails, including a `404`
+/// that names a missing revision.
+/// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing
+/// (an authenticated `404 RepoNotFound`; see
+/// `chunked::resolve_says_file_absent`). A missing `config.json` is `Ok(None)`.
 /// Returns [`FetchError::Io`] if a cached `config.json` cannot be read.
 /// Returns [`FetchError::SafetensorsHeader`] if the JSON is malformed.
 pub async fn fetch_model_config(
@@ -2137,6 +2157,20 @@ mod tests {
 
     use super::collect_matching_names_sizes;
     use super::is_supported_tensor_file;
+    use super::resolve_cached_path;
+
+    /// A listed name that could leave the snapshot directory reads as not
+    /// cached, before the cache directory is even looked up.
+    #[test]
+    fn resolve_cached_path_never_joins_an_unsafe_filename() {
+        for name in ["../../../etc/passwd", "/etc/passwd", "a/../../b", "c:\\x"] {
+            assert_eq!(
+                resolve_cached_path("org/repo", "main", name),
+                None,
+                "{name:?}"
+            );
+        }
+    }
 
     /// `collect_matching_names_sizes` reports a plain file's own length.
     #[test]
