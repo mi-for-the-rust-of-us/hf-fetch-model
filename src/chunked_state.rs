@@ -4,7 +4,7 @@
 //!
 //! When a chunked download is interrupted — timeout-induced future drop,
 //! Ctrl-C, panic, or a retryable chunk error — the `.chunked.part` temp
-//! file is preserved by [`crate::chunked::TempFileGuard`] and accompanied
+//! file is preserved by `chunked::TempFileGuard` and accompanied
 //! by a `.chunked.part.state` JSON sidecar describing how many bytes each
 //! chunk completed.
 //!

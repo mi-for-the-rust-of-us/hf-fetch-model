@@ -255,13 +255,15 @@ pub enum InspectSource {
     Cached,
     /// Fetched via HTTP Range requests.
     Remote,
-    /// Read from `inspect --cache-headers`'s on-disk header cache.
+    /// Read from the on-disk header cache that `inspect --cache-headers`
+    /// and `quants --fits --cache-headers` fill.
     ///
-    /// A real network probe still happened (to read the current etag and
-    /// confirm the cache entry is still valid), but the full header parse —
-    /// the dozens of range requests `Remote` implies — was skipped.
+    /// Within [`crate::header_cache::TRUST_WINDOW`] no request was made at
+    /// all; past it, a network probe read the file's current etag and
+    /// confirmed the entry. Either way the full header parse, the dozens of
+    /// range requests `Remote` implies, was skipped.
     CachedHeader {
-        /// How long ago this entry was written.
+        /// How long ago the entry was written or last confirmed.
         age: std::time::Duration,
     },
 }

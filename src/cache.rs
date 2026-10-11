@@ -5,8 +5,8 @@
 //!
 //! [`hf_cache_dir()`] locates the local HF cache. [`list_cached_families()`]
 //! scans downloaded models and groups them by `model_type`.
-//! [`cache_summary()`] provides per-repo size totals,
-//! [`cache_repo_usage()`] returns per-file disk usage for a single repo, and
+//! [`cache_summary()`] provides per-repo totals of bytes on disk,
+//! [`cache_repo_usage()`] returns a single repo's per-file sizes, and
 //! [`verify_cache()`] re-checks `SHA256` digests of cached files against
 //! `HuggingFace` LFS metadata.
 

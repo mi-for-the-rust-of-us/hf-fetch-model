@@ -2,10 +2,11 @@
 
 //! # hf-fetch-model
 //!
-//! Fast `HuggingFace` model downloads for Rust.
+//! Download, inspect, and compare `HuggingFace` models from Rust.
 //!
 //! An embeddable library for downloading `HuggingFace` model repositories
-//! with maximum throughput. Wraps [`hf_hub`] and adds repo-level orchestration.
+//! with maximum throughput, and for reading their tensor metadata without
+//! downloading weights. Wraps [`hf_hub`] and adds repo-level orchestration.
 //!
 //! ## Quick Start
 //!
@@ -43,12 +44,11 @@
 //!
 //! ## Inspect Before Downloading
 //!
-//! Read tensor metadata from `.safetensors` headers — and, since v0.11.0,
-//! `NumPy` `.npz` archive directories — via HTTP Range requests, no weight
-//! data downloaded. Sharded repos (those with
-//! `model.safetensors.index.json`) work transparently —
-//! [`inspect::inspect_repo_safetensors`] reads every shard's header in parallel
-//! and returns a flat per-file result list. See
+//! Read tensor metadata from `.safetensors`, `NumPy` `.npz`, `GGUF` and
+//! `PyTorch` `.pth` files via HTTP Range requests, with no weight data
+//! downloaded. Sharded repos (those with `model.safetensors.index.json`) work
+//! transparently: [`inspect::inspect_repo_safetensors`] reads every shard's
+//! header in parallel and returns a flat per-file result list. See
 //! [`examples/candle_inspect.rs`](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/examples/candle_inspect.rs)
 //! for a runnable example, or the
 //! [Inspect tutorial](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/docs/tutorials/inspect-before-downloading.md)
@@ -69,7 +69,8 @@
 //!
 //! The CLI also exposes `hf-fm inspect <repo> [FILE] --check-gpu [N]` (v0.10.1)
 //! to print a one-line GPU-fit verdict against device `N` (default 0) using
-//! the `hypomnesis` crate (NVML on Linux/Windows, DXGI on Windows). Adding
+//! the `hypomnesis` crate (NVML on Linux/Windows, DXGI on Windows, Metal on
+//! macOS since v0.10.5). Adding
 //! `--context N` (v0.10.4) folds in the KV cache at a context length and
 //! reports a real fit against `weights + KV` instead of weights alone — the
 //! difference between "fits" and "out-of-memory at token 8000" on a consumer
@@ -93,8 +94,9 @@
 //! [`inspect::SafetensorsHeaderInfo`] shape, so downstream pipeline steps
 //! (filter, tree, dtypes aggregation) work uniformly across formats.
 //!
-//! For cached `.safetensors` files, v0.10.3 also surfaces quantization
-//! detection. When [`inspect::inspect_safetensors_local`] sees a quantized
+//! For `.safetensors` files, inspect also surfaces quantization detection
+//! (cached since v0.10.3, remote since v0.11.1). When
+//! [`inspect::inspect_safetensors_local`] sees a quantized
 //! header (`FP8` variants, `GPTQ`, `AWQ`, `BnB-NF4`, `BnB-INT8`), it
 //! populates the new [`inspect::QuantInfo`] field with the scheme name and
 //! both stored + dequantised byte sizes. Unquantized safetensors and
@@ -137,6 +139,19 @@
 //! (v0.9.7) remains for callers that want exactly that subset. These back
 //! the CLI's `inspect --list`, numeric-index, and `--pick` flows.
 //!
+//! ## Discovery, Small Files and Header Caching
+//!
+//! [`discover::search_models`] searches the Hub, and
+//! [`discover::discover_quant_siblings`] (v0.12.1) gathers a base model's
+//! quant sibling repos, the library side of the CLI's `hf-fm quants`.
+//! [`peek::peek`] (v0.11.5) streams a small non-tensor file (a `config.yaml`,
+//! a `README.md`, a `.gz` sidecar) over the same HTTP Range substrate, within
+//! a size cap. [`header_cache`] holds the on-disk cache of parsed remote
+//! headers behind `inspect --cache-headers` and `quants --fits
+//! --cache-headers` (v0.12.1, extended in v0.12.2): entries are keyed on
+//! `(repo, revision, filename, etag)`, used without a request for
+//! [`header_cache::TRUST_WINDOW`], and pruned when superseded.
+//!
 //! ## `HuggingFace` Cache
 //!
 //! Downloaded files are stored in the standard `HuggingFace` cache directory
@@ -153,6 +168,16 @@
 //! `SHA256` digests of cached files against `HuggingFace` LFS metadata; and
 //! [`cache::find_partial_files`] locates `.chunked.part` orphans from
 //! interrupted downloads.
+//!
+//! Since v0.12.2, a repo's size ([`cache::CachedModelSummary::total_size`],
+//! [`cache::repo_disk_usage`]) is the bytes it occupies on disk: every
+//! physical file in its directory, each counted once, which is what deleting
+//! the directory frees. Earlier versions counted `snapshots/` alone, so a
+//! Windows cache, whose snapshot entries are copies of their blobs, read as
+//! about half its size, and a symlinked Unix cache as almost nothing
+//! ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)).
+//! The per-file listing from [`cache::cache_repo_usage`] keeps each file's
+//! own size.
 //!
 //! For long verifications (multi-GiB safetensors files), drive
 //! [`cache::verify_cache_with_progress`] with an [`Fn`] callback that receives

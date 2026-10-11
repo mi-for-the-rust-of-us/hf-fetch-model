@@ -51,7 +51,9 @@ pub struct HeaderCacheEntry {
     /// The remote etag the header was fetched against. A different etag on
     /// a later call means the upstream file changed, invalidating this entry.
     pub etag: String,
-    /// When this entry was written — feeds the `Source: cached header (age:
+    /// When this entry was written, or last confirmed against the file's
+    /// etag (a confirmed entry is re-saved). Decides whether the entry is
+    /// inside [`TRUST_WINDOW`], and feeds the `Source: cached header (age:
     /// ...)` display line.
     pub cached_at: SystemTime,
     /// The parsed header.

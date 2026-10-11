@@ -1097,14 +1097,6 @@ fn resolve_cached_file(
     }
 }
 
-/// Attempts to resolve all repository files from the local cache (no network).
-///
-/// Resolves the cache directory and repo folder from config, then delegates
-/// to [`try_resolve_all_from_cache()`].
-///
-/// # Errors
-///
-/// Returns [`FetchError::Io`] if the cache directory cannot be resolved.
 /// Attempts to resolve every file in `filtered_remote_files` from the local cache.
 ///
 /// Returns `Some(file_map)` only when **every** file in the filtered remote
@@ -1120,6 +1112,10 @@ fn resolve_cached_file(
 /// `*.json` clause) reported as fully cached even with `model.safetensors`
 /// absent — the function had no idea what files the remote actually
 /// contained. Verifying against the remote-derived list closes that gap.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be resolved.
 async fn try_resolve_filtered_from_cache(
     config: Option<&FetchConfig>,
     repo_id: &str,

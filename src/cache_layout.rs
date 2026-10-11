@@ -114,7 +114,8 @@ pub fn ref_path(repo_dir: &Path, revision: &str) -> PathBuf {
 /// Header-cache directory: `{repo_dir}/.hf-fm-header-cache/`.
 ///
 /// An `hf-fm`-private sidecar directory, not part of the standard `hf-hub`
-/// layout — holds `inspect --cache-headers` entries, following the same
+/// layout — holds the entries `inspect --cache-headers` and `quants --fits
+/// --cache-headers` write, following the same
 /// precedent as the `.hf-fm-snapshot.json` sidecar in [`crate::cache`].
 #[must_use]
 pub fn header_cache_dir(repo_dir: &Path) -> PathBuf {
