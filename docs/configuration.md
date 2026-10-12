@@ -28,7 +28,7 @@ let outcome = hf_fetch_model::download_with_config(
 | `.filter(glob)` | Include pattern (repeatable) | all files |
 | `.exclude(glob)` | Exclude pattern (repeatable) | none |
 | `.concurrency(n)` | Parallel file downloads | auto-tuned |
-| `.output_dir(path)` | Custom cache directory | HF default |
+| `.output_dir(path)` | Custom cache directory, for downloads and for the `inspect` functions' `_with_config` twins | HF default |
 | `.timeout_per_file(dur)` | Ceiling on any single file transfer | 300s |
 | `.timeout_total(dur)` | Hard wall-clock cap on the whole batch (including retries and in-flight files), independent of the per-file timeout | unlimited |
 | `.max_retries(n)` | Retries per file | 3 |
@@ -41,6 +41,19 @@ let outcome = hf_fetch_model::download_with_config(
 ## Authentication
 
 Without `.token(..)`, every request carries the token the Python tools would use: `HF_TOKEN` (or the legacy `HUGGING_FACE_HUB_TOKEN`), else the token file, which is `HF_TOKEN_PATH` or `token` in the HuggingFace home (`HF_HOME`, else `$XDG_CACHE_HOME/huggingface`, else `~/.cache/huggingface`), where `hf auth login` writes it. `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` turns that lookup off; an explicit token is still sent. `hf_fetch_model::auth::resolve_token(None)` returns the token a request would carry.
+
+## Reading a config back
+
+A built `FetchConfig` returns what was set: `token()`, `revision()` and `output_dir()` (since v0.12.3), beside `concurrency()`, `connections_per_file()` and `chunk_threshold()`. `token()` returns only an explicit token; `None` means each request resolves one as described above, so `auth::resolve_token(config.token())` gives the token a request would actually carry.
+
+```rust
+use hf_fetch_model::{FetchConfig, auth};
+
+let config = FetchConfig::builder().revision("v1.0").build()?;
+assert_eq!(config.revision(), Some("v1.0"));
+assert_eq!(config.output_dir(), None); // the default HF cache
+let effective = auth::resolve_token(config.token());
+```
 
 ## Filter presets
 
@@ -181,16 +194,17 @@ if outcome.is_cached() {
 let path = outcome.into_inner();
 ```
 
-## Safetensors header inspection
+## Header inspection
 
-Read tensor metadata without downloading full weight files. The library checks the local cache first and only makes HTTP Range requests on cache miss.
+Read tensor metadata without downloading full weight files. The library checks the local cache first and only makes HTTP Range requests on cache miss. Since v0.12.3 the entry points that can reach the network are re-exported at the crate root as well as living in `inspect`.
 
 ```rust
 use hf_fetch_model::inspect;
+use std::path::Path;
 
 // Single file: cache-first; on a miss, typically 3–4 HTTP Range requests,
 // counted in `stats` (`None` when the header came from the cache)
-let (info, source, stats) = inspect::inspect_safetensors(
+let (info, source, stats) = hf_fetch_model::inspect_safetensors(
     "google/gemma-2-2b-it",
     "model-00001-of-00002.safetensors",
     None,  // token
@@ -218,7 +232,26 @@ if let Some(index) = inspect::fetch_shard_index("google/gemma-2-2b-it", None, No
 
 All types derive `serde::Serialize` for JSON output.
 
-The other three formats take the same arguments and return the same triple: `inspect::inspect_gguf`, `inspect::inspect_npz` and `inspect::inspect_pth`, each cache-first with a remote fallback over HTTP Range.
+The other three formats take the same arguments and return the same triple: `inspect_gguf`, `inspect_npz` and `inspect_pth`, each cache-first with a remote fallback over HTTP Range.
+
+Those four, `inspect_repo_safetensors`, `fetch_shard_index`, `fetch_model_config` and `fetch_adapter_config` each have a `_with_config` twin (since v0.12.3) that takes the token, the revision and the cache directory from a `FetchConfig`. Its cache-first lookup reads `output_dir`, the cache a download with the same config writes to, so files you downloaded into a custom directory are inspected from disk instead of over the network. The config's other settings have no meaning for a header read and are ignored:
+
+```rust
+use hf_fetch_model::FetchConfig;
+use std::path::PathBuf;
+
+let config = FetchConfig::builder()
+    .output_dir(PathBuf::from("/data/hf-cache"))
+    .build()?;
+
+let (info, source, stats) = hf_fetch_model::inspect_safetensors_with_config(
+    "google/gemma-2-2b-it",
+    "model-00001-of-00002.safetensors",
+    &config,
+).await?;
+```
+
+The cache-only functions (`inspect_*_cached`, `fetch_*_cached`, `list_cached_*`) take no config and always read the default cache.
 
 ## Shared HTTP client
 

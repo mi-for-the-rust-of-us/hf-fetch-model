@@ -46,26 +46,66 @@
 //!
 //! Read tensor metadata from `.safetensors`, `NumPy` `.npz`, `GGUF` and
 //! `PyTorch` `.pth` files via HTTP Range requests, with no weight data
-//! downloaded. Sharded repos (those with `model.safetensors.index.json`) work
-//! transparently: [`inspect::inspect_repo_safetensors`] reads every shard's
-//! header in parallel and returns a flat per-file result list. See
-//! [`examples/candle_inspect.rs`](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/examples/candle_inspect.rs)
-//! for a runnable example, or the
-//! [Inspect tutorial](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/docs/tutorials/inspect-before-downloading.md)
-//! for a narrative walkthrough.
+//! downloaded. One call does it for one file of any of the four formats:
+//! [`inspect_safetensors`], [`inspect_gguf`], [`inspect_npz`] and
+//! [`inspect_pth`] each take a repo id and a filename, read the header from
+//! the local cache when the file is there and through a handful of range
+//! requests when it is not, and return the format-agnostic
+//! [`inspect::SafetensorsHeaderInfo`], where it came from, and for a remote
+//! read what it cost ([`RangeStats`]).
 //!
 //! ```rust,no_run
 //! # async fn example() -> Result<(), hf_fetch_model::FetchError> {
-//! let results = hf_fetch_model::inspect::inspect_repo_safetensors(
-//!     "EleutherAI/pythia-1.4b", None, None,
+//! // A GemmaScope transcoder's 288 MiB `params.npz`, not yet cached: 8 range
+//! // requests and 84 KiB fetched to read its five arrays' shapes.
+//! let (header, _source, stats) = hf_fetch_model::inspect_npz(
+//!     "google/gemma-scope-2b-pt-transcoders",
+//!     "layer_0/width_16k/average_l0_115/params.npz",
+//!     None, // token: resolved implicitly when `None`
+//!     None, // revision: `main`
 //! ).await?;
-//!
-//! for (filename, header, _source) in &results {
-//!     println!("{filename}: {} tensors", header.tensors.len());
+//! for t in &header.tensors {
+//!     println!("{} {} {:?}", t.name, t.dtype, t.shape);
+//! }
+//! if let Some(s) = stats {
+//!     println!("{} requests, {} bytes fetched", s.requests, s.bytes_fetched);
 //! }
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Sharded repos (those with `model.safetensors.index.json`) work
+//! transparently: [`inspect_repo_safetensors`] reads every shard's header in
+//! parallel and returns a flat per-file result list, and
+//! [`fetch_shard_index`] reads the index alone. These six, and the
+//! `config.json` / `adapter_config.json` readers [`fetch_model_config`] and
+//! [`fetch_adapter_config`], each have a `_with_config` twin (v0.12.3) that
+//! takes the token, the revision and the cache directory from a
+//! [`FetchConfig`], so a caller that downloads into a custom
+//! [`FetchConfigBuilder::output_dir`] inspects that same cache:
+//!
+//! ```rust,no_run
+//! # async fn example() -> Result<(), hf_fetch_model::FetchError> {
+//! let config = hf_fetch_model::FetchConfig::builder()
+//!     .output_dir("/data/hf-cache".into())
+//!     .build()?;
+//! let (header, source, _stats) = hf_fetch_model::inspect_npz_with_config(
+//!     "google/gemma-scope-2b-pt-transcoders",
+//!     "layer_0/width_16k/average_l0_115/params.npz",
+//!     &config,
+//! ).await?;
+//! println!("{} arrays ({source:?})", header.tensors.len());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! These entry points check the cache, open the reader, parse the header and
+//! keep the typed error; [`HttpRangeReader`], in [`http_range`], is the
+//! substrate they drive, for a reader-based parser of your own. See
+//! [`examples/candle_inspect.rs`](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/examples/candle_inspect.rs)
+//! for a runnable example, or the
+//! [Inspect tutorial](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/docs/tutorials/inspect-before-downloading.md)
+//! for a narrative walkthrough.
 //!
 //! The CLI also exposes `hf-fm inspect <repo> [FILE] --check-gpu [N]` (v0.10.1)
 //! to print a one-line GPU-fit verdict against device `N` (default 0) using
@@ -85,12 +125,13 @@
 //!
 //! ## Cached-file Inspection
 //!
-//! Beyond the remote-or-cached `.safetensors` / `.npz` paths above,
-//! [`inspect::inspect_gguf_cached`] (v0.10.2),
-//! [`inspect::inspect_npz_cached`], and [`inspect::inspect_pth_cached`]
-//! (both v0.10.3) extend inspect to `GGUF` / `NumPy` `.npz` / `PyTorch`
-//! `.pth` files in the local cache via the `anamnesis` parser crate. All
-//! four formats return the same format-agnostic
+//! Beside the remote-or-cached entry points above, the `_cached` variants
+//! never touch the network: [`inspect::inspect_safetensors_cached`],
+//! [`inspect::inspect_gguf_cached`] (v0.10.2), [`inspect::inspect_npz_cached`]
+//! and [`inspect::inspect_pth_cached`] (both v0.10.3) read the file from the
+//! local cache through the `anamnesis` parser crate, and fail when it is not
+//! there. They read the default cache, not a [`FetchConfig`]'s output
+//! directory. All four formats return the same format-agnostic
 //! [`inspect::SafetensorsHeaderInfo`] shape, so downstream pipeline steps
 //! (filter, tree, dtypes aggregation) work uniformly across formats.
 //!
@@ -290,7 +331,18 @@ pub use discover::{DiscoveredFamily, GateStatus, ModelCardMetadata, SearchResult
 pub use download::DownloadOutcome;
 pub use error::{FetchError, FileFailure};
 pub use http_range::{HttpRangeReader, RangeFetcher, RangeReader, RangeStats};
-pub use inspect::{AdapterConfig, ModelConfig};
+// The eight `inspect` entry points that can reach the network, and their
+// `_with_config` twins, sit here beside the `http_range` substrate they
+// drive: a caller scanning the crate root for "inspect a remote file" finds
+// the entry point, not only the substrate (v0.12.3; finding 1 of the
+// candle-mi NPZ adoption report, where three sessions missed `inspect_npz`).
+pub use inspect::{
+    AdapterConfig, ModelConfig, fetch_adapter_config, fetch_adapter_config_with_config,
+    fetch_model_config, fetch_model_config_with_config, fetch_shard_index,
+    fetch_shard_index_with_config, inspect_gguf, inspect_gguf_with_config, inspect_npz,
+    inspect_npz_with_config, inspect_pth, inspect_pth_with_config, inspect_repo_safetensors,
+    inspect_repo_safetensors_with_config, inspect_safetensors, inspect_safetensors_with_config,
+};
 pub use plan::{DownloadPlan, FilePlan, download_plan};
 pub use progress::{ProgressEvent, ProgressReceiver};
 

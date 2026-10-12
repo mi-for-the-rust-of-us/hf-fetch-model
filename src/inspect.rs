@@ -1198,6 +1198,9 @@ fn npz_info_to_header_info(
 /// diagnosis).
 /// Returns [`FetchError::SafetensorsHeader`] if the `NPZ` archive is
 /// malformed (cached or remote).
+// `range_reader` is the name a caller looking for this function searched
+// for (finding 1 of the candle-mi NPZ adoption report).
+#[doc(alias = "range_reader")]
 pub async fn inspect_npz(
     repo_id: &str,
     filename: &str,

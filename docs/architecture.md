@@ -1,6 +1,6 @@
 # Architecture
 
-<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (stack, additions over hf-hub, every module) -->
+<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (lib.rs re-exports the inspect entry points; inspect's _with_config twins; http_range as the substrate) -->
 
 ## Stack
 
@@ -54,14 +54,14 @@ hf-fetch-model   (the library; the hf-fm CLI is behind feature "cli")
 
 | Module | Visibility | Role |
 |--------|-----------|------|
-| `lib.rs` | public | Top-level download functions and re-exports |
+| `lib.rs` | public | Top-level download functions and re-exports, including the eight `inspect` entry points that can reach the network and their `_with_config` twins |
 | `config` | public | `FetchConfig` builder and `Filter` presets |
 | `plan` | public | `DownloadPlan`, `FilePlan`, plan-to-config optimization |
 | `download` | public | Download orchestration, `DownloadOutcome` |
 | `repo` | public | Repository file listing via the HF API |
 | `discover` | public | Search, model card, README fetch, `GateStatus`, family and quant-sibling discovery |
-| `inspect` | public | Tensor-header inspection for all four formats, cached and remote; `TensorInfo`, `SafetensorsHeaderInfo`, `ShardedIndex`, `AdapterConfig` |
-| `http_range` | public | `HttpRangeReader`: the `Read + Seek` over HTTP Range requests that remote inspection runs on, with request and byte caps |
+| `inspect` | public | Tensor-header inspection for all four formats, cached and remote, each remote-capable entry point with a `_with_config` twin that reads a `FetchConfig`'s token, revision and cache directory; `TensorInfo`, `SafetensorsHeaderInfo`, `ShardedIndex`, `AdapterConfig` |
+| `http_range` | public | `HttpRangeReader`: the `Read + Seek` over HTTP Range requests that remote inspection runs on, with request and byte caps; the substrate under `inspect`'s entry points, for a reader-based parser of your own |
 | `header_cache` | public | Opt-in on-disk cache of parsed remote headers (`--cache-headers`), with its one-hour trust window |
 | `peek` | public | Small-file reads (`hf-fm peek`), with optional gzip decoding |
 | `cache` | public | Cache inspection, status, disk usage, verification and cleanup |

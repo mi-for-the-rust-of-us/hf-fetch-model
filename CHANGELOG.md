@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `chunk_threshold()`. `token()` returns only an explicit token: `None`
   means a request resolves one implicitly, as it has since v0.12.2.
 
+- **The `inspect` entry points at the crate root, and named where a caller
+  looks.** The eight functions that can reach the network and their eight
+  twins are re-exported beside `HttpRangeReader`, which had been the only
+  remote-inspect item at the root, so `hf_fetch_model::inspect_npz` works
+  as well as `hf_fetch_model::inspect::inspect_npz`. The crate docs'
+  *Inspect Before Downloading* section, the README's library quick start,
+  the inspect tutorial and the configuration guide now name them, with a
+  measured example: reading a 288 MiB GemmaScope `params.npz` that is not
+  cached took 8 range requests and 84 KiB. `http_range`'s module docs open
+  by pointing at them, and `inspect_npz` answers to the rustdoc search
+  alias `range_reader`. Three candle-mi sessions had missed `inspect_npz`,
+  and two wrote a wrong API into its source (finding 1 of the NPZ report).
+
 ### Changed
 
 - **The two range-budget errors name how to raise the cap.**

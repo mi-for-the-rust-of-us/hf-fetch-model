@@ -2,6 +2,13 @@
 
 //! HTTP Range `Read + Seek` substrate for remote inspection.
 //!
+//! Most callers want the entry points built on it instead:
+//! [`crate::inspect_safetensors`], [`crate::inspect_gguf`],
+//! [`crate::inspect_npz`] and [`crate::inspect_pth`] (and their
+//! `_with_config` twins) check the local cache, open the reader, parse the
+//! header and keep the typed error, in one call. This module is for a
+//! reader-based parser of your own.
+//!
 //! [`RangeReader`] adapts a byte-range transport into [`std::io::Read`] +
 //! [`std::io::Seek`], so format parsers that consume a reader (e.g.
 //! `anamnesis::inspect_npz_from_reader`) can inspect a remote file's

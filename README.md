@@ -352,6 +352,23 @@ let outcome = hf_fetch_model::download(
 println!("Model at: {}", outcome.inner().display());
 ```
 
+Read a file's tensor metadata without downloading its weights. On this 288 MiB archive, not yet cached, it took 8 range requests and 84 KiB:
+
+```rust
+let (header, _source, _stats) = hf_fetch_model::inspect_npz(
+    "google/gemma-scope-2b-pt-transcoders",
+    "layer_0/width_16k/average_l0_115/params.npz",
+    None, // token: resolved implicitly when `None`
+    None, // revision: `main`
+).await?;
+
+for t in &header.tensors {
+    println!("{} {} {:?}", t.name, t.dtype, t.shape); // W_enc F32 [2304, 16384], …
+}
+```
+
+`inspect_safetensors`, `inspect_gguf` and `inspect_pth` take the same arguments, and `inspect_repo_safetensors` reads every shard of a repo. Each reads the local cache first. Each also has a `_with_config` twin that takes a `FetchConfig` instead, whose token, revision and `output_dir` it uses, so a custom cache directory you download into is the one it inspects.
+
 Filter, progress, auth, and more via the builder — see [Configuration](docs/configuration.md).
 
 ## Documentation

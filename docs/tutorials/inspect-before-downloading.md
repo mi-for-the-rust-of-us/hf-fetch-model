@@ -2,9 +2,9 @@
 
 *Read tensor metadata over HTTP Range — no weight data downloaded — and decide whether the model is worth the bandwidth.*
 
-*~1,900 words · about 8 min read*
+*~2,000 words · about 8 min read*
 
-<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (closing note: quant lines are remote since v0.11.1; --cache-headers pointer) -->
+<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (closing note names the library entry points and their _with_config twins) -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -363,7 +363,7 @@ You went from "15 GiB I can't use" to "5 GiB that fits with room to spare" — c
 - **`search --tag` + `list-files`** find community quantizations when the headline repo doesn't fit — and `inspect --check-gpu` (remote `.gguf` since v0.11.2) confirms the pick against the live device before you download it.
 - **`--revision <sha>`** pins every command above to a specific commit so notes stay reproducible.
 
-Total bytes downloaded to learn all of that: less than a megabyte. Every command above is also valid input to library callers — see [`examples/candle_inspect.rs`](../../examples/candle_inspect.rs) for the embeddable equivalent.
+Total bytes downloaded to learn all of that: less than a megabyte. From Rust, each of these reads is one call: `hf_fetch_model::inspect_safetensors`, `inspect_gguf`, `inspect_npz` or `inspect_pth` for one file, and `inspect_repo_safetensors` for every shard. Each has a `_with_config` twin that takes a `FetchConfig`, so it reads the cache your downloads go to. [`examples/candle_inspect.rs`](../../examples/candle_inspect.rs) is a runnable program, and the [configuration guide](../configuration.md#header-inspection) covers the API.
 
 The companion path, **inspect after you download** (`--cached`), reads the same headers from disk with no network at all, but nothing in this tutorial needs it any more. `.gguf` joined `.safetensors` / `.npz` as remote-inspectable in v0.11.2, and `.pth` closed the matrix in v0.11.4; the quantization lines on safetensors (`Format:` / `Size:`, v0.10.3), once cached-only, have worked remotely since v0.11.1. So `inspect` works the same way before or after downloading, for all four tensor formats. If you inspect the same remote files again and again, `--cache-headers` keeps their parsed headers on disk; the [quant tutorial](pick-a-quant-that-fits.md) shows what a second run then costs.
 
