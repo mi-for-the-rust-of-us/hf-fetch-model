@@ -25,9 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `inspect`, its fields being crate-private, which is why candle-mi re-read
   `HF_TOKEN` itself (finding 2 of the
   [NPZ adoption report](docs/dogfooding-feedbacks/candle-mi-npz-range-inspect.md)).
-  Taking the config also retires the adjacent `token` / `revision` arguments,
-  which a transposition compiled. The config's other settings have no
-  meaning for a header read and are ignored. The cache-only functions
+  A twin also has no adjacent `token` / `revision` arguments for a
+  transposition to swap; the originals keep theirs. The config's other
+  settings have no meaning for a header read and are ignored. The cache-only functions
   (`inspect_*_cached`, `fetch_*_cached`, `list_cached_*`) still read the
   default cache; the roadmap tracks them by name.
 

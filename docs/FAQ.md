@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-10-11, hf-fm v0.12.2 (shared blob store and .incomplete partials; token from `hf auth login`; --check-gpu names Metal on macOS; earlier: --cache-headers hit cost, pruning, counted by du) -->
+<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (reading tensor metadata from Rust; .pth on the range substrate; raising the range budgets; earlier: shared blob store and .incomplete partials, token from `hf auth login`) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -51,6 +51,7 @@ A living list of the questions we and our early users have actually run into. If
   - [A repo has many `.safetensors` files — can I pick one interactively?](#a-repo-has-many-safetensors-files--can-i-pick-one-interactively)
   - [How do I read a small config or README file from a repo without downloading it?](#how-do-i-read-a-small-config-or-readme-file-from-a-repo-without-downloading-it)
   - [How do I see a model's tensor names without downloading it?](#how-do-i-see-a-models-tensor-names-without-downloading-it)
+  - [How do I read a file's tensor metadata from Rust?](#how-do-i-read-a-files-tensor-metadata-from-rust)
   - [How do I compare two HuggingFace models structurally?](#how-do-i-compare-two-huggingface-models-structurally)
   - [How do I compare two models' architecture, not just their tensors?](#how-do-i-compare-two-models-architecture-not-just-their-tensors)
   - [How do I know if a model fits on my GPU?](#how-do-i-know-if-a-model-fits-on-my-gpu)
@@ -223,6 +224,10 @@ hf-fm peek bluelightai/clt-qwen3-1.7b-base-20k features/index.json.gz --head 5 -
 ### How do I see a model's tensor names without downloading it?
 
 Run `hf-fm inspect <repo>` with no filename for a per-file (or, on sharded repos, per-shard) rollup — tensor *counts* and parameters. To see the tensor *names*, either name a specific file (or an index from `--list`), or add `--filter "<substring>"`, which lists the matching names nested under each shard/file (e.g. `--filter "layers.0."` for everything in block 0; the match is case-insensitive). Internally, hf-fm fetches only the JSON header via an HTTP Range request — for a typical 2 GiB safetensors file, you transfer maybe 70 KiB of metadata. Add `--tree` for the hierarchical view that groups numeric layers (`layers.[0..27]   (×28)`), or `--dtypes` for a dtype-and-parameter summary. For a complete walkthrough on a real 4-shard model, see [Inspect before you download](tutorials/inspect-before-downloading.md).
+
+### How do I read a file's tensor metadata from Rust?
+
+Call `hf_fetch_model::inspect_safetensors`, `inspect_gguf`, `inspect_npz` or `inspect_pth` with a repo id and a filename. Each reads the local cache first and otherwise fetches only the header over HTTP Range, returning the tensors, where they came from and, for a remote read, the requests and bytes it cost. If you download with a `FetchConfig`, call the `_with_config` twin instead (for example `inspect_npz_with_config(repo, file, &config)`), so that a custom `output_dir` is the cache it reads. The [configuration guide](configuration.md#header-inspection) covers the rest of the API.
 
 ### How do I compare two HuggingFace models structurally?
 
@@ -424,7 +429,7 @@ A `checksum mismatch` means the file's computed SHA256 does not match the hash H
 
 ### Why does `inspect` say `Source: remote (N range requests, X fetched)`?
 
-Remote `.safetensors`, `.npz`, and `.gguf` inspect (v0.11.1, v0.11.0, and v0.11.2 respectively) all ride the same `HttpRangeReader` substrate, and the line reports the *measured* cost of that run rather than a fixed count — the on-screen proof that `inspect` read metadata, not weights. The reader enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted file cannot silently turn an inspect into a full download. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all — distinct from `Source: cached header (age: ...)`, which `--cache-headers` (below) produces for a *remote* file whose already-parsed header was reused.
+Remote `.safetensors`, `.npz`, `.gguf` and `.pth` inspect (v0.11.1, v0.11.0, v0.11.2 and v0.11.4 respectively) all ride the same `HttpRangeReader` substrate, and the line reports the *measured* cost of that run rather than a fixed count — the on-screen proof that `inspect` read metadata, not weights. The reader enforces hard budgets (256 requests / 32 MiB per inspect), so even a hostile or corrupted file cannot silently turn an inspect into a full download; a library caller that legitimately needs more raises them with `HttpRangeReader::open_with_limits`, which both budget errors name. When the file is already in your local cache, the line reads `Source: cached` instead and there are no HTTP requests at all — distinct from `Source: cached header (age: ...)`, which `--cache-headers` (below) produces for a *remote* file whose already-parsed header was reused.
 
 For `.safetensors`, the header is a little-endian `u64` length prefix followed by the `JSON` header itself, both at the very start of the file — the reader's 4 KiB read-ahead window usually covers both in a single fetch, with a second fetch only when the header is larger than that window (common on many-tensor models). Every remote path on this substrate also bakes in a fixed one-time access probe (2 requests), so a small shard reads e.g. `Source: remote (4 range requests, 8.0 KiB fetched)` (live-measured against `hf-internal-testing/tiny-random-gpt2`). For `.npz`, the requests fetch the `ZIP` central directory and the per-array `NPY` headers — e.g. `Source: remote (6 range requests, 136.0 KiB fetched)` against a 72 MiB GemmaScope archive. For `.gguf`, the requests cover the front-loaded metadata KV table and tensor-info table (both live before the tensor-data section, so a single linear scan never touches weight bytes) — e.g. `Source: remote (30 range requests, 1.75 MiB fetched)` against an 84 MiB quantized `bartowski/SmolLM2-135M-Instruct-GGUF` shard. No format on this substrate ever downloads tensor data.
 
