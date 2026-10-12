@@ -653,7 +653,7 @@ pub async fn inspect_safetensors(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_safetensors_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+    inspect_safetensors_with_access(repo_id, filename, &HubAccess::loose(token, revision)).await
 }
 
 /// [`inspect_safetensors`], with the token, the revision and the cache
@@ -679,7 +679,7 @@ pub async fn inspect_safetensors_with_config(
     filename: &str,
     config: &FetchConfig,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_safetensors_with_access(repo_id, filename, HubAccess::from_config(config)).await
+    inspect_safetensors_with_access(repo_id, filename, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`inspect_safetensors`] and
@@ -687,7 +687,7 @@ pub async fn inspect_safetensors_with_config(
 async fn inspect_safetensors_with_access(
     repo_id: &str,
     filename: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first.
     if let Some(cached_path) = access.cached_path(repo_id, filename) {
@@ -962,7 +962,7 @@ pub async fn inspect_gguf(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_gguf_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+    inspect_gguf_with_access(repo_id, filename, &HubAccess::loose(token, revision)).await
 }
 
 /// [`inspect_gguf`], with the token, the revision and the cache directory
@@ -987,14 +987,14 @@ pub async fn inspect_gguf_with_config(
     filename: &str,
     config: &FetchConfig,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_gguf_with_access(repo_id, filename, HubAccess::from_config(config)).await
+    inspect_gguf_with_access(repo_id, filename, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`inspect_gguf`] and [`inspect_gguf_with_config`].
 async fn inspect_gguf_with_access(
     repo_id: &str,
     filename: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first (mirrors `inspect_npz` / `inspect_safetensors`).
     if let Some(cached_path) = access.cached_path(repo_id, filename) {
@@ -1207,7 +1207,7 @@ pub async fn inspect_npz(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_npz_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+    inspect_npz_with_access(repo_id, filename, &HubAccess::loose(token, revision)).await
 }
 
 /// [`inspect_npz`], with the token, the revision and the cache directory
@@ -1232,14 +1232,14 @@ pub async fn inspect_npz_with_config(
     filename: &str,
     config: &FetchConfig,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_npz_with_access(repo_id, filename, HubAccess::from_config(config)).await
+    inspect_npz_with_access(repo_id, filename, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`inspect_npz`] and [`inspect_npz_with_config`].
 async fn inspect_npz_with_access(
     repo_id: &str,
     filename: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first (mirrors `inspect_safetensors`).
     if let Some(cached_path) = access.cached_path(repo_id, filename) {
@@ -1459,7 +1459,7 @@ pub async fn inspect_pth(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_pth_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+    inspect_pth_with_access(repo_id, filename, &HubAccess::loose(token, revision)).await
 }
 
 /// [`inspect_pth`], with the token, the revision and the cache directory
@@ -1484,14 +1484,14 @@ pub async fn inspect_pth_with_config(
     filename: &str,
     config: &FetchConfig,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    inspect_pth_with_access(repo_id, filename, HubAccess::from_config(config)).await
+    inspect_pth_with_access(repo_id, filename, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`inspect_pth`] and [`inspect_pth_with_config`].
 async fn inspect_pth_with_access(
     repo_id: &str,
     filename: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first (mirrors `inspect_gguf` / `inspect_npz`).
     if let Some(cached_path) = access.cached_path(repo_id, filename) {
@@ -1618,7 +1618,7 @@ pub async fn inspect_repo_safetensors(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
-    inspect_repo_safetensors_with_access(repo_id, HubAccess::loose(token, revision)).await
+    inspect_repo_safetensors_with_access(repo_id, &HubAccess::loose(token, revision)).await
 }
 
 /// [`inspect_repo_safetensors`], with the token, the revision and the cache
@@ -1643,14 +1643,14 @@ pub async fn inspect_repo_safetensors_with_config(
     repo_id: &str,
     config: &FetchConfig,
 ) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
-    inspect_repo_safetensors_with_access(repo_id, HubAccess::from_config(config)).await
+    inspect_repo_safetensors_with_access(repo_id, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`inspect_repo_safetensors`] and
 /// [`inspect_repo_safetensors_with_config`].
 async fn inspect_repo_safetensors_with_access(
     repo_id: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
     let client = crate::chunked::build_client(access.token)?;
     let files =
@@ -1663,14 +1663,37 @@ async fn inspect_repo_safetensors_with_access(
         .map(|f| f.filename)
         .collect();
 
-    if safetensors_files.is_empty() {
+    inspect_shards(repo_id, safetensors_files, access).await
+}
+
+/// Reads every listed shard's header, four at a time, each one cache-first
+/// through `access` exactly as [`inspect_safetensors`] reads one file, and
+/// returns them in filename order.
+///
+/// Split out of [`inspect_repo_safetensors_with_access`], whose listing
+/// request needs the network, so this per-shard plumbing (the owned copies
+/// each spawned task rebuilds its access from) can be tested offline.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if a Range request fails or a task fails to
+/// run.
+/// Returns [`FetchError::Io`] if a cached shard cannot be read.
+/// Returns [`FetchError::SafetensorsHeader`] if a shard's header is
+/// malformed.
+async fn inspect_shards(
+    repo_id: &str,
+    filenames: Vec<String>,
+    access: &HubAccess<'_>,
+) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
+    if filenames.is_empty() {
         return Ok(Vec::new());
     }
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let mut join_set = JoinSet::new();
 
-    for filename in safetensors_files {
+    for filename in filenames {
         // BORROW: explicit .clone()/.to_owned()/.to_path_buf() to move into
         // the async task, which must own what it reads
         let sem = semaphore.clone();
@@ -1695,7 +1718,7 @@ async fn inspect_repo_safetensors_with_access(
             // single-file `inspect_safetensors` caller in the `hf-fm` CLI
             // is what renders them.
             let (info, source, _stats) =
-                inspect_safetensors_with_access(&repo, &filename, shard_access).await?;
+                inspect_safetensors_with_access(&repo, &filename, &shard_access).await?;
             Ok::<_, FetchError>((filename, info, source))
         });
     }
@@ -1989,7 +2012,7 @@ async fn fetch_json_cache_first<T>(
     repo_id: &str,
     filename: &str,
     what: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
     parse: fn(&str, &str) -> Result<T, FetchError>,
 ) -> Result<Option<T>, FetchError> {
     let rev = access.rev();
@@ -2067,7 +2090,7 @@ pub async fn fetch_shard_index(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Option<ShardedIndex>, FetchError> {
-    fetch_shard_index_with_access(repo_id, HubAccess::loose(token, revision)).await
+    fetch_shard_index_with_access(repo_id, &HubAccess::loose(token, revision)).await
 }
 
 /// [`fetch_shard_index`], with the token, the revision and the cache
@@ -2091,13 +2114,13 @@ pub async fn fetch_shard_index_with_config(
     repo_id: &str,
     config: &FetchConfig,
 ) -> Result<Option<ShardedIndex>, FetchError> {
-    fetch_shard_index_with_access(repo_id, HubAccess::from_config(config)).await
+    fetch_shard_index_with_access(repo_id, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`fetch_shard_index`] and [`fetch_shard_index_with_config`].
 async fn fetch_shard_index_with_access(
     repo_id: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<Option<ShardedIndex>, FetchError> {
     fetch_json_cache_first(
         repo_id,
@@ -2233,7 +2256,7 @@ pub async fn fetch_adapter_config(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Option<AdapterConfig>, FetchError> {
-    fetch_adapter_config_with_access(repo_id, HubAccess::loose(token, revision)).await
+    fetch_adapter_config_with_access(repo_id, &HubAccess::loose(token, revision)).await
 }
 
 /// [`fetch_adapter_config`], with the token, the revision and the cache
@@ -2259,14 +2282,14 @@ pub async fn fetch_adapter_config_with_config(
     repo_id: &str,
     config: &FetchConfig,
 ) -> Result<Option<AdapterConfig>, FetchError> {
-    fetch_adapter_config_with_access(repo_id, HubAccess::from_config(config)).await
+    fetch_adapter_config_with_access(repo_id, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`fetch_adapter_config`] and
 /// [`fetch_adapter_config_with_config`].
 async fn fetch_adapter_config_with_access(
     repo_id: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<Option<AdapterConfig>, FetchError> {
     fetch_json_cache_first(
         repo_id,
@@ -2462,7 +2485,7 @@ pub async fn fetch_model_config(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Option<ModelConfig>, FetchError> {
-    fetch_model_config_with_access(repo_id, HubAccess::loose(token, revision)).await
+    fetch_model_config_with_access(repo_id, &HubAccess::loose(token, revision)).await
 }
 
 /// [`fetch_model_config`], with the token, the revision and the cache
@@ -2486,14 +2509,14 @@ pub async fn fetch_model_config_with_config(
     repo_id: &str,
     config: &FetchConfig,
 ) -> Result<Option<ModelConfig>, FetchError> {
-    fetch_model_config_with_access(repo_id, HubAccess::from_config(config)).await
+    fetch_model_config_with_access(repo_id, &HubAccess::from_config(config)).await
 }
 
 /// Shared body of [`fetch_model_config`] and
 /// [`fetch_model_config_with_config`].
 async fn fetch_model_config_with_access(
     repo_id: &str,
-    access: HubAccess<'_>,
+    access: &HubAccess<'_>,
 ) -> Result<Option<ModelConfig>, FetchError> {
     fetch_json_cache_first(
         repo_id,
@@ -2978,6 +3001,13 @@ mod tests {
         let loose = super::HubAccess::loose(None, None);
         assert_eq!(loose.rev(), "main");
         assert_eq!(loose.cache_root, None);
+        let loose = super::HubAccess::loose(Some("hf_example"), Some("v2"));
+        assert_eq!(loose.token, Some("hf_example"));
+        assert_eq!(loose.rev(), "v2");
+        assert_eq!(
+            loose.cache_root, None,
+            "the originals read the default cache"
+        );
     }
 
     #[tokio::test]
@@ -3031,13 +3061,67 @@ mod tests {
         assert!(stats.is_none(), "a cache hit makes no range request");
     }
 
-    #[tokio::test]
-    async fn safetensors_with_config_reads_its_output_dir() {
-        let root = tempfile::tempdir().unwrap();
+    /// A minimal `.safetensors` file holding one `F32` tensor named `w`.
+    fn minimal_safetensors() -> Vec<u8> {
         let header = br#"{"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
         let mut file = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
         file.extend_from_slice(header);
         file.extend_from_slice(&[0u8; 8]);
+        file
+    }
+
+    #[tokio::test]
+    async fn inspect_shards_reads_each_shard_through_the_given_access() {
+        // `inspect_repo_safetensors_with_config`'s per-shard plumbing: each
+        // spawned task rebuilds its access from owned copies, so the root and
+        // the revision must survive that hand-off. Laid out at `v1` only.
+        let root = tempfile::tempdir().unwrap();
+        for shard in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            cache_file_at(
+                root.path(),
+                "org/model",
+                "v1",
+                shard,
+                &minimal_safetensors(),
+            );
+        }
+        let config = config_at(root.path(), "v1");
+
+        let results = super::inspect_shards(
+            "org/model",
+            vec![
+                "model-00002-of-00002.safetensors".to_owned(),
+                "model-00001-of-00002.safetensors".to_owned(),
+            ],
+            &super::HubAccess::from_config(&config),
+        )
+        .await
+        .unwrap();
+        // BORROW: explicit .as_str() to compare names as &str
+        let names: Vec<&str> = results.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors"
+            ],
+            "returned in filename order"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r.2, super::InspectSource::Cached)),
+            "every shard read from the configured cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn safetensors_with_config_reads_its_output_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let file = minimal_safetensors();
         cache_file_at(root.path(), "org/model", "main", "model.safetensors", &file);
 
         let (info, source, stats) = super::inspect_safetensors_with_config(
