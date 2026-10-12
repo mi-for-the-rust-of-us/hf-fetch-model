@@ -30,6 +30,15 @@
 //! - **Read-ahead** — short sequential reads are coalesced into
 //!   [`READAHEAD_BYTES`]-sized window fetches, so parsing a 30-byte local
 //!   header followed by a ~120-byte `NPY` header costs one request, not two.
+//! - **Growing read-ahead** — a fetch that continues exactly where the last
+//!   window ended doubles that window, up to [`MAX_READAHEAD_BYTES`], so a
+//!   long sequential scan costs a few requests instead of one per buffer
+//!   refill. A `.gguf` header is such a scan: its tokenizer's vocabulary
+//!   arrays, read through anamnesis's 64 KiB buffer, took about 16 requests
+//!   per MiB of header before v0.12.3: 201 for `gpt-oss-20b`, which now takes
+//!   18. Any seek starts
+//!   the next window again at the caller's size, so the archive layouts
+//!   above keep their small windows.
 //! - **No re-fetch** — reads covered by the cached tail or the current
 //!   window never re-issue a request.
 //!
@@ -77,22 +86,35 @@ pub const TAIL_PREFETCH_BYTES: u64 = 64 * 1024;
 /// request.
 pub const READAHEAD_BYTES: u64 = 4 * 1024;
 
+/// Largest window a growing read-ahead fetch reaches.
+///
+/// A sequential scan's windows double from the caller's buffer size up to
+/// this cap, so a 12 MiB `.gguf` header costs about 18 requests rather than
+/// 200. The cap bounds what the last window can read past the bytes the
+/// parser needs: under 1 MiB of tensor data, against a 64 KiB buffer
+/// refill's worth before growing read-ahead existed.
+pub const MAX_READAHEAD_BYTES: u64 = 1024 * 1024;
+
 /// Default cap on total bytes fetched over the reader's lifetime.
 ///
 /// Remote inspection of a well-formed `.safetensors`, `.npz` or `.pth`
 /// header transfers well under 1 MiB, and of a `.gguf` header, which carries
-/// its tokenizer's vocabulary, up to about 10 MiB (10.5 MiB measured on
-/// `unsloth/Qwen3.5-4B-GGUF`). 32 MiB leaves headroom above both (e.g. for a
-/// many-thousand-entry central directory) while guaranteeing that no inspect
-/// silently degenerates into a full-file download.
+/// its tokenizer's vocabulary, up to about 13 MiB (12.9 MiB fetched for
+/// `gpt-oss-20b`, the largest measured). 32 MiB leaves headroom above both
+/// (e.g. for a many-thousand-entry central directory) while guaranteeing that
+/// no inspect silently degenerates into a full-file download. Since growing
+/// read-ahead (v0.12.3) this is the budget that binds: a header up to about
+/// 31.9 MiB inspects, and a larger one fails with
+/// `range transfer budget exceeded`.
 pub const MAX_TRANSFER_BUDGET: u64 = 32 * 1024 * 1024;
 
 /// Default cap on the number of range fetches over the reader's lifetime.
 ///
 /// A well-formed `.safetensors`, `.npz` or `.pth` inspect needs a handful of
-/// requests, and a `.gguf` one tens to a couple of hundred (170 measured on
-/// `unsloth/Qwen3.5-4B-GGUF`); 256 tolerates a fragmented directory layout
-/// while stopping request storms from adversarial seek patterns.
+/// requests, and a `.gguf` one under 20 thanks to growing read-ahead (18 for
+/// `gpt-oss-20b`'s 12.4 MiB header, which took 201 before v0.12.3); 256
+/// tolerates a fragmented directory layout while stopping request storms
+/// from adversarial seek patterns.
 pub const MAX_RANGE_REQUESTS: u32 = 256;
 
 /// Wall-clock budget for a single HTTP range request (headers + body).
@@ -276,6 +298,30 @@ impl<F: RangeFetcher> RangeReader<F> {
         self.last_error.take()
     }
 
+    /// The window a fetch at the current position may grow to: double the
+    /// last window's length when this read continues exactly where that
+    /// window ended, capped at [`MAX_READAHEAD_BYTES`] and at the transfer
+    /// budget still unspent; `0` for any other read.
+    ///
+    /// The budget clamp means growth never spends bytes a fixed-size window
+    /// would not have: near the limit the fetch falls back to the caller's
+    /// size, whose own overrun the budget check reports as it always did.
+    fn grown_window(&self) -> u64 {
+        let Some(window) = &self.window else {
+            return 0;
+        };
+        // CAST: usize → u64, buffer length always fits (usize ≤ 64 bits)
+        #[allow(clippy::as_conversions)]
+        let len = window.data.len() as u64;
+        if window.start.saturating_add(len) != self.pos {
+            return 0;
+        }
+        let remaining = self.max_transfer_bytes.saturating_sub(self.bytes_fetched);
+        len.saturating_mul(2)
+            .min(MAX_READAHEAD_BYTES)
+            .min(remaining)
+    }
+
     /// Fetches `start..=end_inclusive` through the budget checks, recording
     /// stats and stashing typed errors.
     fn checked_fetch(&mut self, start: u64, end_inclusive: u64) -> io::Result<Vec<u8>> {
@@ -398,7 +444,8 @@ impl<F: RangeFetcher> Read for RangeReader<F> {
         // 3. Read-ahead window fetch at the current position.
         // CAST: usize → u64, buffer length always fits (usize ≤ 64 bits)
         #[allow(clippy::as_conversions)]
-        let want = (buf.len() as u64).max(READAHEAD_BYTES);
+        let base = (buf.len() as u64).max(READAHEAD_BYTES);
+        let want = base.max(self.grown_window());
         let mut end = self
             .pos
             .saturating_add(want)
@@ -554,8 +601,9 @@ impl HttpRangeReader {
     /// The defaults (256 requests, 32 MiB) are caps, not the expected spend.
     /// Header parsing on `inspect`'s `.safetensors` / `.npz` / `.pth` paths
     /// typically spends a handful of requests and well under 1 MiB; on its
-    /// `.gguf` path, whose header carries the tokenizer's vocabulary, tens to
-    /// a couple of hundred requests and a few MiB. A caller with its own,
+    /// `.gguf` path, whose header carries the tokenizer's vocabulary, under 20
+    /// requests and up to about 13 MiB. A `.gguf` header past about 31.9 MiB
+    /// needs a larger byte budget than the default. A caller with its own,
     /// larger, user-facing byte budget (`hf-fm peek`'s `--max`) needs its
     /// transport budget sized to match, or safety limits sized for header
     /// parsing cut it off first with an error that blames the archive
@@ -981,6 +1029,89 @@ mod tests {
         assert_eq!(r.fetcher.calls[0], (0, READAHEAD_BYTES - 1));
     }
 
+    /// Length of each fetched range, in fetch order.
+    fn fetch_lengths(r: &RangeReader<InMemoryFetcher>) -> Vec<u64> {
+        r.fetcher.calls.iter().map(|(s, e)| e - s + 1).collect()
+    }
+
+    #[test]
+    fn sequential_reads_grow_the_window_up_to_the_cap() {
+        const K: u64 = 1024;
+        // anamnesis's GGUF parser reads through a 64 KiB `BufReader`: each
+        // refill continues where the last window ended, so the window
+        // doubles until it reaches `MAX_READAHEAD_BYTES`.
+        let mut r = RangeReader::new(InMemoryFetcher::new(sample_data(8 * 1024 * 1024)));
+        let mut buf = vec![0u8; 64 * 1024];
+        for _ in 0..64 {
+            r.read_exact(&mut buf).unwrap(); // 4 MiB in 64 KiB refills
+        }
+        assert_eq!(
+            fetch_lengths(&r),
+            [
+                64 * K,
+                128 * K,
+                256 * K,
+                512 * K,
+                1024 * K,
+                1024 * K,
+                1024 * K,
+                1024 * K
+            ],
+            "doubling from the caller's 64 KiB to the 1 MiB cap"
+        );
+        // Before growing read-ahead, the same scan took 64 requests.
+        assert_eq!(r.stats().requests, 8);
+    }
+
+    #[test]
+    fn a_seek_restarts_the_window_at_the_callers_size() {
+        let mut r = RangeReader::new(InMemoryFetcher::new(sample_data(8 * 1024 * 1024)));
+        let mut buf = vec![0u8; 64 * 1024];
+        for _ in 0..8 {
+            r.read_exact(&mut buf).unwrap(); // grows to 256 KiB
+        }
+        r.seek(SeekFrom::Start(5 * 1024 * 1024)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            fetch_lengths(&r).last().copied(),
+            Some(64 * 1024),
+            "after a seek the window starts again at the caller's size"
+        );
+        // And a read after a non-contiguous seek back into a cached window
+        // is served without a request.
+        let before = r.stats().requests;
+        r.seek(SeekFrom::Start(5 * 1024 * 1024 + 10)).unwrap();
+        r.read_exact(&mut buf[..100]).unwrap();
+        assert_eq!(r.stats().requests, before);
+    }
+
+    #[test]
+    fn window_growth_never_spends_budget_a_fixed_window_would_not() {
+        // A 320 KiB budget: fixed 64 KiB windows read 5 of them (320 KiB)
+        // before the budget stops a sixth. Growth (64 + 128 = 192 KiB) must
+        // clamp to the 128 KiB left, not overrun with a 256 KiB window.
+        let budget = 320 * 1024;
+        let mut r = RangeReader::with_limits(
+            InMemoryFetcher::new(sample_data(4 * 1024 * 1024)),
+            u32::MAX,
+            budget,
+        );
+        let mut buf = vec![0u8; 64 * 1024];
+        for _ in 0..5 {
+            r.read_exact(&mut buf).unwrap();
+        }
+        assert_eq!(
+            r.stats().bytes_fetched,
+            budget,
+            "every budgeted byte is usable"
+        );
+        let err = r.read(&mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("range transfer budget exceeded"),
+            "the sixth refill overruns, as it did with fixed windows: {err}"
+        );
+    }
+
     #[test]
     fn tail_region_read_prefetches_tail_once() {
         let size: u64 = 1024 * 1024; // 1 MiB
@@ -1367,12 +1498,51 @@ mod tests {
 
     impl GgufBuilder {
         fn new(tensor_count: u64) -> Self {
+            Self::with_metadata(tensor_count, 0)
+        }
+
+        /// A builder whose header declares `kv_count` metadata entries,
+        /// which the caller then pushes before the tensor infos.
+        fn with_metadata(tensor_count: u64, kv_count: u64) -> Self {
             let mut buf = Vec::new();
             buf.extend_from_slice(b"GGUF");
             buf.extend_from_slice(&3u32.to_le_bytes()); // version
             buf.extend_from_slice(&tensor_count.to_le_bytes());
-            buf.extend_from_slice(&0u64.to_le_bytes()); // kv_count = 0
+            buf.extend_from_slice(&kv_count.to_le_bytes());
             Self { buf }
+        }
+
+        fn push_gguf_string(&mut self, s: &str) {
+            self.buf
+                .extend_from_slice(&u64::try_from(s.len()).unwrap().to_le_bytes());
+            self.buf.extend_from_slice(s.as_bytes());
+        }
+
+        /// A metadata array of `count` strings, each `len` bytes long: the
+        /// shape of `tokenizer.ggml.tokens` and `tokenizer.ggml.merges`.
+        fn push_kv_string_array(&mut self, key: &str, count: usize, len: usize) {
+            self.push_gguf_string(key);
+            self.buf.extend_from_slice(&9u32.to_le_bytes()); // GGUF_TYPE_ARRAY
+            self.buf.extend_from_slice(&8u32.to_le_bytes()); // of GGUF_TYPE_STRING
+            self.buf
+                .extend_from_slice(&u64::try_from(count).unwrap().to_le_bytes());
+            let item = "t".repeat(len);
+            for _ in 0..count {
+                self.push_gguf_string(&item);
+            }
+        }
+
+        /// A metadata array of `count` `i32` values: the shape of
+        /// `tokenizer.ggml.token_type`.
+        fn push_kv_i32_array(&mut self, key: &str, count: usize) {
+            self.push_gguf_string(key);
+            self.buf.extend_from_slice(&9u32.to_le_bytes()); // GGUF_TYPE_ARRAY
+            self.buf.extend_from_slice(&5u32.to_le_bytes()); // of GGUF_TYPE_INT32
+            self.buf
+                .extend_from_slice(&u64::try_from(count).unwrap().to_le_bytes());
+            for _ in 0..count {
+                self.buf.extend_from_slice(&1i32.to_le_bytes());
+            }
         }
 
         fn push_f32_tensor_info(&mut self, name: &str, shape: &[u64], relative_offset: u64) {
@@ -1454,6 +1624,97 @@ mod tests {
             "fetched {} of {total} bytes — front-matter parse must not read tensor data",
             stats.bytes_fetched
         );
+    }
+
+    /// A `GGUF` whose header is a BPE tokenizer: `tokens` tokens of 9 bytes,
+    /// their types, and `merges` merges of 11 bytes, then one small tensor
+    /// and 2 MiB of data the inspect never needs. With 201,088 tokens and
+    /// 446,189 merges this is the shape of `gpt-oss-20b`'s 12.4 MiB header,
+    /// the largest measured. Returns the bytes and the header's length.
+    fn tokenizer_gguf(tokens: usize, merges: usize) -> (Vec<u8>, u64) {
+        let mut b = GgufBuilder::with_metadata(1, 3);
+        b.push_kv_string_array("tokenizer.ggml.tokens", tokens, 9);
+        b.push_kv_i32_array("tokenizer.ggml.token_type", tokens);
+        b.push_kv_string_array("tokenizer.ggml.merges", merges, 11);
+        b.push_f32_tensor_info("w", &[8], 0);
+        let header_len = u64::try_from(b.buf.len()).unwrap();
+        b.pad_to_alignment(32);
+        b.push_zeros(2 * 1024 * 1024);
+        (b.finish(), header_len)
+    }
+
+    #[test]
+    fn gguf_with_a_gpt_oss_sized_tokenizer_inspects_in_a_few_requests() {
+        // The real `ggml-org/gpt-oss-20b-GGUF` took 201 of the 256 allowed
+        // requests (and 74 s) before growing read-ahead: one per 64 KiB
+        // `BufReader` refill of its tokenizer arrays.
+        let (gguf, header_len) = tokenizer_gguf(201_088, 446_189);
+        let mut reader = RangeReader::new(InMemoryFetcher::new(gguf));
+        let front = anamnesis::parse_gguf_front_matter_from_reader(&mut reader)
+            .expect("a gpt-oss-sized header must parse within the default budgets");
+        assert_eq!(front.tensor_infos.len(), 1);
+
+        let stats = reader.stats();
+        assert!(
+            stats.requests <= 25,
+            "a {header_len}-byte header should take about 18 requests, got {}",
+            stats.requests
+        );
+        assert!(
+            stats.bytes_fetched >= header_len
+                && stats.bytes_fetched <= header_len + MAX_READAHEAD_BYTES,
+            "fetched {} for a {header_len}-byte header: at most one window past it",
+            stats.bytes_fetched
+        );
+    }
+
+    #[test]
+    fn gguf_header_just_under_the_transfer_budget_still_inspects() {
+        // About 30.5 MiB of header, two and a half times gpt-oss-20b's: the
+        // byte budget, not the request cap, is now the limit that binds.
+        let (gguf, header_len) = tokenizer_gguf(800_000, 800_000);
+        assert!(
+            header_len > 30 * 1024 * 1024,
+            "fixture is {header_len} bytes"
+        );
+        let mut reader = RangeReader::new(InMemoryFetcher::new(gguf));
+        let front = anamnesis::parse_gguf_front_matter_from_reader(&mut reader)
+            .expect("a header under the 32 MiB budget must parse");
+        assert_eq!(front.tensor_infos.len(), 1);
+        assert!(
+            reader.stats().requests <= 40,
+            "got {}",
+            reader.stats().requests
+        );
+    }
+
+    #[test]
+    fn gguf_header_over_the_transfer_budget_fails_and_a_larger_budget_reads_it() {
+        // About 33.6 MiB of header: past the 32 MiB default.
+        let (gguf, header_len) = tokenizer_gguf(880_000, 880_000);
+        assert!(
+            header_len > MAX_TRANSFER_BUDGET,
+            "fixture is {header_len} bytes"
+        );
+
+        let mut reader = RangeReader::new(InMemoryFetcher::new(gguf.clone()));
+        let err = anamnesis::parse_gguf_front_matter_from_reader(&mut reader).unwrap_err();
+        assert!(
+            err.to_string().contains("range transfer budget exceeded")
+                && err.to_string().contains("open_with_limits"),
+            "the failure names the budget and how to raise it: {err}"
+        );
+
+        // The way past it a library caller has: a larger budget, which
+        // `HttpRangeReader::open_with_limits` sets for a remote file.
+        let mut reader = RangeReader::with_limits(
+            InMemoryFetcher::new(gguf),
+            MAX_RANGE_REQUESTS,
+            2 * MAX_TRANSFER_BUDGET,
+        );
+        let front = anamnesis::parse_gguf_front_matter_from_reader(&mut reader)
+            .expect("a 64 MiB budget reads the 33.6 MiB header");
+        assert_eq!(front.tensor_infos.len(), 1);
     }
 
     // ---------- PTH end-to-end over the reader ----------

@@ -946,9 +946,10 @@ fn gguf_front_matter_to_header_info(
 /// anamnesis shipped in 0.4.5). `GGUF` is front-loaded: the parser reads the
 /// metadata KV table and tensor-info table in a single linear scan and never
 /// touches the tensor-data segment, so a multi-GiB quantised file inspects in
-/// a few MiB: tens to a couple of hundred range requests, most of them for
-/// the tokenizer's vocabulary arrays (170 requests and 10.5 MiB measured on
-/// `unsloth/Qwen3.5-4B-GGUF`). Mirrors [`inspect_npz`] / [`inspect_safetensors`]'s
+/// a few MiB, most of it the tokenizer's vocabulary arrays, and in under 20
+/// range requests thanks to the reader's growing read-ahead (16 requests and
+/// 10.9 MiB measured on `unsloth/Qwen3.5-4B-GGUF`, which took 170 before
+/// v0.12.3). Mirrors [`inspect_npz`] / [`inspect_safetensors`]'s
 /// shape so the `hf-fm` CLI renders all three formats' `Source:` line
 /// identically.
 ///

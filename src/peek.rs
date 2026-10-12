@@ -41,15 +41,16 @@ const TAIL_SCAN_CHUNK: u64 = 4 * 1024;
 ///
 /// Sized to match [`crate::http_range::TAIL_PREFETCH_BYTES`] rather than
 /// the transport's smaller `READAHEAD_BYTES` floor: `bounded_copy` reads
-/// through [`crate::http_range::RangeReader`], which fetches one window
-/// per call sized to (at least) the caller's buffer — a small fixed chunk
-/// here means one HTTP range request per chunk, no window reuse, since a
-/// forward-only scan never revisits a window once drained. At 4 KiB that
-/// caps a `--head`/`--tail` (lines) scan at [`MAX_RANGE_REQUESTS`] × 4 KiB
-/// ≈ 1 MiB — well under the 10 MiB default `--max` — before hitting
-/// `"range request cap exceeded"`. 64 KiB raises that same ceiling to
-/// [`MAX_RANGE_REQUESTS`] × 64 KiB ≈ 16 MiB, comfortably covering the
-/// default cap without even widening [`transport_limits`]'s request count.
+/// through [`crate::http_range::RangeReader`], whose window is at least the
+/// caller's buffer. Before v0.12.3 that was also at most, so a small fixed
+/// chunk here meant one HTTP range request per chunk: at 4 KiB a
+/// `--head`/`--tail` (lines) scan hit `"range request cap exceeded"` after
+/// [`MAX_RANGE_REQUESTS`] × 4 KiB ≈ 1 MiB, well under the 10 MiB default
+/// `--max`, and 64 KiB raised that ceiling to ≈ 16 MiB. The reader's
+/// growing read-ahead now doubles a forward scan's window up to
+/// [`crate::http_range::MAX_READAHEAD_BYTES`], so a scan costs far fewer
+/// requests than one per chunk; the 64 KiB first window still keeps a
+/// short `--head` to a single request.
 const READ_CHUNK: usize = 64 * 1024;
 
 // -----------------------------------------------------------------------
@@ -622,8 +623,9 @@ fn format_bytes_approx(bytes: u64) -> String {
 ///   function's doc comment) and the gzip `Cat` path's `max_bytes + 1`
 ///   buffering probe.
 /// - `max_requests` budgets one request per [`READ_CHUNK`] of forward scan
-///   ([`bounded_copy`]'s per-chunk fetch pattern, the dominant cost for
-///   `--head` / `--tail` lines mode), plus a fixed slack for
+///   ([`bounded_copy`]'s per-chunk fetch pattern before v0.12.3's growing
+///   read-ahead, and still a safe upper bound now that the reader's windows
+///   grow), plus a fixed slack for
 ///   [`stream_tail_lines`]'s handful of doubling rounds and the transport's
 ///   own probe/tail-prefetch requests.
 fn transport_limits(max_bytes: u64) -> (u32, u64) {

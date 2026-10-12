@@ -51,6 +51,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Growing read-ahead: a large `.gguf` header inspects in under 20 range
+  requests.** `RangeReader` now doubles its window while a read continues
+  exactly where the last window ended, from the caller's size up to the new
+  `MAX_READAHEAD_BYTES` (1 MiB), and starts again at the caller's size after
+  any seek. anamnesis reads a GGUF header through a 64 KiB buffer, so its
+  tokenizer arrays had cost one range request per 64 KiB: 201 of the 256
+  allowed for `gpt-oss-20b`'s 12.4 MiB header and 202 for
+  `Llama-4-Scout`'s, so a vocabulary about a quarter larger would have
+  failed with `range request cap exceeded`. Measured on the real files,
+  before and after:
+
+  | GGUF | before | after |
+  |---|---|---|
+  | `ggml-org/gpt-oss-20b-GGUF` | 201 requests, 74 s | 18 requests, 7 s |
+  | `unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF` | 202 requests, 91 s | 18 requests, 7 s |
+  | `unsloth/Qwen3.5-4B-GGUF` | 170 requests | 16 requests, 6 s |
+  | `bartowski/zed-industries_zeta-2-GGUF` (Q4_K_M) | 98 requests | 12 requests |
+  | `bartowski/SmolLM2-135M-Instruct-GGUF` (Q2_K) | 30 requests | 7 requests, 3 s |
+
+  The last window reads at most 1 MiB past the header (0.94 MiB at most
+  above). The 32 MiB byte budget is now the limit that binds: a header up
+  to about 31.9 MiB inspects, two and a half times the largest measured,
+  and a larger one fails with `range transfer budget exceeded` (the FAQ
+  says what to do then). A grown window never spends budget a fixed one
+  would not have: near the limit it falls back to the caller's size.
+  `.npz`, `.pth` and safetensors headers, which seek or arrive in one read,
+  are unchanged; `hf-fm peek`'s forward scans and `quants --fits`' header
+  reads take fewer requests too.
+
 - **The two range-budget errors name how to raise the cap.**
   `range request cap exceeded (…)` and `range transfer budget exceeded (…)`
   already stated the cap they hit; both now end with `(a caller can raise the
@@ -61,12 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expected spend: its old wording, "a handful of requests, well under
   1 MiB", was read as the cap during candle-mi's NPZ adoption (finding 4 of
   [its report](docs/dogfooding-feedbacks/candle-mi-npz-range-inspect.md)).
-  That wording was also wrong for `.gguf`, and the docs now give the
-  typical spend per format: a handful of requests and well under 1 MiB
-  for `.safetensors`, `.npz` and `.pth`, but tens to a couple of hundred
-  requests and up to about 10 MiB for a `.gguf`, whose header carries the
-  tokenizer's vocabulary (170 requests and 10.5 MiB measured on
-  `unsloth/Qwen3.5-4B-GGUF`, two thirds of the request cap).
+  That wording was also wrong for `.gguf`, whose header carries the
+  tokenizer's vocabulary and took tens to a couple of hundred requests
+  before growing read-ahead (above); the docs now give the spend per
+  format.
   Code matching either message on its text keeps working if it matches the
   start, which is unchanged.
 

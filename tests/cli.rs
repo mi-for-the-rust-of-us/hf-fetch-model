@@ -3834,6 +3834,48 @@ fn info_json_output() {
 // quants / --fits
 // -----------------------------------------------------------------------
 
+/// Parses the request count out of `Source:   remote (N range requests, …)`.
+fn remote_request_count(stdout: &str) -> Option<u32> {
+    let line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("Source:"))?;
+    line.split("remote (")
+        .nth(1)?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[test]
+fn inspect_remote_gguf_with_a_large_tokenizer_takes_a_few_requests() {
+    // Real-life check of growing read-ahead (v0.12.3). gpt-oss-20b's GGUF
+    // has the largest header measured, 12.4 MiB, nearly all of it tokenizer
+    // arrays; before v0.12.3 it took 201 of the 256 allowed range requests
+    // (and 74 s), one per 64 KiB buffer refill. Live, like the other remote
+    // inspect tests, with an isolated HF_HOME so the file cannot come from a
+    // local cache.
+    let (_dir, stdout, stderr, success) = run_isolated(hf_fm().args([
+        "inspect",
+        "ggml-org/gpt-oss-20b-GGUF",
+        "gpt-oss-20b-MXFP4.gguf",
+        "--limit",
+        "1",
+    ]));
+    assert!(success, "remote GGUF inspect should succeed: {stderr}");
+    let requests = remote_request_count(&stdout).unwrap_or_else(|| {
+        panic!(
+            "expected a remote Source line, got:
+{stdout}"
+        )
+    });
+    assert!(
+        requests <= 40,
+        "expected about 20 range requests, got {requests}:
+{stdout}"
+    );
+}
+
 #[test]
 fn inspect_cache_headers_second_call_hits_the_cache() {
     // Isolated HF_HOME: a real repo directory gets created here solely by

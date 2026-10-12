@@ -50,7 +50,7 @@
 //! [`inspect_safetensors`], [`inspect_gguf`], [`inspect_npz`] and
 //! [`inspect_pth`] each take a repo id and a filename, read the header from
 //! the local cache when the file is there and over HTTP Range otherwise (a
-//! handful of requests for most formats, tens to a couple of hundred for a
+//! handful of requests for most formats, and under 20 for even a large
 //! `.gguf`, whose header carries the tokenizer's vocabulary), and return the
 //! format-agnostic [`inspect::SafetensorsHeaderInfo`], where it came from,
 //! and for a remote read what it cost ([`RangeStats`]).
