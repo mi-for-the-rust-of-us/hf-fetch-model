@@ -24,9 +24,10 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    reused here as illustration and labeled as such, since reproducing a
    12+ GiB MoE GGUF download-free capture is impractical to redo on
    every doc refresh. The `--cache-headers` section's blocks are real
-   captures from 2026-10-10 (v0.12.2), made without a token on an isolated
-   cache: the two `quants` runs 15 minutes apart, inside the header
-   cache's one-hour window, and the two `inspect` calls back to back.
+   captures on an isolated cache: the two `quants` runs from 2026-10-10
+   (v0.12.2), made without a token 15 minutes apart, inside the header
+   cache's one-hour window; the two `inspect` calls re-captured back to
+   back on 2026-10-12 (v0.12.3), after growing read-ahead.
 3. Output blocks: paste exact output, do not paraphrase. Trim a long
    table with `…` and note the trim.
 4. Length budget: under 300 lines total, including embedded outputs.

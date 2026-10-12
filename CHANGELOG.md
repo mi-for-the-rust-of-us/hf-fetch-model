@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3] — Inspect API ergonomics and growing read-ahead
+
 ### Added
 
 - **`_with_config` twins for the eight cache-first `inspect` entry points
