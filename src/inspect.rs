@@ -30,6 +30,14 @@
 //! adapters) and [`ModelConfig`] (`config.json`, the architecture parameters
 //! that drive `inspect --check-gpu --context` KV-cache budgeting), via
 //! [`fetch_model_config`] / [`fetch_model_config_cached`].
+//!
+//! The eight entry points that can reach the network take a token and a
+//! revision as loose arguments and look in the default `HF` cache first.
+//! Each has a `_with_config` twin (since v0.12.3, e.g.
+//! [`inspect_npz_with_config`]) that takes the token, the revision and the
+//! cache directory from a [`FetchConfig`] instead, so a caller that
+//! downloads with a custom [`FetchConfig::output_dir`] inspects that same
+//! cache.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +48,7 @@ use tokio::task::JoinSet;
 use crate::cache;
 use crate::cache_layout;
 use crate::chunked;
+use crate::config::FetchConfig;
 use crate::error::FetchError;
 use crate::http_range::{HttpRangeReader, RangeStats};
 
@@ -393,12 +402,30 @@ pub struct ModelConfig {
 /// ([`cache_layout::is_safe_repo_filename`]) is never joined to it and reads
 /// as not cached: `inspect <repo> <N>` and `--pick` take the name from the
 /// repo listing.
+///
+/// This reads the default `HF` cache. The `_with_config` entry points look in
+/// a [`FetchConfig::output_dir`] instead when one is set.
 #[must_use]
 pub fn resolve_cached_path(repo_id: &str, revision: &str, filename: &str) -> Option<PathBuf> {
+    resolve_cached_path_at(None, repo_id, revision, filename)
+}
+
+/// [`resolve_cached_path`] against `cache_root`, or against the default `HF`
+/// cache when `cache_root` is `None`.
+fn resolve_cached_path_at(
+    cache_root: Option<&Path>,
+    repo_id: &str,
+    revision: &str,
+    filename: &str,
+) -> Option<PathBuf> {
     if !cache_layout::is_safe_repo_filename(filename) {
         return None;
     }
-    let cache_dir = cache::hf_cache_dir().ok()?;
+    let cache_dir = match cache_root {
+        // BORROW: explicit .to_path_buf() so both arms yield an owned root
+        Some(root) => root.to_path_buf(),
+        None => cache::hf_cache_dir().ok()?,
+    };
     let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id);
     let commit_hash = cache::read_ref(&repo_dir, revision)?;
     let cached_path = cache_layout::pointer_path(&repo_dir, &commit_hash, filename);
@@ -406,6 +433,55 @@ pub fn resolve_cached_path(repo_id: &str, revision: &str, filename: &str) -> Opt
         Some(cached_path)
     } else {
         None
+    }
+}
+
+/// How a cache-first entry point reaches the Hub, and where it looks first.
+///
+/// The original entry points take `token` and `revision` as loose arguments
+/// and read the default `HF` cache ([`HubAccess::loose`]); their
+/// `_with_config` twins take all three from a [`FetchConfig`]
+/// ([`HubAccess::from_config`]). Both forms build one of these and share a
+/// single body, so they cannot drift. No `Debug`: it carries the token.
+#[derive(Clone, Copy)]
+struct HubAccess<'a> {
+    /// Explicit token; `None` lets each request resolve one implicitly.
+    token: Option<&'a str>,
+    /// Git revision (branch, tag, or commit SHA); `None` means `main`.
+    revision: Option<&'a str>,
+    /// Root of the cache-first lookup; `None` means the default `HF` cache.
+    cache_root: Option<&'a Path>,
+}
+
+impl<'a> HubAccess<'a> {
+    /// The original entry points' access: loose arguments, default cache.
+    const fn loose(token: Option<&'a str>, revision: Option<&'a str>) -> Self {
+        Self {
+            token,
+            revision,
+            cache_root: None,
+        }
+    }
+
+    /// A `_with_config` twin's access: `config`'s token, revision and output
+    /// directory. Every other setting of `config` is ignored.
+    fn from_config(config: &'a FetchConfig) -> Self {
+        Self {
+            token: config.token(),
+            revision: config.revision(),
+            cache_root: config.output_dir(),
+        }
+    }
+
+    /// The revision requests target: the configured one, or `main`.
+    fn rev(&self) -> &'a str {
+        self.revision.unwrap_or("main")
+    }
+
+    /// Where `filename` of `repo_id` sits in the cache this access reads, if
+    /// it is cached there.
+    fn cached_path(&self, repo_id: &str, filename: &str) -> Option<PathBuf> {
+        resolve_cached_path_at(self.cache_root, repo_id, self.rev(), filename)
     }
 }
 
@@ -559,12 +635,16 @@ fn safetensors_header_to_info(
 /// path. Mirrors [`inspect_npz`]'s shape so the `hf-fm` CLI renders both
 /// formats' `Source:` line identically.
 ///
+/// [`inspect_safetensors_with_config`] takes the token, the revision and the
+/// cache directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the Range probe or a range request
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
 /// diagnosis).
+/// Returns [`FetchError::Io`] if the cached file cannot be read.
 /// Returns [`FetchError::SafetensorsHeader`] if the header is malformed
 /// (cached or remote).
 pub async fn inspect_safetensors(
@@ -573,17 +653,51 @@ pub async fn inspect_safetensors(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    let rev = revision.unwrap_or("main");
+    inspect_safetensors_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+}
 
+/// [`inspect_safetensors`], with the token, the revision and the cache
+/// directory taken from `config`.
+///
+/// The cache-first lookup reads [`FetchConfig::output_dir`] as the cache
+/// root, so a file downloaded with the same `config` is found there (unset:
+/// the default `HF` cache). A remote read sends [`FetchConfig::token`]
+/// (unset: one is resolved implicitly) and targets [`FetchConfig::revision`]
+/// (unset: `main`). The other settings of `config` have no meaning for a
+/// header read and are ignored.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the Range probe or a range request
+/// fails — including gated repos, which surface as `returned status
+/// 401/403` errors.
+/// Returns [`FetchError::Io`] if the cached file cannot be read.
+/// Returns [`FetchError::SafetensorsHeader`] if the header is malformed
+/// (cached or remote).
+pub async fn inspect_safetensors_with_config(
+    repo_id: &str,
+    filename: &str,
+    config: &FetchConfig,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
+    inspect_safetensors_with_access(repo_id, filename, HubAccess::from_config(config)).await
+}
+
+/// Shared body of [`inspect_safetensors`] and
+/// [`inspect_safetensors_with_config`].
+async fn inspect_safetensors_with_access(
+    repo_id: &str,
+    filename: &str,
+    access: HubAccess<'_>,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first.
-    if let Some(cached_path) = resolve_cached_path(repo_id, rev, filename) {
+    if let Some(cached_path) = access.cached_path(repo_id, filename) {
         let info = inspect_safetensors_local(&cached_path)?;
         return Ok((info, InspectSource::Cached, None));
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
     // then hand the reader off to the shared from-reader parse path.
-    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    let reader = HttpRangeReader::open(repo_id, access.revision, filename, access.token).await?;
     inspect_safetensors_from_reader(reader, filename).await
 }
 
@@ -718,14 +832,23 @@ pub fn inspect_gguf_cached(
         }
     })?;
 
-    let file_size = std::fs::metadata(&cached_path).ok().map(|m| m.len());
+    parse_gguf_file(&cached_path, filename)
+}
 
-    let parsed =
-        anamnesis::parse_gguf(&cached_path).map_err(|e| FetchError::SafetensorsHeader {
-            // BORROW: explicit .to_owned() for owned String in the error variant
-            filename: filename.to_owned(),
-            reason: format!("failed to parse GGUF: {e}"),
-        })?;
+/// Parses the cached `.gguf` file at `path` into the format-agnostic header
+/// shape; `filename` names it in errors.
+///
+/// Shared by [`inspect_gguf_cached`] and the cache-hit path of
+/// [`inspect_gguf`] / [`inspect_gguf_with_config`], which has already
+/// resolved the path in whichever cache it reads.
+fn parse_gguf_file(path: &Path, filename: &str) -> Result<SafetensorsHeaderInfo, FetchError> {
+    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+
+    let parsed = anamnesis::parse_gguf(path).map_err(|e| FetchError::SafetensorsHeader {
+        // BORROW: explicit .to_owned() for owned String in the error variant
+        filename: filename.to_owned(),
+        reason: format!("failed to parse GGUF: {e}"),
+    })?;
 
     Ok(gguf_front_matter_to_header_info(
         parsed.tensor_info(),
@@ -822,6 +945,9 @@ fn gguf_front_matter_to_header_info(
 /// The third tuple element reports the remote transfer statistics
 /// ([`RangeStats`]: request count + bytes fetched); `None` on the cached path.
 ///
+/// [`inspect_gguf_with_config`] takes the token, the revision and the cache
+/// directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the Range probe or a range request
@@ -836,17 +962,49 @@ pub async fn inspect_gguf(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    let rev = revision.unwrap_or("main");
+    inspect_gguf_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+}
 
+/// [`inspect_gguf`], with the token, the revision and the cache directory
+/// taken from `config`.
+///
+/// The cache-first lookup reads [`FetchConfig::output_dir`] as the cache
+/// root, so a file downloaded with the same `config` is found there (unset:
+/// the default `HF` cache). A remote read sends [`FetchConfig::token`]
+/// (unset: one is resolved implicitly) and targets [`FetchConfig::revision`]
+/// (unset: `main`). The other settings of `config` have no meaning for a
+/// header read and are ignored.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the Range probe or a range request
+/// fails — including gated repos, which surface as `returned status
+/// 401/403` errors.
+/// Returns [`FetchError::SafetensorsHeader`] if the `GGUF` file is malformed
+/// (cached or remote).
+pub async fn inspect_gguf_with_config(
+    repo_id: &str,
+    filename: &str,
+    config: &FetchConfig,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
+    inspect_gguf_with_access(repo_id, filename, HubAccess::from_config(config)).await
+}
+
+/// Shared body of [`inspect_gguf`] and [`inspect_gguf_with_config`].
+async fn inspect_gguf_with_access(
+    repo_id: &str,
+    filename: &str,
+    access: HubAccess<'_>,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first (mirrors `inspect_npz` / `inspect_safetensors`).
-    if resolve_cached_path(repo_id, rev, filename).is_some() {
-        let info = inspect_gguf_cached(repo_id, filename, revision)?;
+    if let Some(cached_path) = access.cached_path(repo_id, filename) {
+        let info = parse_gguf_file(&cached_path, filename)?;
         return Ok((info, InspectSource::Cached, None));
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
     // then hand the reader off to the shared from-reader parse path.
-    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    let reader = HttpRangeReader::open(repo_id, access.revision, filename, access.token).await?;
     inspect_gguf_from_reader(reader, filename).await
 }
 
@@ -954,14 +1112,23 @@ pub fn inspect_npz_cached(
         }
     })?;
 
-    let file_size = std::fs::metadata(&cached_path).ok().map(|m| m.len());
+    parse_npz_file(&cached_path, filename)
+}
 
-    let parsed =
-        anamnesis::inspect_npz(&cached_path).map_err(|e| FetchError::SafetensorsHeader {
-            // BORROW: explicit .to_owned() for owned String in the error variant
-            filename: filename.to_owned(),
-            reason: format!("failed to parse NPZ: {e}"),
-        })?;
+/// Parses the cached `.npz` archive at `path` into the format-agnostic
+/// header shape; `filename` names it in errors.
+///
+/// Shared by [`inspect_npz_cached`] and the cache-hit path of
+/// [`inspect_npz`] / [`inspect_npz_with_config`], which has already resolved
+/// the path in whichever cache it reads.
+fn parse_npz_file(path: &Path, filename: &str) -> Result<SafetensorsHeaderInfo, FetchError> {
+    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+
+    let parsed = anamnesis::inspect_npz(path).map_err(|e| FetchError::SafetensorsHeader {
+        // BORROW: explicit .to_owned() for owned String in the error variant
+        filename: filename.to_owned(),
+        reason: format!("failed to parse NPZ: {e}"),
+    })?;
 
     Ok(npz_info_to_header_info(parsed, file_size))
 }
@@ -1020,6 +1187,9 @@ fn npz_info_to_header_info(
 /// `remote (6 range requests, 136.0 KiB fetched)`, the live-measured cost
 /// against a 72 MiB `GemmaScope` `params.npz`.
 ///
+/// [`inspect_npz_with_config`] takes the token, the revision and the cache
+/// directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the Range probe or a range request
@@ -1034,17 +1204,49 @@ pub async fn inspect_npz(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    let rev = revision.unwrap_or("main");
+    inspect_npz_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+}
 
+/// [`inspect_npz`], with the token, the revision and the cache directory
+/// taken from `config`.
+///
+/// The cache-first lookup reads [`FetchConfig::output_dir`] as the cache
+/// root, so a file downloaded with the same `config` is found there (unset:
+/// the default `HF` cache). A remote read sends [`FetchConfig::token`]
+/// (unset: one is resolved implicitly) and targets [`FetchConfig::revision`]
+/// (unset: `main`). The other settings of `config` have no meaning for a
+/// header read and are ignored.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the Range probe or a range request
+/// fails — including gated repos, which surface as `returned status
+/// 401/403` errors.
+/// Returns [`FetchError::SafetensorsHeader`] if the `NPZ` archive is
+/// malformed (cached or remote).
+pub async fn inspect_npz_with_config(
+    repo_id: &str,
+    filename: &str,
+    config: &FetchConfig,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
+    inspect_npz_with_access(repo_id, filename, HubAccess::from_config(config)).await
+}
+
+/// Shared body of [`inspect_npz`] and [`inspect_npz_with_config`].
+async fn inspect_npz_with_access(
+    repo_id: &str,
+    filename: &str,
+    access: HubAccess<'_>,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first (mirrors `inspect_safetensors`).
-    if resolve_cached_path(repo_id, rev, filename).is_some() {
-        let info = inspect_npz_cached(repo_id, filename, revision)?;
+    if let Some(cached_path) = access.cached_path(repo_id, filename) {
+        let info = parse_npz_file(&cached_path, filename)?;
         return Ok((info, InspectSource::Cached, None));
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
     // then hand the reader off to the shared from-reader parse path.
-    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    let reader = HttpRangeReader::open(repo_id, access.revision, filename, access.token).await?;
     inspect_npz_from_reader(reader, filename).await
 }
 
@@ -1137,9 +1339,19 @@ pub fn inspect_pth_cached(
         }
     })?;
 
-    let file_size = std::fs::metadata(&cached_path).ok().map(|m| m.len());
+    parse_pth_file(&cached_path, filename)
+}
 
-    let parsed = anamnesis::parse_pth(&cached_path).map_err(|e| FetchError::SafetensorsHeader {
+/// Parses the cached `.pth` archive at `path` into the format-agnostic
+/// header shape; `filename` names it in errors.
+///
+/// Shared by [`inspect_pth_cached`] and the cache-hit path of
+/// [`inspect_pth`] / [`inspect_pth_with_config`], which has already resolved
+/// the path in whichever cache it reads.
+fn parse_pth_file(path: &Path, filename: &str) -> Result<SafetensorsHeaderInfo, FetchError> {
+    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+
+    let parsed = anamnesis::parse_pth(path).map_err(|e| FetchError::SafetensorsHeader {
         // BORROW: explicit .to_owned() for owned String in the error variant
         filename: filename.to_owned(),
         reason: format!("failed to parse PTH: {e}"),
@@ -1227,6 +1439,9 @@ fn pth_tensor_info_to_header_info(
 /// ([`RangeStats`]: request count + bytes fetched); `None` on the cached
 /// path.
 ///
+/// [`inspect_pth_with_config`] takes the token, the revision and the cache
+/// directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the Range probe or a range request
@@ -1241,17 +1456,49 @@ pub async fn inspect_pth(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
-    let rev = revision.unwrap_or("main");
+    inspect_pth_with_access(repo_id, filename, HubAccess::loose(token, revision)).await
+}
 
+/// [`inspect_pth`], with the token, the revision and the cache directory
+/// taken from `config`.
+///
+/// The cache-first lookup reads [`FetchConfig::output_dir`] as the cache
+/// root, so a file downloaded with the same `config` is found there (unset:
+/// the default `HF` cache). A remote read sends [`FetchConfig::token`]
+/// (unset: one is resolved implicitly) and targets [`FetchConfig::revision`]
+/// (unset: `main`). The other settings of `config` have no meaning for a
+/// header read and are ignored.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the Range probe or a range request
+/// fails — including gated repos, which surface as `returned status
+/// 401/403` errors.
+/// Returns [`FetchError::SafetensorsHeader`] if the `PTH` file is malformed
+/// (cached or remote).
+pub async fn inspect_pth_with_config(
+    repo_id: &str,
+    filename: &str,
+    config: &FetchConfig,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
+    inspect_pth_with_access(repo_id, filename, HubAccess::from_config(config)).await
+}
+
+/// Shared body of [`inspect_pth`] and [`inspect_pth_with_config`].
+async fn inspect_pth_with_access(
+    repo_id: &str,
+    filename: &str,
+    access: HubAccess<'_>,
+) -> Result<(SafetensorsHeaderInfo, InspectSource, Option<RangeStats>), FetchError> {
     // Try local cache first (mirrors `inspect_gguf` / `inspect_npz`).
-    if resolve_cached_path(repo_id, rev, filename).is_some() {
-        let info = inspect_pth_cached(repo_id, filename, revision)?;
+    if let Some(cached_path) = access.cached_path(repo_id, filename) {
+        let info = parse_pth_file(&cached_path, filename)?;
         return Ok((info, InspectSource::Cached, None));
     }
 
     // Fall back to HTTP Range requests: probe eagerly (typed errors here),
     // then hand the reader off to the shared from-reader parse path.
-    let reader = HttpRangeReader::open(repo_id, revision, filename, token).await?;
+    let reader = HttpRangeReader::open(repo_id, access.revision, filename, access.token).await?;
     inspect_pth_from_reader(reader, filename).await
 }
 
@@ -1353,17 +1600,59 @@ fn stringify_gguf_scalar(value: &anamnesis::parse::gguf::GgufMetadataValue) -> O
 /// For a lightweight summary of sharded models (tensor counts per shard
 /// without fetching individual headers), use [`fetch_shard_index()`] instead.
 ///
+/// [`inspect_repo_safetensors_with_config`] takes the token, the revision and
+/// the cache directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the metadata or Range requests fail.
+/// Returns [`FetchError::RepoNotFound`] if the repository does not exist.
+/// Returns [`FetchError::Io`] if a cached shard cannot be read.
+/// Returns [`FetchError::SafetensorsHeader`] if a shard's header is
+/// malformed.
 pub async fn inspect_repo_safetensors(
     repo_id: &str,
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
-    let client = crate::chunked::build_client(token)?;
+    inspect_repo_safetensors_with_access(repo_id, HubAccess::loose(token, revision)).await
+}
+
+/// [`inspect_repo_safetensors`], with the token, the revision and the cache
+/// directory taken from `config`.
+///
+/// Each shard's cache-first lookup reads [`FetchConfig::output_dir`] as the
+/// cache root, so shards downloaded with the same `config` are found there
+/// (unset: the default `HF` cache). The listing and every remote read send
+/// [`FetchConfig::token`] (unset: one is resolved implicitly) and target
+/// [`FetchConfig::revision`] (unset: `main`). The other settings of `config`
+/// are ignored; in particular, shard headers are read four at a time
+/// whatever its concurrency.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the metadata or Range requests fail.
+/// Returns [`FetchError::RepoNotFound`] if the repository does not exist.
+/// Returns [`FetchError::Io`] if a cached shard cannot be read.
+/// Returns [`FetchError::SafetensorsHeader`] if a shard's header is
+/// malformed.
+pub async fn inspect_repo_safetensors_with_config(
+    repo_id: &str,
+    config: &FetchConfig,
+) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
+    inspect_repo_safetensors_with_access(repo_id, HubAccess::from_config(config)).await
+}
+
+/// Shared body of [`inspect_repo_safetensors`] and
+/// [`inspect_repo_safetensors_with_config`].
+async fn inspect_repo_safetensors_with_access(
+    repo_id: &str,
+    access: HubAccess<'_>,
+) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
+    let client = crate::chunked::build_client(access.token)?;
     let files =
-        crate::repo::list_repo_files_with_metadata(repo_id, token, revision, &client).await?;
+        crate::repo::list_repo_files_with_metadata(repo_id, access.token, access.revision, &client)
+            .await?;
 
     let safetensors_files: Vec<String> = files
         .into_iter()
@@ -1379,24 +1668,31 @@ pub async fn inspect_repo_safetensors(
     let mut join_set = JoinSet::new();
 
     for filename in safetensors_files {
-        // BORROW: explicit .clone()/.to_owned() to move into async task
+        // BORROW: explicit .clone()/.to_owned()/.to_path_buf() to move into
+        // the async task, which must own what it reads
         let sem = semaphore.clone();
         let repo = repo_id.to_owned();
-        let tok = token.map(str::to_owned);
-        let rev = revision.map(str::to_owned);
+        let tok = access.token.map(str::to_owned);
+        let rev = access.revision.map(str::to_owned);
+        let root = access.cache_root.map(Path::to_path_buf);
 
         join_set.spawn(async move {
             let _permit = sem
                 .acquire()
                 .await
                 .map_err(|e| FetchError::Http(format!("semaphore error: {e}")))?;
-            // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+            // BORROW: explicit .as_deref() for the owned copies → borrowed access
+            let shard_access = HubAccess {
+                token: tok.as_deref(),
+                revision: rev.as_deref(),
+                cache_root: root.as_deref(),
+            };
             // Range stats aren't part of this multi-file listing's shape
             // (only the per-file `Cached`/`Remote` provenance is); the
             // single-file `inspect_safetensors` caller in the `hf-fm` CLI
             // is what renders them.
             let (info, source, _stats) =
-                inspect_safetensors(&repo, &filename, tok.as_deref(), rev.as_deref()).await?;
+                inspect_safetensors_with_access(&repo, &filename, shard_access).await?;
             Ok::<_, FetchError>((filename, info, source))
         });
     }
@@ -1666,6 +1962,75 @@ fn collect_safetensors_recursive(
 }
 
 // -----------------------------------------------------------------------
+// Cache-first JSON fetches
+// -----------------------------------------------------------------------
+
+/// Shared body of the cache-first `JSON` fetchers ([`fetch_shard_index`],
+/// [`fetch_adapter_config`], [`fetch_model_config`] and their
+/// `_with_config` twins): the cached copy of `filename` if `access` finds
+/// one, else one `GET` of it from the Hub.
+///
+/// A file the Hub reports absent is `Ok(None)`. `what` names the file in
+/// errors (`"model config"`), so each fetcher keeps its own messages, and
+/// `parse` turns its text into the fetcher's type.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cached copy cannot be read.
+/// Returns [`FetchError::Http`] if the request fails, including a `404`
+/// that names a missing revision.
+/// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing.
+/// Returns [`FetchError::SafetensorsHeader`] if `parse` rejects the content,
+/// as each fetcher's parser does for malformed `JSON`.
+async fn fetch_json_cache_first<T>(
+    repo_id: &str,
+    filename: &str,
+    what: &str,
+    access: HubAccess<'_>,
+    parse: fn(&str, &str) -> Result<T, FetchError>,
+) -> Result<Option<T>, FetchError> {
+    let rev = access.rev();
+
+    // Try local cache first.
+    if let Some(cached_path) = access.cached_path(repo_id, filename) {
+        let content = std::fs::read_to_string(&cached_path).map_err(|e| FetchError::Io {
+            path: cached_path,
+            source: e,
+        })?;
+        return parse(&content, repo_id).map(Some);
+    }
+
+    // Fall back to HTTP.
+    let client = chunked::build_client(access.token)?;
+    let url = chunked::build_download_url(repo_id, rev, filename);
+
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let response = client
+        .get(url.as_str())
+        .send()
+        .await
+        .map_err(|e| FetchError::Http(format!("failed to fetch {what} for {repo_id}: {e}")))?;
+
+    if chunked::resolve_says_file_absent(response.status(), response.headers(), repo_id, rev)? {
+        return Ok(None);
+    }
+
+    if !response.status().is_success() {
+        return Err(FetchError::Http(format!(
+            "{what} request for {repo_id} returned status {}",
+            response.status()
+        )));
+    }
+
+    let content = response
+        .text()
+        .await
+        .map_err(|e| FetchError::Http(format!("failed to read {what} for {repo_id}: {e}")))?;
+
+    parse(&content, repo_id).map(Some)
+}
+
+// -----------------------------------------------------------------------
 // Shard index
 // -----------------------------------------------------------------------
 
@@ -1682,6 +2047,9 @@ struct RawShardIndex {
 /// Returns `Ok(None)` if the repo has no `model.safetensors.index.json` (i.e.,
 /// the model is not sharded or uses a single `.safetensors` file).
 ///
+/// [`fetch_shard_index_with_config`] takes the token, the revision and the
+/// cache directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the index fetch fails, including a `404`
@@ -1689,53 +2057,53 @@ struct RawShardIndex {
 /// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing
 /// (an authenticated `404 RepoNotFound`; see
 /// `chunked::resolve_says_file_absent`). A missing index file is `Ok(None)`.
+/// Returns [`FetchError::Io`] if a cached index cannot be read.
 /// Returns [`FetchError::SafetensorsHeader`] if the index JSON is malformed.
 pub async fn fetch_shard_index(
     repo_id: &str,
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Option<ShardedIndex>, FetchError> {
-    let rev = revision.unwrap_or("main");
-    let index_filename = "model.safetensors.index.json";
+    fetch_shard_index_with_access(repo_id, HubAccess::loose(token, revision)).await
+}
 
-    // Try local cache first.
-    if let Some(cached_path) = resolve_cached_path(repo_id, rev, index_filename) {
-        let content = std::fs::read_to_string(&cached_path).map_err(|e| FetchError::Io {
-            path: cached_path,
-            source: e,
-        })?;
-        let index = parse_shard_index_json(&content, repo_id)?;
-        return Ok(Some(index));
-    }
+/// [`fetch_shard_index`], with the token, the revision and the cache
+/// directory taken from `config`.
+///
+/// The cache-first lookup reads [`FetchConfig::output_dir`] as the cache
+/// root, so an index downloaded with the same `config` is found there
+/// (unset: the default `HF` cache). A request sends [`FetchConfig::token`]
+/// (unset: one is resolved implicitly) and targets [`FetchConfig::revision`]
+/// (unset: `main`). The other settings of `config` are ignored.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the index fetch fails, including a `404`
+/// that names a missing revision.
+/// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing.
+/// A missing index file is `Ok(None)`.
+/// Returns [`FetchError::Io`] if a cached index cannot be read.
+/// Returns [`FetchError::SafetensorsHeader`] if the index JSON is malformed.
+pub async fn fetch_shard_index_with_config(
+    repo_id: &str,
+    config: &FetchConfig,
+) -> Result<Option<ShardedIndex>, FetchError> {
+    fetch_shard_index_with_access(repo_id, HubAccess::from_config(config)).await
+}
 
-    // Fall back to HTTP.
-    let client = chunked::build_client(token)?;
-    let url = chunked::build_download_url(repo_id, rev, index_filename);
-
-    // BORROW: explicit .as_str() instead of Deref coercion
-    let response =
-        client.get(url.as_str()).send().await.map_err(|e| {
-            FetchError::Http(format!("failed to fetch shard index for {repo_id}: {e}"))
-        })?;
-
-    if chunked::resolve_says_file_absent(response.status(), response.headers(), repo_id, rev)? {
-        return Ok(None);
-    }
-
-    if !response.status().is_success() {
-        return Err(FetchError::Http(format!(
-            "shard index request for {repo_id} returned status {}",
-            response.status()
-        )));
-    }
-
-    let content = response
-        .text()
-        .await
-        .map_err(|e| FetchError::Http(format!("failed to read shard index for {repo_id}: {e}")))?;
-
-    let index = parse_shard_index_json(&content, repo_id)?;
-    Ok(Some(index))
+/// Shared body of [`fetch_shard_index`] and [`fetch_shard_index_with_config`].
+async fn fetch_shard_index_with_access(
+    repo_id: &str,
+    access: HubAccess<'_>,
+) -> Result<Option<ShardedIndex>, FetchError> {
+    fetch_json_cache_first(
+        repo_id,
+        "model.safetensors.index.json",
+        "shard index",
+        access,
+        parse_shard_index_json,
+    )
+    .await
 }
 
 /// Fetches the shard index from cache only (no network).
@@ -1844,6 +2212,9 @@ enum AdapterTargetModules {
 /// Returns `Ok(None)` if the file does not exist (HTTP 404), meaning the
 /// repository is not a `PEFT` adapter.
 ///
+/// [`fetch_adapter_config_with_config`] takes the token, the revision and the
+/// cache directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the request fails, including a `404`
@@ -1851,51 +2222,57 @@ enum AdapterTargetModules {
 /// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing
 /// (an authenticated `404 RepoNotFound`; see
 /// `chunked::resolve_says_file_absent`). A missing file is `Ok(None)`.
+/// Returns [`FetchError::Io`] if a cached `adapter_config.json` cannot be
+/// read.
 /// Returns [`FetchError::SafetensorsHeader`] if the JSON is malformed.
 pub async fn fetch_adapter_config(
     repo_id: &str,
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Option<AdapterConfig>, FetchError> {
-    let rev = revision.unwrap_or("main");
-    let config_filename = "adapter_config.json";
+    fetch_adapter_config_with_access(repo_id, HubAccess::loose(token, revision)).await
+}
 
-    // Try local cache first.
-    if let Some(cached_path) = resolve_cached_path(repo_id, rev, config_filename) {
-        let content = std::fs::read_to_string(&cached_path).map_err(|e| FetchError::Io {
-            path: cached_path,
-            source: e,
-        })?;
-        let config = parse_adapter_config_json(&content, repo_id)?;
-        return Ok(Some(config));
-    }
+/// [`fetch_adapter_config`], with the token, the revision and the cache
+/// directory taken from `config`.
+///
+/// The cache-first lookup reads [`FetchConfig::output_dir`] as the cache
+/// root, so an `adapter_config.json` downloaded with the same `config` is
+/// found there (unset: the default `HF` cache). A request sends
+/// [`FetchConfig::token`] (unset: one is resolved implicitly) and targets
+/// [`FetchConfig::revision`] (unset: `main`). The other settings of `config`
+/// are ignored.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the request fails, including a `404`
+/// that names a missing revision.
+/// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing.
+/// A missing file is `Ok(None)`.
+/// Returns [`FetchError::Io`] if a cached `adapter_config.json` cannot be
+/// read.
+/// Returns [`FetchError::SafetensorsHeader`] if the JSON is malformed.
+pub async fn fetch_adapter_config_with_config(
+    repo_id: &str,
+    config: &FetchConfig,
+) -> Result<Option<AdapterConfig>, FetchError> {
+    fetch_adapter_config_with_access(repo_id, HubAccess::from_config(config)).await
+}
 
-    // Fall back to HTTP.
-    let client = chunked::build_client(token)?;
-    let url = chunked::build_download_url(repo_id, rev, config_filename);
-
-    // BORROW: explicit .as_str() instead of Deref coercion
-    let response = client.get(url.as_str()).send().await.map_err(|e| {
-        FetchError::Http(format!("failed to fetch adapter config for {repo_id}: {e}"))
-    })?;
-
-    if chunked::resolve_says_file_absent(response.status(), response.headers(), repo_id, rev)? {
-        return Ok(None);
-    }
-
-    if !response.status().is_success() {
-        return Err(FetchError::Http(format!(
-            "adapter config request for {repo_id} returned status {}",
-            response.status()
-        )));
-    }
-
-    let content = response.text().await.map_err(|e| {
-        FetchError::Http(format!("failed to read adapter config for {repo_id}: {e}"))
-    })?;
-
-    let config = parse_adapter_config_json(&content, repo_id)?;
-    Ok(Some(config))
+/// Shared body of [`fetch_adapter_config`] and
+/// [`fetch_adapter_config_with_config`].
+async fn fetch_adapter_config_with_access(
+    repo_id: &str,
+    access: HubAccess<'_>,
+) -> Result<Option<AdapterConfig>, FetchError> {
+    fetch_json_cache_first(
+        repo_id,
+        "adapter_config.json",
+        "adapter config",
+        access,
+        parse_adapter_config_json,
+    )
+    .await
 }
 
 /// Fetches the adapter config from cache only (no network).
@@ -2065,6 +2442,9 @@ fn parse_model_config_json(content: &str, repo_id: &str) -> Result<ModelConfig, 
 /// Returns `Ok(None)` when the repository has no `config.json` (HTTP 404) —
 /// e.g. a non-model repo or a raw-weights upload.
 ///
+/// [`fetch_model_config_with_config`] takes the token, the revision and the
+/// cache directory from a [`FetchConfig`] instead.
+///
 /// # Errors
 ///
 /// Returns [`FetchError::Http`] if the request fails, including a `404`
@@ -2079,46 +2459,47 @@ pub async fn fetch_model_config(
     token: Option<&str>,
     revision: Option<&str>,
 ) -> Result<Option<ModelConfig>, FetchError> {
-    let rev = revision.unwrap_or("main");
-    let config_filename = "config.json";
+    fetch_model_config_with_access(repo_id, HubAccess::loose(token, revision)).await
+}
 
-    // Try local cache first.
-    if let Some(cached_path) = resolve_cached_path(repo_id, rev, config_filename) {
-        let content = std::fs::read_to_string(&cached_path).map_err(|e| FetchError::Io {
-            path: cached_path,
-            source: e,
-        })?;
-        let config = parse_model_config_json(&content, repo_id)?;
-        return Ok(Some(config));
-    }
+/// [`fetch_model_config`], with the token, the revision and the cache
+/// directory taken from `config`.
+///
+/// The cache-first lookup reads [`FetchConfig::output_dir`] as the cache
+/// root, so a `config.json` downloaded with the same `config` is found there
+/// (unset: the default `HF` cache). A request sends [`FetchConfig::token`]
+/// (unset: one is resolved implicitly) and targets [`FetchConfig::revision`]
+/// (unset: `main`). The other settings of `config` are ignored.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Http`] if the request fails, including a `404`
+/// that names a missing revision.
+/// Returns [`FetchError::RepoNotFound`] if the Hub reports the repo missing.
+/// A missing `config.json` is `Ok(None)`.
+/// Returns [`FetchError::Io`] if a cached `config.json` cannot be read.
+/// Returns [`FetchError::SafetensorsHeader`] if the JSON is malformed.
+pub async fn fetch_model_config_with_config(
+    repo_id: &str,
+    config: &FetchConfig,
+) -> Result<Option<ModelConfig>, FetchError> {
+    fetch_model_config_with_access(repo_id, HubAccess::from_config(config)).await
+}
 
-    // Fall back to HTTP.
-    let client = chunked::build_client(token)?;
-    let url = chunked::build_download_url(repo_id, rev, config_filename);
-
-    // BORROW: explicit .as_str() instead of Deref coercion
-    let response = client.get(url.as_str()).send().await.map_err(|e| {
-        FetchError::Http(format!("failed to fetch model config for {repo_id}: {e}"))
-    })?;
-
-    if chunked::resolve_says_file_absent(response.status(), response.headers(), repo_id, rev)? {
-        return Ok(None);
-    }
-
-    if !response.status().is_success() {
-        return Err(FetchError::Http(format!(
-            "model config request for {repo_id} returned status {}",
-            response.status()
-        )));
-    }
-
-    let content = response
-        .text()
-        .await
-        .map_err(|e| FetchError::Http(format!("failed to read model config for {repo_id}: {e}")))?;
-
-    let config = parse_model_config_json(&content, repo_id)?;
-    Ok(Some(config))
+/// Shared body of [`fetch_model_config`] and
+/// [`fetch_model_config_with_config`].
+async fn fetch_model_config_with_access(
+    repo_id: &str,
+    access: HubAccess<'_>,
+) -> Result<Option<ModelConfig>, FetchError> {
+    fetch_json_cache_first(
+        repo_id,
+        "config.json",
+        "model config",
+        access,
+        parse_model_config_json,
+    )
+    .await
 }
 
 /// Fetches a model's `config.json` from the local cache only (no network).
@@ -2154,10 +2535,13 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
     use std::io::Write as _;
+    use std::path::{Path, PathBuf};
 
     use super::collect_matching_names_sizes;
     use super::is_supported_tensor_file;
     use super::resolve_cached_path;
+    use crate::config::FetchConfig;
+    use crate::error::FetchError;
 
     /// A listed name that could leave the snapshot directory reads as not
     /// cached, before the cache directory is even looked up.
@@ -2519,5 +2903,227 @@ mod tests {
         // The extension must be the FINAL path segment suffix, not a
         // substring elsewhere in the name.
         assert!(!is_supported_tensor_file("model.safetensors.bak"));
+    }
+
+    // ---------- `_with_config` twins (v0.12.3) ----------
+    //
+    // Each test lays files out under a temporary cache root and points a
+    // `FetchConfig`'s `output_dir` at it. A twin that ignored the root (or the
+    // revision) would miss the cache and go to the Hub for `org/model`, which
+    // fails, so a pass shows the configured root was read, with no network.
+
+    /// The commit every fixture's ref points to.
+    const FIXTURE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Lays `bytes` out as `filename` of `repo_id` at `revision` in the cache
+    /// rooted at `root`, as `hf-hub` would: a ref naming the commit, and the
+    /// file in that commit's snapshot.
+    fn cache_file_at(root: &Path, repo_id: &str, revision: &str, filename: &str, bytes: &[u8]) {
+        let repo_dir = crate::cache_layout::repo_dir(root, repo_id);
+        let ref_path = crate::cache_layout::ref_path(&repo_dir, revision);
+        std::fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
+        std::fs::write(&ref_path, FIXTURE_COMMIT).unwrap();
+        let pointer = crate::cache_layout::pointer_path(&repo_dir, FIXTURE_COMMIT, filename);
+        std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        std::fs::write(&pointer, bytes).unwrap();
+    }
+
+    /// A config whose cache root is `root`, at `revision`.
+    fn config_at(root: &Path, revision: &str) -> FetchConfig {
+        FetchConfig::builder()
+            .revision(revision)
+            // BORROW: explicit .to_path_buf() — the builder takes an owned PathBuf
+            .output_dir(root.to_path_buf())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn resolve_cached_path_at_reads_the_given_root() {
+        let root = tempfile::tempdir().unwrap();
+        cache_file_at(root.path(), "org/model", "main", "config.json", b"{}");
+        let repo_dir = crate::cache_layout::repo_dir(root.path(), "org/model");
+        assert_eq!(
+            super::resolve_cached_path_at(Some(root.path()), "org/model", "main", "config.json"),
+            Some(crate::cache_layout::pointer_path(
+                &repo_dir,
+                FIXTURE_COMMIT,
+                "config.json"
+            ))
+        );
+        // Only the revision that was laid out is there.
+        assert_eq!(
+            super::resolve_cached_path_at(Some(root.path()), "org/model", "v2", "config.json"),
+            None
+        );
+    }
+
+    #[test]
+    fn hub_access_takes_token_revision_and_cache_root_from_the_config() {
+        let config = FetchConfig::builder()
+            .token("hf_example")
+            .revision("v1")
+            .output_dir(PathBuf::from("custom-cache"))
+            .build()
+            .unwrap();
+        let access = super::HubAccess::from_config(&config);
+        assert_eq!(access.token, Some("hf_example"));
+        assert_eq!(access.rev(), "v1");
+        assert_eq!(access.cache_root, Some(Path::new("custom-cache")));
+
+        // The original entry points: loose arguments, default cache, `main`.
+        let loose = super::HubAccess::loose(None, None);
+        assert_eq!(loose.rev(), "main");
+        assert_eq!(loose.cache_root, None);
+    }
+
+    #[tokio::test]
+    async fn npz_with_config_reads_its_output_dir_at_its_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let npz = make_in_memory_npz(&[(
+            "w_enc",
+            "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }",
+            &[0u8; 24],
+        )]);
+        // Laid out at `v1` only: the config's revision must reach the lookup.
+        cache_file_at(root.path(), "org/model", "v1", "params.npz", &npz);
+
+        let (info, source, stats) = super::inspect_npz_with_config(
+            "org/model",
+            "params.npz",
+            &config_at(root.path(), "v1"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(source, super::InspectSource::Cached));
+        assert!(stats.is_none(), "a cache hit makes no range request");
+        // BORROW: explicit .as_str() to compare names as &str
+        let names: Vec<&str> = info.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["w_enc"]);
+    }
+
+    #[tokio::test]
+    async fn safetensors_with_config_reads_its_output_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let header = br#"{"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let mut file = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        file.extend_from_slice(header);
+        file.extend_from_slice(&[0u8; 8]);
+        cache_file_at(root.path(), "org/model", "main", "model.safetensors", &file);
+
+        let (info, source, stats) = super::inspect_safetensors_with_config(
+            "org/model",
+            "model.safetensors",
+            &config_at(root.path(), "main"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(source, super::InspectSource::Cached));
+        assert!(stats.is_none());
+        // BORROW: explicit .as_str() to compare names as &str
+        let names: Vec<&str> = info.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["w"]);
+    }
+
+    #[tokio::test]
+    async fn gguf_and_pth_with_config_parse_the_file_in_their_output_dir() {
+        // No GGUF or PTH builder exists here, so each file is deliberately
+        // corrupt: a parse error proves the twin found the cached file, where
+        // a twin that missed the cache would fail on the network instead.
+        let root = tempfile::tempdir().unwrap();
+        cache_file_at(
+            root.path(),
+            "org/model",
+            "main",
+            "model.gguf",
+            b"not a gguf",
+        );
+        cache_file_at(root.path(), "org/model", "main", "model.pth", b"not a pth");
+        let config = config_at(root.path(), "main");
+
+        let err = super::inspect_gguf_with_config("org/model", "model.gguf", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FetchError::SafetensorsHeader { reason, .. }
+                if reason.contains("failed to parse GGUF")),
+            "expected a parse error from the cached file, got: {err}"
+        );
+
+        let err = super::inspect_pth_with_config("org/model", "model.pth", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FetchError::SafetensorsHeader { reason, .. }
+                if reason.contains("failed to parse PTH")),
+            "expected a parse error from the cached file, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_fetchers_with_config_read_their_output_dir() {
+        let root = tempfile::tempdir().unwrap();
+        cache_file_at(
+            root.path(),
+            "org/model",
+            "main",
+            "config.json",
+            br#"{"model_type":"llama","num_hidden_layers":2}"#,
+        );
+        cache_file_at(
+            root.path(),
+            "org/model",
+            "main",
+            "adapter_config.json",
+            br#"{"peft_type":"LORA","r":8}"#,
+        );
+        cache_file_at(
+            root.path(),
+            "org/model",
+            "main",
+            "model.safetensors.index.json",
+            br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        );
+        let config = config_at(root.path(), "main");
+
+        let model = super::fetch_model_config_with_config("org/model", &config)
+            .await
+            .unwrap()
+            .expect("config.json is cached");
+        assert_eq!(model.model_type.as_deref(), Some("llama"));
+
+        let adapter = super::fetch_adapter_config_with_config("org/model", &config)
+            .await
+            .unwrap()
+            .expect("adapter_config.json is cached");
+        assert_eq!(adapter.peft_type.as_deref(), Some("LORA"));
+        assert_eq!(adapter.r, Some(8));
+
+        let index = super::fetch_shard_index_with_config("org/model", &config)
+            .await
+            .unwrap()
+            .expect("the shard index is cached");
+        assert_eq!(
+            index.shards,
+            [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors"
+            ]
+        );
+    }
+
+    #[test]
+    fn with_config_futures_are_send() {
+        // A caller that spawns one onto a multi-threaded runtime needs this.
+        fn assert_send<T: Send>(_: &T) {}
+        let config = FetchConfig::builder().build().unwrap();
+        assert_send(&super::inspect_safetensors_with_config("o/m", "f", &config));
+        assert_send(&super::inspect_gguf_with_config("o/m", "f", &config));
+        assert_send(&super::inspect_npz_with_config("o/m", "f", &config));
+        assert_send(&super::inspect_pth_with_config("o/m", "f", &config));
+        assert_send(&super::inspect_repo_safetensors_with_config("o/m", &config));
+        assert_send(&super::fetch_model_config_with_config("o/m", &config));
+        assert_send(&super::fetch_adapter_config_with_config("o/m", &config));
+        assert_send(&super::fetch_shard_index_with_config("o/m", &config));
     }
 }

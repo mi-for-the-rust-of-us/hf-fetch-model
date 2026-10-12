@@ -5,7 +5,7 @@
 //! [`FetchConfig`] controls revision, authentication, file filtering,
 //! concurrency, timeouts, retry behavior, and progress reporting.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,6 +134,35 @@ impl FetchConfig {
     pub const fn chunk_threshold(&self) -> u64 {
         self.chunk_threshold
     }
+
+    /// Returns the explicit token, set with [`FetchConfigBuilder::token`] or
+    /// [`FetchConfigBuilder::token_from_env`].
+    ///
+    /// `None` does not mean that requests go unauthenticated: since v0.12.2
+    /// each request then resolves a token implicitly, the way
+    /// [`crate::auth::resolve_token`] documents.
+    #[must_use]
+    pub fn token(&self) -> Option<&str> {
+        // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+        self.token.as_deref()
+    }
+
+    /// Returns the configured revision (branch, tag, or commit SHA); `None`
+    /// means `main`.
+    #[must_use]
+    pub fn revision(&self) -> Option<&str> {
+        // BORROW: explicit .as_deref() for Option<String> → Option<&str>
+        self.revision.as_deref()
+    }
+
+    /// Returns the configured cache root (see
+    /// [`FetchConfigBuilder::output_dir`]); `None` means the default `HF`
+    /// cache.
+    #[must_use]
+    pub fn output_dir(&self) -> Option<&Path> {
+        // BORROW: explicit .as_deref() for Option<PathBuf> → Option<&Path>
+        self.output_dir.as_deref()
+    }
 }
 
 /// Builder for [`FetchConfig`].
@@ -228,6 +257,13 @@ impl FetchConfigBuilder {
     /// By default, files are stored in the standard `HuggingFace` cache directory
     /// (`~/.cache/huggingface/hub/`). When set, the `HuggingFace` cache hierarchy
     /// is created inside this directory instead.
+    ///
+    /// The `inspect` functions that take a [`FetchConfig`]
+    /// ([`crate::inspect::inspect_npz_with_config`] and its seven
+    /// `_with_config` siblings, since v0.12.3) look for cached files here
+    /// too. The cache-only ones (`inspect_*_cached`, `fetch_*_cached`,
+    /// `list_cached_*`) and [`crate::inspect::resolve_cached_path`] always
+    /// read the default cache.
     #[must_use]
     pub fn output_dir(mut self, dir: PathBuf) -> Self {
         self.output_dir = Some(dir);
@@ -542,6 +578,29 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn accessors_return_what_the_builder_set() {
+        let config = FetchConfig::builder()
+            .token("hf_example")
+            .revision("v1.0")
+            .output_dir(PathBuf::from("custom-cache"))
+            .build()
+            .unwrap();
+        assert_eq!(config.token(), Some("hf_example"));
+        assert_eq!(config.revision(), Some("v1.0"));
+        assert_eq!(config.output_dir(), Some(Path::new("custom-cache")));
+    }
+
+    #[test]
+    fn accessors_are_none_when_unset() {
+        // An unset token means "resolve one implicitly at request time",
+        // which the accessor reports as `None` rather than resolving it.
+        let config = FetchConfig::builder().build().unwrap();
+        assert_eq!(config.token(), None);
+        assert_eq!(config.revision(), None);
+        assert_eq!(config.output_dir(), None);
+    }
 
     #[test]
     fn test_file_matches_no_filters() {

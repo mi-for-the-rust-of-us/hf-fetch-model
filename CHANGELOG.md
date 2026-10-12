@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`_with_config` twins for the eight `inspect` entry points that can reach
+  the network**: `inspect_safetensors_with_config`,
+  `inspect_gguf_with_config`, `inspect_npz_with_config`,
+  `inspect_pth_with_config`, `inspect_repo_safetensors_with_config`,
+  `fetch_model_config_with_config`, `fetch_adapter_config_with_config` and
+  `fetch_shard_index_with_config`, all in `inspect`. Each takes the same
+  `repo_id` (and `filename`) as its original, then a `&FetchConfig`, and
+  reads three of its settings: the token, the revision, and `output_dir` as
+  the root of the cache-first lookup, so a file downloaded with that same
+  config is found where the download put it. The originals look only in the
+  default cache, so a caller downloading into a custom `output_dir` silently
+  lost cache-first inspection and paid range requests for files already on
+  disk; and a caller holding a `FetchConfig` could not hand its token to
+  `inspect`, its fields being crate-private, which is why candle-mi re-read
+  `HF_TOKEN` itself (finding 2 of the
+  [NPZ adoption report](docs/dogfooding-feedbacks/candle-mi-npz-range-inspect.md)).
+  Taking the config also retires the adjacent `token` / `revision` arguments,
+  which a transposition compiled. The config's other settings have no
+  meaning for a header read and are ignored. The cache-only functions
+  (`inspect_*_cached`, `fetch_*_cached`, `list_cached_*`) still read the
+  default cache; the roadmap tracks them by name.
+
+- **`FetchConfig::token()`, `revision()` and `output_dir()`**, beside the
+  existing `concurrency()`, `connections_per_file()` and
+  `chunk_threshold()`. `token()` returns only an explicit token: `None`
+  means a request resolves one implicitly, as it has since v0.12.2.
+
 ### Changed
 
 - **The two range-budget errors name how to raise the cap.**
