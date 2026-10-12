@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The two range-budget errors name how to raise the cap.**
+  `range request cap exceeded (…)` and `range transfer budget exceeded (…)`
+  already stated the cap they hit; both now end with `(a caller can raise it
+  with HttpRangeReader::open_with_limits or RangeReader::with_limits)`, so a
+  library caller who trips a cap legitimately learns that refusing is
+  configurable. `HttpRangeReader::open_with_limits`' doc now states the
+  defaults as numbers (256 requests, 32 MiB) and calls them caps, not the
+  expected spend: its old wording, "a handful of requests, well under
+  1 MiB", was read as the cap during candle-mi's NPZ adoption (finding 4 of
+  [its report](docs/dogfooding-feedbacks/candle-mi-npz-range-inspect.md)).
+  Code matching either message on its text keeps working if it matches the
+  start, which is unchanged.
+
 ## [0.12.2] — Honest disk accounting
 
 ### Added

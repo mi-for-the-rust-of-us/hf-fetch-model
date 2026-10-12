@@ -32,8 +32,9 @@
 //! [`MAX_TRANSFER_BUDGET`] bytes fetched — so a pathological or adversarial
 //! archive layout (a seek storm, an absurdly large central directory) fails
 //! fast with a clear error instead of degenerating into a full download.
-//! [`RangeReader::with_limits`] overrides the defaults for callers with
-//! different budgets.
+//! [`RangeReader::with_limits`] and [`HttpRangeReader::open_with_limits`]
+//! override the defaults for callers with different budgets, and both
+//! budget-exceeded errors name them.
 //!
 //! # Error channel
 //!
@@ -89,6 +90,12 @@ pub const MAX_RANGE_REQUESTS: u32 = 256;
 /// Bounds a stalled response body — the connect phase is separately bounded
 /// by the client's TCP connect timeout.
 const RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Appended to both budget-exceeded errors: the message already states the
+/// cap that was hit, and this names how a caller that legitimately needs
+/// more can raise it.
+const RAISE_LIMITS_HINT: &str =
+    "a caller can raise it with HttpRangeReader::open_with_limits or RangeReader::with_limits";
 
 // -----------------------------------------------------------------------
 // Transport abstraction
@@ -275,7 +282,7 @@ impl<F: RangeFetcher> RangeReader<F> {
         if self.requests >= self.max_requests {
             return Err(io::Error::other(format!(
                 "range request cap exceeded ({} requests): pathological archive \
-                 layout or seek storm; refusing further fetches",
+                 layout or seek storm; refusing further fetches ({RAISE_LIMITS_HINT})",
                 self.max_requests
             )));
         }
@@ -283,7 +290,7 @@ impl<F: RangeFetcher> RangeReader<F> {
             return Err(io::Error::other(format!(
                 "range transfer budget exceeded ({} bytes fetched, {len} more \
                  requested, cap {}): metadata inspection should never read \
-                 this much; refusing further fetches",
+                 this much; refusing further fetches ({RAISE_LIMITS_HINT})",
                 self.bytes_fetched, self.max_transfer_bytes
             )));
         }
@@ -532,12 +539,14 @@ impl HttpRangeReader {
     /// [`RangeReader::with_limits`]) instead of the [`MAX_RANGE_REQUESTS`] /
     /// [`MAX_TRANSFER_BUDGET`] defaults [`HttpRangeReader::open`] uses.
     ///
-    /// The defaults are tuned for archive-header parsing (`inspect`'s
-    /// `.safetensors` / `.gguf` / `.npz` / `.pth` paths) — a handful of
-    /// requests, well under 1 MiB. A caller with its own, larger,
-    /// user-facing byte budget (`hf-fm peek`'s `--max`) needs its transport
-    /// budget sized to match, or safety limits tuned for header parsing cut
-    /// it off first with a misleading "pathological archive layout" error.
+    /// The defaults (256 requests, 32 MiB) are generous for archive-header
+    /// parsing (`inspect`'s `.safetensors` / `.gguf` / `.npz` / `.pth`
+    /// paths), which typically spends a handful of requests and well under
+    /// 1 MiB: they are caps, not the expected spend. A caller with its own,
+    /// larger, user-facing byte budget (`hf-fm peek`'s `--max`) needs its
+    /// transport budget sized to match, or safety limits sized for header
+    /// parsing cut it off first with an error that blames the archive
+    /// layout.
     ///
     /// Same preconditions as [`HttpRangeReader::open`] (must be called from
     /// within a `tokio` runtime; the reader is then driven from a blocking
@@ -1035,6 +1044,12 @@ mod tests {
                 .contains("range request cap exceeded (3 requests)"),
             "unexpected error: {err}"
         );
+        // The message names the knob, not only the cap it hit.
+        assert!(
+            err.to_string().contains("open_with_limits")
+                && err.to_string().contains("RangeReader::with_limits"),
+            "the error should say how to raise the cap: {err}"
+        );
     }
 
     #[test]
@@ -1049,6 +1064,25 @@ mod tests {
         assert!(
             err.to_string().contains("range transfer budget exceeded"),
             "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("cap 6144")
+                && err.to_string().contains("open_with_limits")
+                && err.to_string().contains("RangeReader::with_limits"),
+            "the error should state the cap and how to raise it: {err}"
+        );
+    }
+
+    #[test]
+    fn default_caps_match_the_numbers_open_with_limits_states() {
+        // `HttpRangeReader::open_with_limits`' doc states the defaults as
+        // numbers so they read as caps, not as the expected spend; this keeps
+        // the doc honest if either constant moves.
+        assert_eq!(MAX_RANGE_REQUESTS, 256, "update open_with_limits' doc");
+        assert_eq!(
+            MAX_TRANSFER_BUDGET,
+            32 * 1024 * 1024,
+            "update open_with_limits' doc"
         );
     }
 
