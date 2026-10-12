@@ -86,6 +86,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hf-hub` does; a refs file, when present, still wins. Found by the
   v0.12.3 consistency pass.
 
+- **No panic on stderr after a failed multi-shard read.** When one shard of
+  `inspect_repo_safetensors` failed (for instance `diff` over the network,
+  on a transient connection error), the others were aborted, but aborting a
+  task does not stop the blocking thread its header read runs on. Those
+  reads kept sending requests, and once the runtime began shutting down
+  they panicked inside `tokio`'s timer, printing "A Tokio 1.x context was
+  found, but it is being shutdown" after the real error. Now no further
+  shard starts after the first error, and the ones already running are
+  awaited before it is returned.
+
 ## [0.12.2] — Honest disk accounting
 
 ### Added

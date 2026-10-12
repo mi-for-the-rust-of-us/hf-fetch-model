@@ -43,6 +43,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -1712,27 +1714,17 @@ async fn inspect_shards(
     filenames: Vec<String>,
     access: &HubAccess<'_>,
 ) -> Result<Vec<(String, SafetensorsHeaderInfo, InspectSource)>, FetchError> {
-    if filenames.is_empty() {
-        return Ok(Vec::new());
-    }
+    // BORROW: explicit .to_owned()/.to_path_buf() — every task must own what
+    // it reads, so each one rebuilds its access from these copies
+    let repo = repo_id.to_owned();
+    let tok = access.token.map(str::to_owned);
+    let rev = access.revision.map(str::to_owned);
+    let root = access.cache_root.map(Path::to_path_buf);
 
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
-    let mut join_set = JoinSet::new();
-
-    for filename in filenames {
-        // BORROW: explicit .clone()/.to_owned()/.to_path_buf() to move into
-        // the async task, which must own what it reads
-        let sem = semaphore.clone();
-        let repo = repo_id.to_owned();
-        let tok = access.token.map(str::to_owned);
-        let rev = access.revision.map(str::to_owned);
-        let root = access.cache_root.map(Path::to_path_buf);
-
-        join_set.spawn(async move {
-            let _permit = sem
-                .acquire()
-                .await
-                .map_err(|e| FetchError::Http(format!("semaphore error: {e}")))?;
+    let mut results = fan_out_fail_fast(filenames, 4, move |filename: String| {
+        // BORROW: explicit .clone() of the owned copies into this task
+        let (repo, tok, rev, root) = (repo.clone(), tok.clone(), rev.clone(), root.clone());
+        async move {
             // BORROW: explicit .as_deref() for the owned copies → borrowed access
             let shard_access = HubAccess {
                 token: tok.as_deref(),
@@ -1745,28 +1737,91 @@ async fn inspect_shards(
             // is what renders them.
             let (info, source, _stats) =
                 inspect_safetensors_with_access(&repo, &filename, &shard_access).await?;
-            Ok::<_, FetchError>((filename, info, source))
-        });
-    }
-
-    let mut results = Vec::new();
-    while let Some(join_result) = join_set.join_next().await {
-        match join_result {
-            Ok(Ok(item)) => results.push(item),
-            Ok(Err(e)) => {
-                join_set.abort_all();
-                return Err(e);
-            }
-            Err(e) => {
-                join_set.abort_all();
-                return Err(FetchError::Http(format!("task join error: {e}")));
-            }
+            Ok((filename, info, source))
         }
-    }
+    })
+    .await?;
 
     results.sort_by(|a, b| a.0.cmp(&b.0));
 
     Ok(results)
+}
+
+/// Runs `run` on every item, at most `concurrency` at a time, and stops at
+/// the first error without abandoning work already under way.
+///
+/// After the first error no further item starts, and every task already
+/// running is awaited before that error is returned. Aborting them instead
+/// would not stop the work: a remote header is read on a blocking thread
+/// that aborting its task leaves running, and one still sending requests
+/// when the caller's runtime shuts down panics inside `tokio`'s timer ("A
+/// Tokio 1.x context was found, but it is being shutdown"), which printed
+/// a panic on stderr after an already-reported failure until v0.12.3.
+/// Results come back in completion order.
+///
+/// # Errors
+///
+/// Returns the first error any `run` returned.
+/// Returns [`FetchError::Http`] if a task panics or the concurrency limiter
+/// fails.
+async fn fan_out_fail_fast<T, R, F, Fut>(
+    items: Vec<T>,
+    concurrency: usize,
+    run: F,
+) -> Result<Vec<R>, FetchError>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<R, FetchError>> + Send + 'static,
+{
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let failed = Arc::new(AtomicBool::new(false));
+    let run = Arc::new(run);
+    let mut join_set = JoinSet::new();
+
+    for item in items {
+        let limiter = Arc::clone(&semaphore);
+        let failed = Arc::clone(&failed);
+        let run = Arc::clone(&run);
+        join_set.spawn(async move {
+            let _permit = limiter
+                .acquire_owned()
+                .await
+                .map_err(|e| FetchError::Http(format!("semaphore error: {e}")))?;
+            if failed.load(Ordering::Acquire) {
+                return Ok(None); // EXPLICIT: an earlier item failed, so this one never starts
+            }
+            let result = run(item).await;
+            if result.is_err() {
+                failed.store(true, Ordering::Release);
+            }
+            result.map(Some)
+        });
+    }
+
+    let mut results = Vec::new();
+    let mut first_error: Option<FetchError> = None;
+    while let Some(joined) = join_set.join_next().await {
+        let error = match joined {
+            Ok(Ok(Some(result))) => {
+                results.push(result);
+                continue;
+            }
+            Ok(Ok(None)) => continue, // EXPLICIT: skipped after the first failure
+            Ok(Err(e)) => e,
+            Err(e) => FetchError::Http(format!("task join error: {e}")),
+        };
+        failed.store(true, Ordering::Release);
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(results),
+    }
 }
 
 /// Tensor-file extensions the `inspect` dispatcher understands.
@@ -2588,6 +2643,8 @@ mod tests {
 
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use super::collect_matching_names_sizes;
     use super::is_supported_tensor_file;
@@ -3249,6 +3306,64 @@ mod tests {
                 "model-00002-of-00002.safetensors"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn fan_out_fail_fast_waits_for_running_work_before_returning_the_error() {
+        // The hazard it exists for: a remote header read runs on a blocking
+        // thread that aborting its task leaves running. Each item here works
+        // on such a thread, so when the error comes back, every item that
+        // started must also have finished. Item 2 fails at once; the others
+        // take 100 ms.
+        use std::sync::atomic::AtomicUsize;
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let (s, f) = (Arc::clone(&started), Arc::clone(&finished));
+        let result = super::fan_out_fail_fast((0..16).collect::<Vec<u32>>(), 4, move |i| {
+            let (s, f) = (Arc::clone(&s), Arc::clone(&f));
+            async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                let i = tokio::task::spawn_blocking(move || {
+                    if i != 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    f.fetch_add(1, Ordering::SeqCst);
+                    i
+                })
+                .await
+                .map_err(|e| FetchError::Http(e.to_string()))?;
+                if i == 2 {
+                    return Err(FetchError::Http("item 2 failed".to_owned()));
+                }
+                Ok(i)
+            }
+        })
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("item 2 failed"), "{err}");
+        let (started, finished) = (
+            started.load(Ordering::SeqCst),
+            finished.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            started, finished,
+            "every item that started finished before the error came back"
+        );
+        assert!(started < 16, "items queued behind the failure never start");
+    }
+
+    #[tokio::test]
+    async fn fan_out_fail_fast_returns_every_result_when_nothing_fails() {
+        let mut results = super::fan_out_fail_fast(
+            (0..10).collect::<Vec<u32>>(),
+            3,
+            |i| async move { Ok(i * 2) },
+        )
+        .await
+        .unwrap();
+        results.sort_unstable();
+        assert_eq!(results, (0..10).map(|i| i * 2).collect::<Vec<u32>>());
     }
 
     #[test]
