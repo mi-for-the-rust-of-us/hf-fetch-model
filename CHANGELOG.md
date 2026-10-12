@@ -81,6 +81,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged; `hf-fm peek`'s forward scans and `quants --fits`' header
   reads take fewer requests too.
 
+- **Every `inspect` listing ends with the same labelled footer.** v0.10.2
+  gave the single-file listing a labelled two-line footer (`Showing 6 of
+  112 tensors matching filter "gate_proj" (898 tensors total, limit: 6).`
+  then `Param counts: …`), because the terse slash form left the reader
+  to map `6/112/898` back to shown, matching and total. The multi-shard
+  table, `--tree` and the multi-file summary kept the slash form
+  (`5/291 tensors shown, 811.6M/8.25B params (limit: 5)`). All four now
+  print their footer through one helper, so they cannot drift apart again.
+  The unfiltered, untruncated footer (`291 tensors, 8.25B params`) is
+  unchanged, and a filtered multi-file summary names its file count
+  (`(in 4 files)`). A script that parsed the slash form needs the labelled
+  one; `--json` output is unaffected.
+
 - **The two range-budget errors name how to raise the cap.**
   `range request cap exceeded (…)` and `range transfer budget exceeded (…)`
   already stated the cap they hit; both now end with `(a caller can raise the
@@ -134,6 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inspect tutorial are re-captured from this build; several also predated
   the current footers, and both `--check-gpu` blocks are now taken back to
   back so their verdicts compare on one GPU state.
+
+- **No trailing spaces in the multi-shard `--limit` table.** Its last
+  column, `Shard`, was padded to the longest shard name, so the header row
+  (and any row with a shorter name) ended in spaces. It now takes no
+  padding.
 
 ## [0.12.2] — Honest disk accounting
 

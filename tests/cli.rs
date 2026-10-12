@@ -2923,9 +2923,10 @@ fn inspect_cached_repo_filter_lists_names() {
         success,
         "repo-level inspect --filter should succeed: {stderr}"
     );
-    // The summary still echoes the active filter...
+    // The summary still echoes the active filter, in the labelled footer
+    // every listing prints since v0.12.3...
     assert!(
-        stdout.contains("filter:"),
+        stdout.contains(r#"matching filter "weight""#),
         "filtered rollup should echo the filter, got:\n{stdout}"
     );
     // ...and at least one matched name is listed nested beneath its file row.

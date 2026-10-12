@@ -180,7 +180,8 @@ $ hf-fm inspect google/gemma-4-E2B-it model.safetensors --tree --filter "embed"
       └── vision_tower.patch_embedder.
           ├── input_proj.weight         BF16  [768, 768]        1.12 MiB
           └── position_embedding_table  BF16  [2, 10240, 768]  30.00 MiB
-  6/2011 tensors, 2.77B/5.12B params (filter: "embed")
+  Showing 6 of 2011 tensors matching filter "embed".
+  Param counts: 2.77B matching filter, 5.12B total.
 
 $ hf-fm inspect poolside/Laguna-XS-2.1-GGUF Q4_K_M.gguf --group-by 'blk.*.ffn_*_exps.weight'
   Group                    Tensors        Size  Percent

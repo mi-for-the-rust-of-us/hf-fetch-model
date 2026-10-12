@@ -7949,8 +7949,8 @@ fn tree_to_json(nodes: &[TreeNode]) -> Vec<TreeJsonNode<'_>> {
 
 /// Builds, collapses, and prints a tensor-name tree to stdout.
 ///
-/// `total_tensor_count` and `total_params` are used only for the footer line
-/// (show `X/Y tensors` when `filter` is active, or `N tensors` otherwise).
+/// `total_tensor_count` and `total_params` are used only for the footer,
+/// which [`listing_footer`] builds as every `inspect` listing's is.
 fn print_tree_summary(
     tensors: &[inspect::TensorInfo],
     filter: Option<&str>,
@@ -7967,18 +7967,18 @@ fn print_tree_summary(
         .iter()
         .map(TreeNode::total_params)
         .fold(0u64, u64::saturating_add);
-    let tensor_label = if shown == 1 { "tensor" } else { "tensors" };
-    if let Some(pattern) = filter {
-        println!(
-            "  {shown}/{total_tensor_count} {tensor_label}, {}/{} params (filter: {pattern:?})",
-            inspect::format_params(shown_params),
-            inspect::format_params(total_params),
-        );
-    } else {
-        println!(
-            "  {shown} {tensor_label}, {} params",
-            inspect::format_params(shown_params),
-        );
+    for line in listing_footer(&ListingCounts {
+        shown,
+        matched: shown,
+        total: total_tensor_count,
+        shown_params,
+        matched_params: shown_params,
+        total_params,
+        filter,
+        limit: None,
+        files: None,
+    }) {
+        println!("{line}");
     }
 }
 
@@ -8565,60 +8565,108 @@ fn run_inspect_single(
     }
 
     println!("  {}", "\u{2500}".repeat(row_width));
-    let shown_count = info.tensors.len();
-    let shown_params = info.total_params();
-    let tensor_label = if shown_count == 1 {
-        "tensor"
-    } else {
-        "tensors"
-    };
-
-    match (filter.is_some(), truncated_by_limit) {
-        (false, false) => {
-            println!(
-                "  {shown_count} {tensor_label}, {} params",
-                inspect::format_params(shown_params)
-            );
-        }
-        (true, false) => {
-            let filter_str = filter.unwrap_or_default();
-            println!(
-                "  Showing {shown_count} of {total_tensor_count} tensors matching filter {filter_str:?}."
-            );
-            println!(
-                "  Param counts: {} matching filter, {} total.",
-                inspect::format_params(shown_params),
-                inspect::format_params(total_params),
-            );
-        }
-        (false, true) => {
-            let limit_val = limit.unwrap_or(0);
-            println!(
-                "  Showing {shown_count} of {total_tensor_count} tensors (limit: {limit_val})."
-            );
-            println!(
-                "  Param counts: {} shown, {} total.",
-                inspect::format_params(shown_params),
-                inspect::format_params(total_params),
-            );
-        }
-        (true, true) => {
-            let filter_str = filter.unwrap_or_default();
-            let limit_val = limit.unwrap_or(0);
-            println!(
-                "  Showing {shown_count} of {matched_count} tensors matching filter {filter_str:?} ({total_tensor_count} tensors total, limit: {limit_val})."
-            );
-            println!(
-                "  Param counts: {} shown, {} matching filter, {} total.",
-                inspect::format_params(shown_params),
-                inspect::format_params(matched_params),
-                inspect::format_params(total_params),
-            );
-        }
+    for line in listing_footer(&ListingCounts {
+        shown: info.tensors.len(),
+        matched: matched_count,
+        total: total_tensor_count,
+        shown_params: info.total_params(),
+        matched_params,
+        total_params,
+        filter,
+        limit: limit.filter(|_| truncated_by_limit),
+        files: None,
+    }) {
+        println!("{line}");
     }
 
     maybe_print_gpu_check(gpu_inputs.as_ref(), gpu_result.as_ref());
     Ok(())
+}
+
+/// What an `inspect` tensor listing showed, for its footer.
+struct ListingCounts<'a> {
+    /// Tensors listed.
+    shown: usize,
+    /// Tensors matching the filter; equal to `total` without one.
+    matched: usize,
+    /// Tensors in the whole file or repo.
+    total: usize,
+    /// Parameters across the listed tensors.
+    shown_params: u64,
+    /// Parameters across the tensors matching the filter.
+    matched_params: u64,
+    /// Parameters across all tensors.
+    total_params: u64,
+    /// The `--filter` pattern, if any.
+    filter: Option<&'a str>,
+    /// The `--limit`, only when it cut the listing short.
+    limit: Option<usize>,
+    /// How many files the listing spans, for the multi-file summary.
+    files: Option<usize>,
+}
+
+/// The footer lines of an `inspect` tensor listing.
+///
+/// Unfiltered and untruncated, it is one line (`291 tensors, 8.25B params`).
+/// Otherwise it is the labelled two-line form v0.10.2 adopted for the
+/// single-file listing (Gap 6 of the anamnesis Phase 5 dogfooding report),
+/// `Showing 6 of 112 tensors matching filter "gate_proj" (898 tensors total,
+/// limit: 6).` then `Param counts: …`, which names every number instead of
+/// leaving the reader to map `6/112/898` back to shown, matching and total.
+/// Every listing prints its footer through here (single file, multi-shard
+/// table, `--tree`, multi-file summary): until v0.12.3 the last three still
+/// printed the slash form the single-file listing had dropped.
+fn listing_footer(c: &ListingCounts<'_>) -> Vec<String> {
+    let params = inspect::format_params;
+    let files = c.files.map(|n| (n, if n == 1 { "file" } else { "files" }));
+    match (c.filter, c.limit) {
+        (None, None) => {
+            let label = if c.shown == 1 { "tensor" } else { "tensors" };
+            let prefix = files.map_or_else(String::new, |(n, l)| format!("{n} {l}, "));
+            vec![format!(
+                "  {prefix}{} {label}, {} params",
+                c.shown,
+                params(c.shown_params)
+            )]
+        }
+        (Some(pattern), None) => {
+            let scope = files.map_or_else(String::new, |(n, l)| format!(" (in {n} {l})"));
+            vec![
+                format!(
+                    "  Showing {} of {} tensors matching filter {pattern:?}{scope}.",
+                    c.shown, c.total
+                ),
+                format!(
+                    "  Param counts: {} matching filter, {} total.",
+                    params(c.shown_params),
+                    params(c.total_params)
+                ),
+            ]
+        }
+        (None, Some(limit)) => vec![
+            format!(
+                "  Showing {} of {} tensors (limit: {limit}).",
+                c.shown, c.total
+            ),
+            format!(
+                "  Param counts: {} shown, {} total.",
+                params(c.shown_params),
+                params(c.total_params)
+            ),
+        ],
+        (Some(pattern), Some(limit)) => vec![
+            format!(
+                "  Showing {} of {} tensors matching filter {pattern:?} ({} tensors total, limit: {limit}).",
+                c.shown, c.matched, c.total
+            ),
+            format!(
+                "  Param counts: {} shown, {} matching filter, {} total.",
+                params(c.shown_params),
+                params(c.matched_params),
+                params(c.total_params)
+            ),
+        ],
+    }
 }
 
 /// Model-side inputs for one `--check-gpu` invocation, captured **before** the
@@ -9104,7 +9152,7 @@ fn run_inspect_repo_aggregated(
     // Bare `--limit` (and any combination of `--filter` + `--limit`):
     // flat tensor table with a `Shard` column so the user knows which
     // file each tensor came from.
-    print_multi_shard_table(
+    for line in multi_shard_table_lines(
         &flat,
         filter,
         limit,
@@ -9113,17 +9161,19 @@ fn run_inspect_repo_aggregated(
         matched_count,
         total_params,
         matched_params,
-    );
+    ) {
+        println!("{line}");
+    }
 
     maybe_print_gpu_check(gpu_inputs.as_ref(), gpu_result.as_ref());
     Ok(())
 }
 
-/// Prints a flat tensor table for multi-shard inspect when `--limit` is set
-/// (and neither `--dtypes` nor `--tree` was selected). Adds a `Shard` column
-/// vs. the single-file table so the user can see provenance.
+/// The flat tensor table for multi-shard inspect when `--limit` is set (and
+/// neither `--dtypes` nor `--tree` was selected), as lines to print. Adds a
+/// `Shard` column vs. the single-file table so the user can see provenance.
 #[allow(clippy::too_many_arguments)]
-fn print_multi_shard_table(
+fn multi_shard_table_lines(
     flat: &[(&str, &inspect::TensorInfo)],
     filter: Option<&str>,
     limit: Option<usize>,
@@ -9132,7 +9182,7 @@ fn print_multi_shard_table(
     matched_count: usize,
     total_params: u64,
     matched_params: u64,
-) {
+) -> Vec<String> {
     // Dynamic column widths.
     let nw = flat
         .iter()
@@ -9150,68 +9200,42 @@ fn print_multi_shard_table(
         .max(5); // floor: "Shard".len()
     let row_width = nw + 2 + 8 + 2 + sw + 2 + 10 + 2 + 10 + 2 + fw;
 
-    println!();
-    println!(
-        "  {:<nw$} {:<8} {:<sw$} {:>10} {:>10}  {:<fw$}",
-        "Tensor", "Dtype", "Shape", "Size", "Params", "Shard",
-    );
+    // The `Shard` column is last and left-aligned, so it takes no padding:
+    // until v0.12.3 it did, and the header row ended in trailing spaces.
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "  {:<nw$} {:<8} {:<sw$} {:>10} {:>10}  {}",
+            "Tensor", "Dtype", "Shape", "Size", "Params", "Shard",
+        ),
+    ];
 
     for ((file, t), shape_str) in flat.iter().zip(shape_strs.iter()) {
         let size_str = format_size(t.byte_len());
         let params_str = inspect::format_params(t.num_elements());
-        println!(
-            "  {:<nw$} {:<8} {:<sw$} {:>10} {:>10}  {:<fw$}",
+        lines.push(format!(
+            "  {:<nw$} {:<8} {:<sw$} {:>10} {:>10}  {}",
             t.name, t.dtype, shape_str, size_str, params_str, file,
-        );
+        ));
     }
 
-    println!("  {}", "\u{2500}".repeat(row_width));
+    lines.push(format!("  {}", "\u{2500}".repeat(row_width)));
 
-    let shown_count = flat.len();
-    let shown_params: u64 = flat
-        .iter()
-        .map(|(_, t)| t.num_elements())
-        .fold(0u64, u64::saturating_add);
-    let tensor_label = if shown_count == 1 {
-        "tensor"
-    } else {
-        "tensors"
-    };
-
-    match (filter.is_some(), truncated_by_limit) {
-        (false, false) => {
-            println!(
-                "  {shown_count} {tensor_label}, {} params",
-                inspect::format_params(shown_params)
-            );
-        }
-        (true, false) => {
-            println!(
-                "  {shown_count}/{total_tensor_count} {tensor_label}, {}/{} params (filter: {:?})",
-                inspect::format_params(shown_params),
-                inspect::format_params(total_params),
-                filter.unwrap_or_default(),
-            );
-        }
-        (false, true) => {
-            println!(
-                "  {shown_count}/{total_tensor_count} {tensor_label} shown, {}/{} params (limit: {})",
-                inspect::format_params(shown_params),
-                inspect::format_params(total_params),
-                limit.unwrap_or(0),
-            );
-        }
-        (true, true) => {
-            println!(
-                "  {shown_count}/{matched_count}/{total_tensor_count} {tensor_label} shown, {}/{}/{} params (filter: {:?}, limit: {})",
-                inspect::format_params(shown_params),
-                inspect::format_params(matched_params),
-                inspect::format_params(total_params),
-                filter.unwrap_or_default(),
-                limit.unwrap_or(0),
-            );
-        }
-    }
+    lines.extend(listing_footer(&ListingCounts {
+        shown: flat.len(),
+        matched: matched_count,
+        total: total_tensor_count,
+        shown_params: flat
+            .iter()
+            .map(|(_, t)| t.num_elements())
+            .fold(0u64, u64::saturating_add),
+        matched_params,
+        total_params,
+        filter,
+        limit: limit.filter(|_| truncated_by_limit),
+        files: None,
+    }));
+    lines
 }
 
 /// Prints adapter configuration if `adapter_config.json` is found in the repository.
@@ -9946,31 +9970,19 @@ fn print_multi_file_summary(
     }
 
     println!("  {}", "\u{2500}".repeat(row_width));
-    let file_label = if files_with_matches == 1 {
-        "file"
-    } else {
-        "files"
-    };
-    let tensor_label = if total_tensors_filtered == 1 {
-        "tensor"
-    } else {
-        "tensors"
-    };
 
-    if filter.is_some() {
-        println!(
-            "  {} {file_label}, {total_tensors_filtered}/{total_tensors_unfiltered} {tensor_label}, {}/{} params (filter: {:?})",
-            files_with_matches,
-            inspect::format_params(total_params_filtered),
-            inspect::format_params(total_params_unfiltered),
-            filter.unwrap_or_default(),
-        );
-    } else {
-        println!(
-            "  {} {file_label}, {total_tensors_filtered} {tensor_label}, {} params",
-            files_with_matches,
-            inspect::format_params(total_params_filtered)
-        );
+    for line in listing_footer(&ListingCounts {
+        shown: total_tensors_filtered,
+        matched: total_tensors_filtered,
+        total: total_tensors_unfiltered,
+        shown_params: total_params_filtered,
+        matched_params: total_params_filtered,
+        total_params: total_params_unfiltered,
+        filter,
+        limit: None,
+        files: Some(files_with_matches),
+    }) {
+        println!("{line}");
     }
 
     // Discoverability nudge. When filtered, the matched names are listed
@@ -12694,6 +12706,113 @@ mod tests {
                 TreeNode::Leaf(_) | TreeNode::Branch(_) | TreeNode::Ranged(_) => None,
             })
             .expect("forest must contain a top-level `blocks` branch")
+    }
+
+    /// Counts for a listing of `shown` / `matched` / `total` tensors, with
+    /// parameters a thousand per tensor so each figure is easy to read.
+    fn counts(shown: usize, matched: usize, total: usize) -> ListingCounts<'static> {
+        let per = |n: usize| u64::try_from(n).unwrap() * 1000;
+        ListingCounts {
+            shown,
+            matched,
+            total,
+            shown_params: per(shown),
+            matched_params: per(matched),
+            total_params: per(total),
+            filter: None,
+            limit: None,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn listing_footer_names_every_number() {
+        // Every listing (single file, multi-shard table, --tree, multi-file
+        // summary) prints through this; until v0.12.3 three of them still
+        // printed the slash form (`6/112/898 tensors shown, …`).
+        assert_eq!(
+            listing_footer(&counts(291, 291, 291)),
+            ["  291 tensors, 291.0K params"]
+        );
+        assert_eq!(
+            listing_footer(&counts(1, 1, 1)),
+            ["  1 tensor, 1.0K params"]
+        );
+        assert_eq!(
+            listing_footer(&ListingCounts {
+                filter: Some("lm_head"),
+                ..counts(1, 1, 291)
+            }),
+            [
+                r#"  Showing 1 of 291 tensors matching filter "lm_head"."#,
+                "  Param counts: 1.0K matching filter, 291.0K total.",
+            ]
+        );
+        assert_eq!(
+            listing_footer(&ListingCounts {
+                limit: Some(5),
+                ..counts(5, 291, 291)
+            }),
+            [
+                "  Showing 5 of 291 tensors (limit: 5).",
+                "  Param counts: 5.0K shown, 291.0K total.",
+            ]
+        );
+        assert_eq!(
+            listing_footer(&ListingCounts {
+                filter: Some("gate_proj"),
+                limit: Some(6),
+                ..counts(6, 112, 898)
+            }),
+            [
+                r#"  Showing 6 of 112 tensors matching filter "gate_proj" (898 tensors total, limit: 6)."#,
+                "  Param counts: 6.0K shown, 112.0K matching filter, 898.0K total.",
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_footer_scopes_a_multi_file_summary() {
+        assert_eq!(
+            listing_footer(&ListingCounts {
+                files: Some(4),
+                ..counts(291, 291, 291)
+            }),
+            ["  4 files, 291 tensors, 291.0K params"]
+        );
+        assert_eq!(
+            listing_footer(&ListingCounts {
+                filter: Some("q_proj"),
+                files: Some(1),
+                ..counts(32, 32, 291)
+            }),
+            [
+                r#"  Showing 32 of 291 tensors matching filter "q_proj" (in 1 file)."#,
+                "  Param counts: 32.0K matching filter, 291.0K total.",
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_shard_table_has_no_trailing_whitespace() {
+        // The `Shard` column is last: padding it left the header row (and any
+        // row with a shorter shard name) ending in spaces until v0.12.3.
+        let t = |name: &str| inspect::TensorInfo {
+            name: name.to_owned(),
+            dtype: "BF16".to_owned(),
+            shape: vec![4096],
+            data_offsets: (0, 8192),
+        };
+        let (a, b) = (t("model.norm.weight"), t("lm_head.weight"));
+        let flat = [
+            ("model-00001-of-00002.safetensors", &a),
+            ("model.safetensors", &b),
+        ];
+        let lines = multi_shard_table_lines(&flat, None, Some(2), false, 2, 2, 8192, 8192);
+        for line in &lines {
+            assert_eq!(line.trim_end(), line, "trailing whitespace in {line:?}");
+        }
+        assert!(lines.iter().any(|l| l.ends_with("Shard")), "{lines:#?}");
     }
 
     /// A tree leaf for the rendering tests; `params` is not rendered.
