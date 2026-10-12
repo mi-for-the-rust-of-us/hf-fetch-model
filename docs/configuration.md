@@ -196,7 +196,7 @@ let path = outcome.into_inner();
 
 ## Header inspection
 
-Read tensor metadata without downloading full weight files. The library checks the local cache first and only makes HTTP Range requests on cache miss. Since v0.12.3 the entry points that can reach the network are re-exported at the crate root as well as living in `inspect`.
+Read tensor metadata without downloading full weight files. The library checks the local cache first and only makes HTTP Range requests on cache miss. Since v0.12.3 the eight cache-first entry points that take a repo id, and their `_with_config` twins, are re-exported at the crate root as well as living in `inspect`.
 
 ```rust
 use hf_fetch_model::inspect;

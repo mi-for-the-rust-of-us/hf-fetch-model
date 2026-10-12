@@ -54,7 +54,7 @@ hf-fetch-model   (the library; the hf-fm CLI is behind feature "cli")
 
 | Module | Visibility | Role |
 |--------|-----------|------|
-| `lib.rs` | public | Top-level download functions and re-exports, including the eight `inspect` entry points that can reach the network and their `_with_config` twins |
+| `lib.rs` | public | Top-level download functions and re-exports, including the eight cache-first `inspect` entry points that take a repo id and their `_with_config` twins |
 | `config` | public | `FetchConfig` builder and `Filter` presets |
 | `plan` | public | `DownloadPlan`, `FilePlan`, plan-to-config optimization |
 | `download` | public | Download orchestration, `DownloadOutcome` |

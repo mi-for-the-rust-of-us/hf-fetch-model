@@ -367,7 +367,7 @@ for t in &header.tensors {
 }
 ```
 
-`inspect_safetensors`, `inspect_gguf` and `inspect_pth` take the same arguments, and `inspect_repo_safetensors` reads every shard of a repo. Each reads the local cache first. Each also has a `_with_config` twin that takes a `FetchConfig` instead, whose token, revision and `output_dir` it uses, so a custom cache directory you download into is the one it inspects.
+`inspect_safetensors`, `inspect_gguf` and `inspect_pth` take the same arguments, and each reads the local cache first. `inspect_repo_safetensors` reads every shard of a repo, each from the cache when it is there, after listing the repo on the Hub. Each also has a `_with_config` twin that takes a `FetchConfig` instead, whose token, revision and `output_dir` it uses, so a custom cache directory you download into is the one it inspects.
 
 Filter, progress, auth, and more via the builder — see [Configuration](docs/configuration.md).
 

@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`_with_config` twins for the eight `inspect` entry points that can reach
-  the network**: `inspect_safetensors_with_config`,
+- **`_with_config` twins for the eight cache-first `inspect` entry points
+  that take a repo id**: `inspect_safetensors_with_config`,
   `inspect_gguf_with_config`, `inspect_npz_with_config`,
   `inspect_pth_with_config`, `inspect_repo_safetensors_with_config`,
   `fetch_model_config_with_config`, `fetch_adapter_config_with_config` and
@@ -37,8 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   means a request resolves one implicitly, as it has since v0.12.2.
 
 - **The `inspect` entry points at the crate root, and named where a caller
-  looks.** The eight functions that can reach the network and their eight
-  twins are re-exported beside `HttpRangeReader`, which had been the only
+  looks.** The eight cache-first entry points and their eight twins are
+  re-exported beside `HttpRangeReader`, which had been the only
   remote-inspect item at the root, so `hf_fetch_model::inspect_npz` works
   as well as `hf_fetch_model::inspect::inspect_npz`. The crate docs'
   *Inspect Before Downloading* section, the README's library quick start,
@@ -53,14 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The two range-budget errors name how to raise the cap.**
   `range request cap exceeded (…)` and `range transfer budget exceeded (…)`
-  already stated the cap they hit; both now end with `(a caller can raise it
-  with HttpRangeReader::open_with_limits or RangeReader::with_limits)`, so a
+  already stated the cap they hit; both now end with `(a caller can raise the
+  cap with HttpRangeReader::open_with_limits or RangeReader::with_limits)`, so a
   library caller who trips a cap legitimately learns that refusing is
   configurable. `HttpRangeReader::open_with_limits`' doc now states the
   defaults as numbers (256 requests, 32 MiB) and calls them caps, not the
   expected spend: its old wording, "a handful of requests, well under
   1 MiB", was read as the cap during candle-mi's NPZ adoption (finding 4 of
   [its report](docs/dogfooding-feedbacks/candle-mi-npz-range-inspect.md)).
+  That wording was also wrong for `.gguf`, and the docs now give the
+  typical spend per format: a handful of requests and well under 1 MiB
+  for `.safetensors`, `.npz` and `.pth`, but tens to a couple of hundred
+  requests and up to about 10 MiB for a `.gguf`, whose header carries the
+  tokenizer's vocabulary (170 requests and 10.5 MiB measured on
+  `unsloth/Qwen3.5-4B-GGUF`, two thirds of the request cap).
   Code matching either message on its text keeps working if it matches the
   start, which is unchanged.
 

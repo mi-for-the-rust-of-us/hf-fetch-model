@@ -79,17 +79,20 @@ pub const READAHEAD_BYTES: u64 = 4 * 1024;
 
 /// Default cap on total bytes fetched over the reader's lifetime.
 ///
-/// Remote inspection of a well-formed archive transfers well under 1 MiB;
-/// 32 MiB leaves two orders of magnitude of headroom (e.g. a many-thousand
-/// entry central directory) while guaranteeing that no inspect silently
-/// degenerates into a full-file download.
+/// Remote inspection of a well-formed `.safetensors`, `.npz` or `.pth`
+/// header transfers well under 1 MiB, and of a `.gguf` header, which carries
+/// its tokenizer's vocabulary, up to about 10 MiB (10.5 MiB measured on
+/// `unsloth/Qwen3.5-4B-GGUF`). 32 MiB leaves headroom above both (e.g. for a
+/// many-thousand-entry central directory) while guaranteeing that no inspect
+/// silently degenerates into a full-file download.
 pub const MAX_TRANSFER_BUDGET: u64 = 32 * 1024 * 1024;
 
 /// Default cap on the number of range fetches over the reader's lifetime.
 ///
-/// A well-formed inspect needs a handful of requests; 256 tolerates a
-/// fragmented directory layout while stopping request storms from
-/// adversarial seek patterns.
+/// A well-formed `.safetensors`, `.npz` or `.pth` inspect needs a handful of
+/// requests, and a `.gguf` one tens to a couple of hundred (170 measured on
+/// `unsloth/Qwen3.5-4B-GGUF`); 256 tolerates a fragmented directory layout
+/// while stopping request storms from adversarial seek patterns.
 pub const MAX_RANGE_REQUESTS: u32 = 256;
 
 /// Wall-clock budget for a single HTTP range request (headers + body).
@@ -102,7 +105,7 @@ const RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// cap that was hit, and this names how a caller that legitimately needs
 /// more can raise it.
 const RAISE_LIMITS_HINT: &str =
-    "a caller can raise it with HttpRangeReader::open_with_limits or RangeReader::with_limits";
+    "a caller can raise the cap with HttpRangeReader::open_with_limits or RangeReader::with_limits";
 
 // -----------------------------------------------------------------------
 // Transport abstraction
@@ -525,6 +528,8 @@ impl HttpRangeReader {
     /// file is inaccessible (including gated repos: `returned status
     /// 401/403` errors, which the CLI upgrades into a gated-repo
     /// diagnosis), or the server does not support Range requests.
+    /// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+    /// etag that is not a single plain name.
     pub async fn open(
         repo_id: &str,
         revision: Option<&str>,
@@ -546,10 +551,11 @@ impl HttpRangeReader {
     /// [`RangeReader::with_limits`]) instead of the [`MAX_RANGE_REQUESTS`] /
     /// [`MAX_TRANSFER_BUDGET`] defaults [`HttpRangeReader::open`] uses.
     ///
-    /// The defaults (256 requests, 32 MiB) are generous for archive-header
-    /// parsing (`inspect`'s `.safetensors` / `.gguf` / `.npz` / `.pth`
-    /// paths), which typically spends a handful of requests and well under
-    /// 1 MiB: they are caps, not the expected spend. A caller with its own,
+    /// The defaults (256 requests, 32 MiB) are caps, not the expected spend.
+    /// Header parsing on `inspect`'s `.safetensors` / `.npz` / `.pth` paths
+    /// typically spends a handful of requests and well under 1 MiB; on its
+    /// `.gguf` path, whose header carries the tokenizer's vocabulary, tens to
+    /// a couple of hundred requests and a few MiB. A caller with its own,
     /// larger, user-facing byte budget (`hf-fm peek`'s `--max`) needs its
     /// transport budget sized to match, or safety limits sized for header
     /// parsing cut it off first with an error that blames the archive

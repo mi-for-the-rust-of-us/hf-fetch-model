@@ -31,9 +31,11 @@
 //! that drive `inspect --check-gpu --context` KV-cache budgeting), via
 //! [`fetch_model_config`] / [`fetch_model_config_cached`].
 //!
-//! The eight entry points that can reach the network take a token and a
-//! revision as loose arguments and look in the default `HF` cache first.
-//! Each has a `_with_config` twin (since v0.12.3, e.g.
+//! Eight cache-first entry points take a repo id: the four single-file
+//! inspectors ([`inspect_npz`] and its siblings), [`inspect_repo_safetensors`]
+//! (whose shards are cache-first, though its listing always asks the Hub),
+//! and the three `fetch_*` readers. They take a token and a revision as loose
+//! arguments and read the default `HF` cache. Each has a `_with_config` twin (since v0.12.3, e.g.
 //! [`inspect_npz_with_config`]) that takes the token, the revision and the
 //! cache directory from a [`FetchConfig`] instead, so a caller that
 //! downloads with a custom [`FetchConfig::output_dir`] inspects that same
@@ -645,6 +647,8 @@ fn safetensors_header_to_info(
 /// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
 /// diagnosis).
 /// Returns [`FetchError::Io`] if the cached file cannot be read.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the header is malformed
 /// (cached or remote).
 pub async fn inspect_safetensors(
@@ -672,6 +676,8 @@ pub async fn inspect_safetensors(
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors.
 /// Returns [`FetchError::Io`] if the cached file cannot be read.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the header is malformed
 /// (cached or remote).
 pub async fn inspect_safetensors_with_config(
@@ -929,16 +935,18 @@ fn gguf_front_matter_to_header_info(
 
 /// Inspects a single `.gguf` file's metadata (cache-first, remote fallback).
 ///
-/// Checks the local `HF` cache first. If the file is cached, delegates to
-/// [`inspect_gguf_cached`] with zero network requests. Otherwise, opens an
-/// [`HttpRangeReader`] over the file and runs
+/// Checks the local `HF` cache first. If the file is cached, parses it from
+/// disk with zero network requests, as [`inspect_gguf_cached`] does.
+/// Otherwise, opens an [`HttpRangeReader`] over the file and runs
 /// `anamnesis::parse_gguf_front_matter_from_reader` against it on a blocking
 /// thread (v0.11.2, on anamnesis 0.7.1's reader-generic `GgufFrontMatter` —
 /// the full-detail counterpart to the summary-only `inspect_gguf_from_reader`
 /// anamnesis shipped in 0.4.5). `GGUF` is front-loaded: the parser reads the
 /// metadata KV table and tensor-info table in a single linear scan and never
 /// touches the tensor-data segment, so a multi-GiB quantised file inspects in
-/// a handful of range requests. Mirrors [`inspect_npz`] / [`inspect_safetensors`]'s
+/// a few MiB: tens to a couple of hundred range requests, most of them for
+/// the tokenizer's vocabulary arrays (170 requests and 10.5 MiB measured on
+/// `unsloth/Qwen3.5-4B-GGUF`). Mirrors [`inspect_npz`] / [`inspect_safetensors`]'s
 /// shape so the `hf-fm` CLI renders all three formats' `Source:` line
 /// identically.
 ///
@@ -954,6 +962,8 @@ fn gguf_front_matter_to_header_info(
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
 /// diagnosis).
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the `GGUF` file is malformed
 /// (cached or remote).
 pub async fn inspect_gguf(
@@ -980,6 +990,8 @@ pub async fn inspect_gguf(
 /// Returns [`FetchError::Http`] if the Range probe or a range request
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the `GGUF` file is malformed
 /// (cached or remote).
 pub async fn inspect_gguf_with_config(
@@ -1196,6 +1208,8 @@ fn npz_info_to_header_info(
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
 /// diagnosis).
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the `NPZ` archive is
 /// malformed (cached or remote).
 // `range_reader` is the name a caller looking for this function searched
@@ -1225,6 +1239,8 @@ pub async fn inspect_npz(
 /// Returns [`FetchError::Http`] if the Range probe or a range request
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the `NPZ` archive is
 /// malformed (cached or remote).
 pub async fn inspect_npz_with_config(
@@ -1425,9 +1441,9 @@ fn pth_tensor_info_to_header_info(
 
 /// Inspects a single `.pth` file's metadata (cache-first, remote fallback).
 ///
-/// Checks the local `HF` cache first. If the file is cached, delegates to
-/// [`inspect_pth_cached`] with zero network requests. Otherwise, opens an
-/// [`HttpRangeReader`] over the file and runs
+/// Checks the local `HF` cache first. If the file is cached, parses it from
+/// disk with zero network requests, as [`inspect_pth_cached`] does.
+/// Otherwise, opens an [`HttpRangeReader`] over the file and runs
 /// `anamnesis::parse_pth_front_matter_from_reader` against it on a blocking
 /// thread (v0.11.4, on anamnesis 0.7.5's reader-generic `PthFrontMatter` —
 /// the full-detail counterpart to the summary-only `inspect_pth_from_reader`
@@ -1451,6 +1467,8 @@ fn pth_tensor_info_to_header_info(
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors (the `hf-fm` CLI upgrades those into a gated-repo
 /// diagnosis).
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the `PTH` file is malformed
 /// (cached or remote).
 pub async fn inspect_pth(
@@ -1477,6 +1495,8 @@ pub async fn inspect_pth(
 /// Returns [`FetchError::Http`] if the Range probe or a range request
 /// fails — including gated repos, which surface as `returned status
 /// 401/403` errors.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if the `PTH` file is malformed
 /// (cached or remote).
 pub async fn inspect_pth_with_config(
@@ -1596,8 +1616,8 @@ fn stringify_gguf_scalar(value: &anamnesis::parse::gguf::GgufMetadataValue) -> O
 /// Inspects all `.safetensors` files in a repository (cache-first per file).
 ///
 /// Fetches the file listing via `list_repo_files_with_metadata()`, then
-/// inspects each `.safetensors` file's header via [`inspect_safetensors()`].
-/// For each file, checks the local cache first and only makes HTTP Range
+/// inspects each `.safetensors` file's header the way [`inspect_safetensors`]
+/// reads one: for each file, it checks the local cache first and only makes HTTP Range
 /// requests on cache miss. Returns full per-shard headers in filename order.
 ///
 /// For a lightweight summary of sharded models (tensor counts per shard
@@ -1611,6 +1631,8 @@ fn stringify_gguf_scalar(value: &anamnesis::parse::gguf::GgufMetadataValue) -> O
 /// Returns [`FetchError::Http`] if the metadata or Range requests fail.
 /// Returns [`FetchError::RepoNotFound`] if the repository does not exist.
 /// Returns [`FetchError::Io`] if a cached shard cannot be read.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if a shard's header is
 /// malformed.
 pub async fn inspect_repo_safetensors(
@@ -1637,6 +1659,8 @@ pub async fn inspect_repo_safetensors(
 /// Returns [`FetchError::Http`] if the metadata or Range requests fail.
 /// Returns [`FetchError::RepoNotFound`] if the repository does not exist.
 /// Returns [`FetchError::Io`] if a cached shard cannot be read.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if a shard's header is
 /// malformed.
 pub async fn inspect_repo_safetensors_with_config(
@@ -1679,6 +1703,8 @@ async fn inspect_repo_safetensors_with_access(
 /// Returns [`FetchError::Http`] if a Range request fails or a task fails to
 /// run.
 /// Returns [`FetchError::Io`] if a cached shard cannot be read.
+/// Returns [`FetchError::UnsafeName`] if the Hub sends a commit hash or
+/// etag that is not a single plain name.
 /// Returns [`FetchError::SafetensorsHeader`] if a shard's header is
 /// malformed.
 async fn inspect_shards(

@@ -49,10 +49,11 @@
 //! downloaded. One call does it for one file of any of the four formats:
 //! [`inspect_safetensors`], [`inspect_gguf`], [`inspect_npz`] and
 //! [`inspect_pth`] each take a repo id and a filename, read the header from
-//! the local cache when the file is there and through a handful of range
-//! requests when it is not, and return the format-agnostic
-//! [`inspect::SafetensorsHeaderInfo`], where it came from, and for a remote
-//! read what it cost ([`RangeStats`]).
+//! the local cache when the file is there and over HTTP Range otherwise (a
+//! handful of requests for most formats, tens to a couple of hundred for a
+//! `.gguf`, whose header carries the tokenizer's vocabulary), and return the
+//! format-agnostic [`inspect::SafetensorsHeaderInfo`], where it came from,
+//! and for a remote read what it cost ([`RangeStats`]).
 //!
 //! ```rust,no_run
 //! # async fn example() -> Result<(), hf_fetch_model::FetchError> {
@@ -99,9 +100,12 @@
 //! # }
 //! ```
 //!
-//! These entry points check the cache, open the reader, parse the header and
-//! keep the typed error; [`HttpRangeReader`], in [`http_range`], is the
-//! substrate they drive, for a reader-based parser of your own. See
+//! The four single-file inspectors check the cache, open the reader, parse
+//! the header and keep the typed error, and [`inspect_repo_safetensors`] does
+//! the same for each shard; [`HttpRangeReader`], in [`http_range`], is the
+//! substrate under them, for a reader-based parser of your own. The three
+//! `fetch_*` readers fetch their small `JSON` file with one plain request
+//! instead. See
 //! [`examples/candle_inspect.rs`](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/examples/candle_inspect.rs)
 //! for a runnable example, or the
 //! [Inspect tutorial](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/blob/main/docs/tutorials/inspect-before-downloading.md)
@@ -116,7 +120,7 @@
 //! difference between "fits" and "out-of-memory at token 8000" on a consumer
 //! card. The architecture parameters come from the model's `config.json`,
 //! parsed by the library API that v0.10.4 exposes for downstream reuse:
-//! [`inspect::ModelConfig`] plus [`inspect::fetch_model_config`] /
+//! [`ModelConfig`] plus [`fetch_model_config`] /
 //! [`inspect::fetch_model_config_cached`] (cache-first or cache-only) and the
 //! [`inspect::torch_dtype_bytes`] helper. The KV math itself — `GQA`,
 //! sliding-window, `MLA`-skip, and hybrid Mamba/attention layer counting —
@@ -161,15 +165,11 @@
 //! # }
 //! ```
 //!
-//! Remote inspect via HTTP Range (without going through the cache) shipped
-//! incrementally: `NPZ` in v0.11.0, safetensors in v0.11.1, `GGUF` in
-//! v0.11.2, `PTH` in v0.11.4 ([`inspect::inspect_npz`] /
-//! [`inspect::inspect_safetensors`] / [`inspect::inspect_gguf`] /
-//! [`inspect::inspect_pth`] each drive an anamnesis reader-based parser
-//! over an [`HttpRangeReader`] — see the [`http_range`] module for the
-//! substrate: tail prefetch, read-ahead, hard transfer budgets, token-free
-//! CDN requests). All four formats are now remote-capable, closing the
-//! matrix opened in v0.11.0.
+//! Remote inspect shipped one format at a time: `NPZ` in v0.11.0,
+//! safetensors in v0.11.1, `GGUF` in v0.11.2 and `PTH` in v0.11.4, each an
+//! anamnesis reader-based parser driven over an [`HttpRangeReader`]. The
+//! [`http_range`] module documents that substrate: tail prefetch,
+//! read-ahead, hard transfer budgets, token-free CDN requests.
 //!
 //! For discovery — "what tensor files does this cached repo hold?" —
 //! [`inspect::list_cached_tensor_files`] (v0.10.5) enumerates
@@ -331,11 +331,12 @@ pub use discover::{DiscoveredFamily, GateStatus, ModelCardMetadata, SearchResult
 pub use download::DownloadOutcome;
 pub use error::{FetchError, FileFailure};
 pub use http_range::{HttpRangeReader, RangeFetcher, RangeReader, RangeStats};
-// The eight `inspect` entry points that can reach the network, and their
-// `_with_config` twins, sit here beside the `http_range` substrate they
-// drive: a caller scanning the crate root for "inspect a remote file" finds
-// the entry point, not only the substrate (v0.12.3; finding 1 of the
-// candle-mi NPZ adoption report, where three sessions missed `inspect_npz`).
+// The eight cache-first `inspect` entry points that take a repo id, and
+// their `_with_config` twins, sit here beside `HttpRangeReader`, the
+// substrate under the remote header reads: a caller scanning the crate root
+// for "inspect a remote file" finds the entry point, not only the substrate
+// (v0.12.3; finding 1 of the candle-mi NPZ adoption report, where three
+// sessions missed `inspect_npz`).
 pub use inspect::{
     AdapterConfig, ModelConfig, fetch_adapter_config, fetch_adapter_config_with_config,
     fetch_model_config, fetch_model_config_with_config, fetch_shard_index,

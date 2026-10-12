@@ -609,8 +609,9 @@ fn format_bytes_approx(bytes: u64) -> String {
 /// [`MAX_TRANSFER_BUDGET`]) to `max_bytes` (`PeekOptions::max_bytes`).
 ///
 /// [`HttpRangeReader::open`]'s defaults are tuned for archive-header
-/// parsing (`inspect`'s handful-of-requests, well-under-1-MiB case) —
-/// peek's own `--max` can be, and by default already is, far larger.
+/// parsing (a handful of requests and well under 1 MiB for most formats, a
+/// few MiB for a `.gguf`), and peek's own `--max` can be, and by default
+/// already is, far larger.
 /// Returns `(max_requests, max_transfer_bytes)`, each floored at the
 /// transport's own default so a small/default `--max` keeps exactly
 /// today's safety margins:
