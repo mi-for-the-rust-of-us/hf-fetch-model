@@ -2,9 +2,9 @@
 
 *Aggregate a model's quant sibling repos into one table, then plan CPU-expert offload before choosing — without downloading a single candidate.*
 
-*~1,540 words · about 6 min read*
+*~1,560 words · about 6 min read*
 
-<!-- Last updated: 2026-10-10, hf-fm v0.12.2 -->
+<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (SmolLM2 capture re-run with growing read-ahead, 30 to 7 requests; the Laguna header's cost noted against v0.12.2) -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -127,7 +127,7 @@ ARTIFACT                  SIZE       RESIDENT   PLAN
 
 ## Running `--fits` again: `--cache-headers`
 
-Choosing is rarely one run: you change `--reserve`, try another budget, and run `--fits` again. Each run re-reads the header of every over-budget `.gguf` candidate, and for a popular `MoE` model that adds up fast. `poolside/Laguna-XS-2.1` has 48 sibling repos; at a 16 GiB budget with 2.5 GiB reserved, 76 of their files are over it, and one of those headers alone took 59 range requests and 3.56 MiB to read. Without a token, a second run a few minutes after the first, still contacting the Hub for every one of those headers, was refused with `429 Too Many Requests` on every row.
+Choosing is rarely one run: you change `--reserve`, try another budget, and run `--fits` again. Each run re-reads the header of every over-budget `.gguf` candidate, and for a popular `MoE` model that adds up fast. `poolside/Laguna-XS-2.1` has 48 sibling repos; at a 16 GiB budget with 2.5 GiB reserved, 76 of their files are over it, and one of those headers alone took 59 range requests and 3.56 MiB to read (with v0.12.2; v0.12.3's growing read-ahead reads a header that size in about 9). Without a token, a second run a few minutes after the first, still contacting the Hub for every one of those headers, was refused with `429 Too Many Requests` on every row.
 
 `--cache-headers` keeps each header it reads in a `.hf-fm-header-cache/` sidecar inside that candidate's cache directory, so a rerun reads it back instead:
 
@@ -151,7 +151,7 @@ Searching for quant siblings of poolside/Laguna-XS-2.1...
 76 of 76 read from the header cache
 ```
 
-An entry less than an hour old is used without a single request, so those 76 header reads cost nothing; only discovery's search and repo listings ran again. Past the hour, an entry is first checked against its file's current etag (2 requests instead of dozens) and, if it still matches, trusted for another hour. A file that changed upstream is read afresh, and its old entry removed. What the hour costs you is that a quant re-uploaded within it is planned from its old header until the hour ends.
+An entry less than an hour old is used without a single request, so those 76 header reads cost nothing; only discovery's search and repo listings ran again. Past the hour, an entry is first checked against its file's current etag (2 requests instead of a fresh read) and, if it still matches, trusted for another hour. A file that changed upstream is read afresh, and its old entry removed. What the hour costs you is that a quant re-uploaded within it is planned from its old header until the hour ends.
 
 The same flag works one file at a time with `inspect`, where the `Source:` line shows what each call cost. The first call:
 
@@ -160,7 +160,7 @@ hf-fm inspect bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q2_K.gg
 ```
 
 ```
-  Source:   remote (30 range requests, 1.75 MiB fetched)
+  Source:   remote (7 range requests, 1.94 MiB fetched)
 ```
 
 And the `Source:` line of the next one:

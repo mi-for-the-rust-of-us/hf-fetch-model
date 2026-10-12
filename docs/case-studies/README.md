@@ -29,6 +29,7 @@ similar wall:
 |------------|-----------------------------|---------------|
 | [Per-layer shape variation in Gemma 4](gemma4-per-layer-shape-variation.md) | `inspect --tree` reveals when a "constant" architecture isn't — a shape that varies by layer index | candle [#3448](https://github.com/huggingface/candle/issues/3448) |
 | [Reconstructing an OOM from a crash log](qwen3-next-memory-forensics.md) | `inspect --dtypes` for ground-truth on-disk size; fingerprinting a model the reporter never named | candle [#3530](https://github.com/huggingface/candle/issues/3530) |
+| [Remote GGUF inspect: from 201 range requests to 18](remote-gguf-read-ahead.md) | The `Source:` line's requests per MiB as a profiler; before-and-after measurement of growing read-ahead on eleven real files | internal (v0.12.3) |
 
 A note on timing: case studies are written *after* the upstream conversation
 has had time to settle, so the narrative reflects the real reception rather

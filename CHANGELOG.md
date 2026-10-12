@@ -59,16 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokenizer arrays had cost one range request per 64 KiB: 201 of the 256
   allowed for `gpt-oss-20b`'s 12.4 MiB header and 202 for
   `Llama-4-Scout`'s, so a vocabulary about a quarter larger would have
-  failed with `range request cap exceeded`. Measured on the real files,
-  before and after:
+  failed with `range request cap exceeded`. Measured on the real files
+  (median of three runs, v0.12.2 against this build; eleven files in all in
+  [the case study](docs/case-studies/remote-gguf-read-ahead.md)):
 
-  | GGUF | before | after |
-  |---|---|---|
-  | `ggml-org/gpt-oss-20b-GGUF` | 201 requests, 74 s | 18 requests, 7 s |
-  | `unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF` | 202 requests, 91 s | 18 requests, 7 s |
-  | `unsloth/Qwen3.5-4B-GGUF` | 170 requests | 16 requests, 6 s |
-  | `bartowski/zed-industries_zeta-2-GGUF` (Q4_K_M) | 98 requests | 12 requests |
-  | `bartowski/SmolLM2-135M-Instruct-GGUF` (Q2_K) | 30 requests | 7 requests, 3 s |
+  | GGUF | before | after | speed-up |
+  |---|---|---|---|
+  | `ggml-org/gpt-oss-20b-GGUF` | 201 requests, 74.1 s | 18 requests, 6.8 s | 11.0× |
+  | `unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF` | 202 requests, 76.0 s | 18 requests, 6.5 s | 11.7× |
+  | `unsloth/Qwen3.5-4B-GGUF` | 170 requests, 61.6 s | 16 requests, 5.9 s | 10.4× |
+  | `bartowski/zed-industries_zeta-2-GGUF` (Q4_K_M) | 98 requests, 35.3 s | 12 requests, 4.5 s | 7.9× |
+  | `bartowski/SmolLM2-135M-Instruct-GGUF` (Q2_K) | 30 requests, 11.2 s | 7 requests, 2.3 s | 4.8× |
 
   The last window reads at most 1 MiB past the header (0.94 MiB at most
   above). The 32 MiB byte budget is now the limit that binds: a header up

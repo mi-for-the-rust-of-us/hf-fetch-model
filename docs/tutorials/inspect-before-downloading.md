@@ -2,9 +2,9 @@
 
 *Read tensor metadata over HTTP Range — no weight data downloaded — and decide whether the model is worth the bandwidth.*
 
-*~2,000 words · about 8 min read*
+*~2,050 words · about 8 min read*
 
-<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (closing note names the library entry points and their _with_config twins) -->
+<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (GGUF capture re-run with growing read-ahead, 98 to 12 requests, and a note on its cost and the 32 MiB limit; closing note names the library entry points) -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -315,7 +315,7 @@ hf-fm inspect bartowski/zed-industries_zeta-2-GGUF zed-industries_zeta-2-Q4_K_M.
 ```
   Repo:     bartowski/zed-industries_zeta-2-GGUF
   File:     zed-industries_zeta-2-Q4_K_M.gguf
-  Source:   remote (98 range requests, 6.00 MiB fetched)
+  Source:   remote (12 range requests, 6.94 MiB fetched)
   Size:     4.87 GiB
   Metadata:
     general.architecture=llama
@@ -335,15 +335,17 @@ hf-fm inspect bartowski/zed-industries_zeta-2-GGUF zed-industries_zeta-2-Q4_K_M.
 
   Model weights:  4.86 GiB  (Q4_K + others, 8.25B params)
   GPU 0:          NVIDIA GeForce RTX 5060 Ti — 15.93 GiB VRAM
-                  free: 13.79 GiB, used: 2.14 GiB
-  Fit:            ✓ 8.93 GiB headroom for weights + KV cache + runtime
+                  free: 11.57 GiB, used: 4.36 GiB
+  Fit:            ✓ 6.71 GiB headroom for weights + KV cache + runtime
   Spilling:       not sampled (platform supports detection)
 
   Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
   weight size for KV cache and activations.
 ```
 
-Confirmed against the live device, not just the size table: `✓ 8.93 GiB headroom`, comfortably reversing the `✗ short by 1.77 GiB` verdict from §6's BF16 original. The `Metadata:` block is GGUF's other advantage over safetensors: `llama.block_count=32` self-confirms the same 32-layer architecture as zeta-2's safetensors original, read straight from the file rather than inferred. `291 tensors, 8.25B params` matches §2's safetensors tree exactly — same model, same tensor and parameter counts, fewer bytes per parameter.
+Confirmed against the live device, not just the size table: `✓ 6.71 GiB headroom`, comfortably reversing the `✗ short by 1.77 GiB` verdict from §6's BF16 original. The `Metadata:` block is GGUF's other advantage over safetensors: `llama.block_count=32` self-confirms the same 32-layer architecture as zeta-2's safetensors original, read straight from the file rather than inferred. `291 tensors, 8.25B params` matches §2's safetensors tree exactly — same model, same tensor and parameter counts, fewer bytes per parameter.
+
+The `Source:` line is what that cost: 12 range requests for 6.9 MiB, nearly all of it the tokenizer's vocabulary, which a GGUF stores in its header. Before v0.12.3 the same read took 98 requests and about 35 seconds; the reader now doubles its window while a read stays sequential, which the [before-and-after measurements](../case-studies/remote-gguf-read-ahead.md) put at up to 11× faster on large vocabularies. A header past about 32 MiB, two and a half times the largest measured, would not inspect remotely; the [FAQ](../FAQ.md#which-models-cant-be-inspected-remotely) says what to do then.
 
 The closing command, the only download in this whole tutorial:
 
