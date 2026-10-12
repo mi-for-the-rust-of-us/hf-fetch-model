@@ -124,6 +124,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shard starts after the first error, and the ones already running are
   awaited before it is returned.
 
+- **`inspect --tree` lines up its leaf columns.** Within each sibling group
+  the leaf rows padded their names and dtypes, but printed shapes unpadded
+  and sizes ragged, so `8.00 MiB` and `32.00 MiB` ended in different
+  columns. Shapes are now padded and sizes right-aligned to the group's
+  widest, as the README's `--tree` example had shown since v0.9.6: that
+  block had been aligned by hand, and the tool never printed it so. The
+  README's two `inspect` examples and every `inspect` capture in the
+  inspect tutorial are re-captured from this build; several also predated
+  the current footers, and both `--check-gpu` blocks are now taken back to
+  back so their verdicts compare on one GPU state.
+
 ## [0.12.2] — Honest disk accounting
 
 ### Added

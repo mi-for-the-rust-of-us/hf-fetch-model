@@ -4,7 +4,7 @@
 
 *~2,050 words · about 8 min read*
 
-<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (GGUF capture re-run with growing read-ahead, 98 to 12 requests, and a note on its cost and the 32 MiB limit; closing note names the library entry points) -->
+<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (every inspect capture re-run: --tree sizes now aligned, current footers, both --check-gpu blocks back to back; GGUF read 98 to 12 requests and a note on the 32 MiB limit; closing note names the library entry points) -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -33,8 +33,9 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
 7. --check-gpu output (added v0.10.1): the GPU 0 line is the maintainer's
    RTX 5060 Ti — `free` / `used` figures will drift run-to-run as the
    desktop's other processes change. Re-capture if rerunning the tutorial
-   end-to-end; the verdict (✗ short by ~1–2 GiB) should remain stable
-   regardless of the moment.
+   end-to-end; the verdict (✗ short by about 1.5–2.5 GiB) should remain stable
+   regardless of the moment. Both --check-gpu blocks are captured back to
+   back so their free/used figures agree.
 -->
 
 A new tutorial in the v0.10.0 docs effort. If you find a step confusing or an output that looks different from yours, please open an issue on [GitHub](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues) — the tutorial improves as real questions land.
@@ -85,11 +86,11 @@ Output:
       │   │   └── up_proj.weight    BF16  [14336, 4096]  112.00 MiB
       │   ├── post_attention_layernorm.weight  BF16  [4096]  8.0 KiB
       │   └── self_attn.
-      │       ├── k_proj.weight  BF16  [1024, 4096]  8.00 MiB
+      │       ├── k_proj.weight  BF16  [1024, 4096]   8.00 MiB
       │       ├── o_proj.weight  BF16  [4096, 4096]  32.00 MiB
       │       ├── q_proj.weight  BF16  [4096, 4096]  32.00 MiB
-      │       └── v_proj.weight  BF16  [1024, 4096]  8.00 MiB
-      └── norm.weight          BF16  [4096]  8.0 KiB
+      │       └── v_proj.weight  BF16  [1024, 4096]   8.00 MiB
+      └── norm.weight          BF16  [4096]           8.0 KiB
   291 tensors, 8.25B params
 ```
 
@@ -195,11 +196,10 @@ hf-fm inspect zed-industries/zeta-2 \
   Source: aggregated across 4 shards
 
   └── lm_head.weight  BF16  [155136, 4096]  1.18 GiB
-  Showing 1 of 291 tensors matching filter "lm_head".
-  Param counts: 635.4M matching filter, 8.25B total.
+  1/291 tensor, 635.4M/8.25B params (filter: "lm_head")
 ```
 
-The footer's `Showing 1 of 291 tensors matching filter "lm_head"` (635.4M matching out of 8.25B total) is the answer: the head alone is 635 million parameters, 1.18 GiB. If you are sketching a fine-tuning budget, that's the cost of replacing the head and freezing the rest.
+The footer's `1/291 tensor, 635.4M/8.25B params (filter: "lm_head")` is the answer: the head alone is 635 million parameters, 1.18 GiB. If you are sketching a fine-tuning budget, that's the cost of replacing the head and freezing the rest.
 
 Or "show me the first five tensors with their source shard":
 
@@ -213,15 +213,14 @@ hf-fm inspect zed-industries/zeta-2 \
   Repo:   zed-industries/zeta-2
   Source: aggregated across 4 shards
 
-  Tensor                                Dtype    Shape                Size     Params  Shard
+  Tensor                                Dtype    Shape                Size     Params  Shard                           
   model.embed_tokens.weight             BF16     [155136, 4096]   1.18 GiB     635.4M  model-00001-of-00004.safetensors
   model.layers.0.input_layernorm.weight BF16     [4096]            8.0 KiB       4.1K  model-00001-of-00004.safetensors
   model.layers.0.mlp.down_proj.weight   BF16     [4096, 14336]  112.00 MiB      58.7M  model-00001-of-00004.safetensors
   model.layers.0.mlp.gate_proj.weight   BF16     [14336, 4096]  112.00 MiB      58.7M  model-00001-of-00004.safetensors
   model.layers.0.mlp.up_proj.weight     BF16     [14336, 4096]  112.00 MiB      58.7M  model-00001-of-00004.safetensors
-  ─────────────────────────────────────────────────────────────────────────────────────────────
-  Showing 5 of 291 tensors (limit: 5).
-  Param counts: 811.6M shown, 8.25B total.
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5/291 tensors shown, 811.6M/8.25B params (limit: 5)
 ```
 
 The `Shard` column is hf-fm reminding you that shard 1 holds the embedding plus the first set of layer weights. That is occasionally useful when debugging: if a download failed for a specific shard, you know which tensors are at risk.
@@ -245,15 +244,15 @@ hf-fm inspect zed-industries/zeta-2 \
 
   Model weights:  15.37 GiB  (BF16, 8.25B params)
   GPU 0:          NVIDIA GeForce RTX 5060 Ti — 15.93 GiB VRAM
-                  free: 13.60 GiB, used: 2.33 GiB
-  Fit:            ✗ short by 1.77 GiB for the weights alone
+                  free: 13.20 GiB, used: 2.73 GiB
+  Fit:            ✗ short by 2.17 GiB for the weights alone
   Spilling:       not sampled (platform supports detection)
 
   Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
   weight size for KV cache and activations.
 ```
 
-The verdict is short and clear: the weights are 1.77 GiB larger than what is actually free on this RTX 5060 Ti right now — and that is *before* the KV cache. Add `--context N` (v0.10.4) to fold the KV cache in at a chosen sequence length and get a real `weights + KV` verdict; it reads the architecture from `config.json`, so GQA, sliding-window, and hybrid Mamba models are all handled (see the [FAQ](../FAQ.md#how-do-i-know-if-a-model-fits-on-my-gpu) for the formula and its limitations). The next section is the practical pivot to a quant that fits.
+The verdict is short and clear: the weights are 2.17 GiB larger than what is actually free on this RTX 5060 Ti right now — and that is *before* the KV cache. Add `--context N` (v0.10.4) to fold the KV cache in at a chosen sequence length and get a real `weights + KV` verdict; it reads the architecture from `config.json`, so GQA, sliding-window, and hybrid Mamba models are all handled (see the [FAQ](../FAQ.md#how-do-i-know-if-a-model-fits-on-my-gpu) for the formula and its limitations). The next section is the practical pivot to a quant that fits.
 
 ## The verdict — and what to do when it doesn't fit
 
@@ -335,15 +334,15 @@ hf-fm inspect bartowski/zed-industries_zeta-2-GGUF zed-industries_zeta-2-Q4_K_M.
 
   Model weights:  4.86 GiB  (Q4_K + others, 8.25B params)
   GPU 0:          NVIDIA GeForce RTX 5060 Ti — 15.93 GiB VRAM
-                  free: 11.57 GiB, used: 4.36 GiB
-  Fit:            ✓ 6.71 GiB headroom for weights + KV cache + runtime
+                  free: 13.21 GiB, used: 2.72 GiB
+  Fit:            ✓ 8.35 GiB headroom for weights + KV cache + runtime
   Spilling:       not sampled (platform supports detection)
 
   Note: reports weights only. Large-context inference typically needs ~1.3–1.5×
   weight size for KV cache and activations.
 ```
 
-Confirmed against the live device, not just the size table: `✓ 6.71 GiB headroom`, comfortably reversing the `✗ short by 1.77 GiB` verdict from §6's BF16 original. The `Metadata:` block is GGUF's other advantage over safetensors: `llama.block_count=32` self-confirms the same 32-layer architecture as zeta-2's safetensors original, read straight from the file rather than inferred. `291 tensors, 8.25B params` matches §2's safetensors tree exactly — same model, same tensor and parameter counts, fewer bytes per parameter.
+Confirmed against the live device, not just the size table: `✓ 8.35 GiB headroom`, comfortably reversing the `✗ short by 2.17 GiB` verdict from §6's BF16 original. The `Metadata:` block is GGUF's other advantage over safetensors: `llama.block_count=32` self-confirms the same 32-layer architecture as zeta-2's safetensors original, read straight from the file rather than inferred. `291 tensors, 8.25B params` matches §2's safetensors tree exactly — same model, same tensor and parameter counts, fewer bytes per parameter.
 
 The `Source:` line is what that cost: 12 range requests for 6.9 MiB, nearly all of it the tokenizer's vocabulary, which a GGUF stores in its header. Before v0.12.3 the same read took 98 requests and about 35 seconds; the reader now doubles its window while a read stays sequential, which the [before-and-after measurements](../case-studies/remote-gguf-read-ahead.md) put at up to 11× faster on large vocabularies. A header past about 32 MiB, two and a half times the largest measured, would not inspect remotely; the [FAQ](../FAQ.md#which-models-cant-be-inspected-remotely) says what to do then.
 

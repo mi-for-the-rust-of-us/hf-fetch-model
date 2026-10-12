@@ -7780,36 +7780,61 @@ fn nodes_structurally_equal(a: &TreeNode, b: &TreeNode) -> bool {
 
 /// Renders a tree forest to stdout using Unicode box-drawing connectors.
 fn render_tree(nodes: &[TreeNode]) {
-    render_children(nodes, "");
+    for line in render_tree_lines(nodes) {
+        println!("{line}");
+    }
 }
 
-/// Renders children of a node, computing per-level leaf alignment.
-fn render_children(children: &[TreeNode], prefix: &str) {
-    // Compute max leaf-name width at THIS level for column alignment.
-    let leaf_name_width: usize = children
-        .iter()
-        .filter_map(|c| match c {
-            TreeNode::Leaf(l) => Some(l.name.len()),
-            // EXPLICIT: branch/ranged children don't contribute to leaf-name width
-            TreeNode::Branch(_) | TreeNode::Ranged(_) => None,
-        })
-        .max()
-        .unwrap_or(0);
+/// The lines [`render_tree`] prints, built apart from printing so tests can
+/// check the layout.
+fn render_tree_lines(nodes: &[TreeNode]) -> Vec<String> {
+    let mut lines = Vec::new();
+    render_children(nodes, "", &mut lines);
+    lines
+}
 
-    // Max dtype width for aligned leaf rows.
-    let dtype_width: usize = children
-        .iter()
-        .filter_map(|c| match c {
-            TreeNode::Leaf(l) => Some(l.dtype.len()),
-            // EXPLICIT: branch/ranged children don't contribute to dtype width
-            TreeNode::Branch(_) | TreeNode::Ranged(_) => None,
-        })
-        .max()
-        .unwrap_or(0);
+/// Column widths shared by the leaf rows of one sibling group.
+struct LeafWidths {
+    /// Widest leaf name, in characters.
+    name: usize,
+    /// Widest dtype, in characters.
+    dtype: usize,
+    /// Widest shape label (`[2304, 16384]`), in characters.
+    shape: usize,
+    /// Widest size label (`768.00 MiB`); sizes are right-aligned to it.
+    size: usize,
+}
+
+/// A leaf's shape as the tree prints it, e.g. `[2304, 16384]`.
+fn shape_label(shape: &[usize]) -> String {
+    format!("{shape:?}")
+}
+
+/// Renders children of a node, aligning the leaf rows of this sibling group.
+///
+/// Every leaf column is sized from the group's own widest entry: names,
+/// dtypes and shapes are padded and sizes right-aligned, so the rows line
+/// up. Until v0.12.3 the shape and size columns were not, and a group's
+/// sizes were ragged.
+fn render_children(children: &[TreeNode], prefix: &str, lines: &mut Vec<String>) {
+    let mut widths = LeafWidths {
+        name: 0,
+        dtype: 0,
+        shape: 0,
+        size: 0,
+    };
+    for child in children {
+        if let TreeNode::Leaf(l) = child {
+            widths.name = widths.name.max(l.name.len());
+            widths.dtype = widths.dtype.max(l.dtype.len());
+            widths.shape = widths.shape.max(shape_label(&l.shape).len());
+            widths.size = widths.size.max(format_size(l.bytes).len());
+        }
+    }
 
     for (i, child) in children.iter().enumerate() {
         let is_last = i + 1 == children.len();
-        render_node(child, prefix, is_last, leaf_name_width, dtype_width);
+        render_node(child, prefix, is_last, &widths, lines);
     }
 }
 
@@ -7817,32 +7842,35 @@ fn render_node(
     node: &TreeNode,
     prefix: &str,
     is_last: bool,
-    leaf_name_width: usize,
-    dtype_width: usize,
+    widths: &LeafWidths,
+    lines: &mut Vec<String>,
 ) {
     let connector = if is_last { "└── " } else { "├── " };
     let indent = if is_last { "    " } else { "│   " };
 
     match node {
         TreeNode::Leaf(leaf) => {
-            let shape_str = format!("{:?}", leaf.shape);
-            let size_str = format_size(leaf.bytes);
-            // Leaf columns: name (padded) | dtype (padded) | shape | size
-            println!(
-                "  {prefix}{connector}{name:<nw$}  {dtype:<dw$}  {shape_str}  {size_str}",
+            // Leaf columns: name, dtype and shape padded, size right-aligned,
+            // each to the widest in this sibling group.
+            lines.push(format!(
+                "  {prefix}{connector}{name:<nw$}  {dtype:<dw$}  {shape:<sw$}  {size:>zw$}",
                 name = leaf.name,
                 dtype = leaf.dtype,
-                nw = leaf_name_width,
-                dw = dtype_width,
-            );
+                shape = shape_label(&leaf.shape),
+                size = format_size(leaf.bytes),
+                nw = widths.name,
+                dw = widths.dtype,
+                sw = widths.shape,
+                zw = widths.size,
+            ));
         }
         TreeNode::Branch(branch) => {
-            println!(
+            lines.push(format!(
                 "  {prefix}{connector}{seg}.",
                 seg = branch.segment.as_str(), // BORROW: explicit .as_str()
-            );
+            ));
             let new_prefix = format!("{prefix}{indent}");
-            render_children(&branch.children, new_prefix.as_str()); // BORROW: explicit .as_str()
+            render_children(&branch.children, new_prefix.as_str(), lines); // BORROW: explicit .as_str()
         }
         TreeNode::Ranged(ranged) => {
             let count = ranged.range_end - ranged.range_start + 1;
@@ -7856,15 +7884,17 @@ fn render_node(
                 end = ranged.range_end
             );
             if ranged.segment.is_empty() {
-                println!("  {prefix}{connector}{range_label}.   (\u{00d7}{count})");
+                lines.push(format!(
+                    "  {prefix}{connector}{range_label}.   (\u{00d7}{count})"
+                ));
             } else {
-                println!(
+                lines.push(format!(
                     "  {prefix}{connector}{seg}.{range_label}.   (\u{00d7}{count})",
                     seg = ranged.segment.as_str(), // BORROW: explicit .as_str()
-                );
+                ));
             }
             let new_prefix = format!("{prefix}{indent}");
-            render_children(&ranged.template, new_prefix.as_str()); // BORROW: explicit .as_str()
+            render_children(&ranged.template, new_prefix.as_str(), lines); // BORROW: explicit .as_str()
         }
     }
 }
@@ -12664,6 +12694,71 @@ mod tests {
                 TreeNode::Leaf(_) | TreeNode::Branch(_) | TreeNode::Ranged(_) => None,
             })
             .expect("forest must contain a top-level `blocks` branch")
+    }
+
+    /// A tree leaf for the rendering tests; `params` is not rendered.
+    fn render_leaf(name: &str, dtype: &str, shape: &[usize], bytes: u64) -> TreeNode {
+        TreeNode::Leaf(LeafNode {
+            name: name.to_owned(),
+            dtype: dtype.to_owned(),
+            shape: shape.to_vec(),
+            params: 0,
+            bytes,
+        })
+    }
+
+    #[test]
+    fn tree_leaf_rows_align_shape_and_size_within_a_sibling_group() {
+        // `google/gemma-4-E2B-it`'s `vision_tower.patch_embedder.` group:
+        // shapes of 10 and 15 characters, sizes of 8 and 9. Until v0.12.3 the
+        // shape column was not padded nor the size right-aligned, so the two
+        // sizes ended 5 characters apart.
+        let lines = render_tree_lines(&[
+            render_leaf("input_proj.weight", "BF16", &[768, 768], 1_179_648),
+            render_leaf(
+                "position_embedding_table",
+                "BF16",
+                &[2, 10240, 768],
+                31_457_280,
+            ),
+        ]);
+        assert_eq!(
+            lines,
+            [
+                "  ├── input_proj.weight         BF16  [768, 768]        1.12 MiB",
+                "  └── position_embedding_table  BF16  [2, 10240, 768]  30.00 MiB",
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_leaf_alignment_is_per_sibling_group() {
+        // A nested group's long names and wide sizes must not widen the
+        // top-level columns, and a branch line takes no padding at all.
+        let sub = TreeNode::Branch(BranchNode {
+            segment: "language_model".to_owned(),
+            children: vec![
+                render_leaf("embed_tokens.weight", "BF16", &[262_144, 1536], 805_306_368),
+                render_leaf("norm", "F32", &[1536], 6144),
+            ],
+            total_tensors: 2,
+            total_params: 0,
+            total_bytes: 805_312_512,
+        });
+        let lines = render_tree_lines(&[
+            render_leaf("a", "BF16", &[4], 8),
+            sub,
+            render_leaf("bb", "F32", &[1024, 1024], 4_194_304),
+        ]);
+        let width = |i: usize| lines[i].chars().count();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[1], "  ├── language_model.");
+        assert_eq!(width(0), width(4), "top-level leaves line up: {lines:#?}");
+        assert_eq!(width(2), width(3), "nested leaves line up: {lines:#?}");
+        assert_eq!(
+            lines[0], "  ├── a   BF16  [4]                8 B",
+            "the top level is sized from its own leaves only"
+        );
     }
 
     #[test]

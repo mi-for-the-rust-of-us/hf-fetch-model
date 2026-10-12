@@ -153,12 +153,14 @@ $ hf-fm inspect EleutherAI/pythia-1.4b model.safetensors --cached --filter "laye
   Repo:     EleutherAI/pythia-1.4b
   File:     model.safetensors
   Source:   cached
+  Header:   41.5 KiB (JSON), 2.73 GiB total
+  Metadata: format=pt
 
-  Tensor                                             Dtype    Shape                  Size     Params
-  gpt_neox.layers.0.attention.dense.weight           F16      [2048, 2048]       8.00 MiB       4.2M
-  gpt_neox.layers.0.mlp.dense_h_to_4h.weight         F16      [8192, 2048]      32.00 MiB      16.8M
+  Tensor                                             Dtype    Shape                    Size     Params
+  gpt_neox.layers.0.attention.dense.weight           F16      [2048, 2048]         8.00 MiB       4.2M
+  gpt_neox.layers.0.mlp.dense_h_to_4h.weight         F16      [8192, 2048]        32.00 MiB      16.8M
   ...
-  ────────────────────────────────────────────────────────────────────────────────────────────────
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────
   Showing 15 of 364 tensors matching filter "layers.0.".
   Param counts: 54.6M matching filter, 1.52B total.
 
@@ -171,12 +173,12 @@ $ hf-fm inspect google/gemma-4-E2B-it model.safetensors --tree --filter "embed"
 
   └── model.
       ├── embed_audio.embedding_projection.weight   BF16  [1536, 1536]  4.50 MiB
-      ├── embed_vision.embedding_projection.weight  BF16  [1536, 768]  2.25 MiB
+      ├── embed_vision.embedding_projection.weight  BF16  [1536, 768]   2.25 MiB
       ├── language_model.
       │   ├── embed_tokens.weight            BF16  [262144, 1536]  768.00 MiB
-      │   └── embed_tokens_per_layer.weight  BF16  [262144, 8960]  4.38 GiB
+      │   └── embed_tokens_per_layer.weight  BF16  [262144, 8960]    4.38 GiB
       └── vision_tower.patch_embedder.
-          ├── input_proj.weight         BF16  [768, 768]  1.12 MiB
+          ├── input_proj.weight         BF16  [768, 768]        1.12 MiB
           └── position_embedding_table  BF16  [2, 10240, 768]  30.00 MiB
   6/2011 tensors, 2.77B/5.12B params (filter: "embed")
 
