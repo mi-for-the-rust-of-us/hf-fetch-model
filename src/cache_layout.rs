@@ -200,6 +200,17 @@ pub fn is_safe_hub_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
+/// Whether `revision` is a full commit hash: exactly 40 hex digits, the rule
+/// `hf-hub` 1.0 applies to decide the same question.
+///
+/// `hf-hub` and `huggingface_hub` write no `refs/<revision>` file for such a
+/// revision, since it already names its snapshot directory, so a cache
+/// lookup resolves it to itself ([`crate::cache::read_ref`]).
+#[must_use]
+pub(crate) fn is_commit_hash(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Whether `filename`, a file's path within a repo as the Hub lists it
 /// (`config.json`, `subdir/model.safetensors`), stays inside the snapshot
 /// directory it is joined to.

@@ -3006,6 +3006,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn npz_with_config_finds_a_commit_pinned_snapshot_that_has_no_ref() {
+        // `hf-hub` writes no `refs/<sha>` for a commit-hash revision: the
+        // file sits in `snapshots/<sha>/` with no ref naming it.
+        let root = tempfile::tempdir().unwrap();
+        let repo_dir = crate::cache_layout::repo_dir(root.path(), "org/model");
+        let pointer = crate::cache_layout::pointer_path(&repo_dir, FIXTURE_COMMIT, "params.npz");
+        std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        let npz = make_in_memory_npz(&[(
+            "w_enc",
+            "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }",
+            &[0u8; 24],
+        )]);
+        std::fs::write(&pointer, npz).unwrap();
+
+        let (_, source, stats) = super::inspect_npz_with_config(
+            "org/model",
+            "params.npz",
+            &config_at(root.path(), FIXTURE_COMMIT),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(source, super::InspectSource::Cached));
+        assert!(stats.is_none(), "a cache hit makes no range request");
+    }
+
+    #[tokio::test]
     async fn safetensors_with_config_reads_its_output_dir() {
         let root = tempfile::tempdir().unwrap();
         let header = br#"{"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;

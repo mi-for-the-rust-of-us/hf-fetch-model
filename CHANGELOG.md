@@ -64,6 +64,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code matching either message on its text keeps working if it matches the
   start, which is unchanged.
 
+### Fixed
+
+- **A commit-hash revision finds its cached snapshot.** `hf-hub` and
+  Python's `huggingface_hub` write no `refs/<sha>` file when the revision is
+  itself a commit hash, since it already names its snapshot directory, and
+  hf-fm resolved every revision through that file alone. A snapshot pinned
+  that way therefore read as not cached: `inspect --cached`, the cache-first
+  lookup of every `inspect` entry point (the new twins included), `status`,
+  `list-files`, `cache path`, `cache verify` and the download plan all
+  missed files already on disk when given `--revision <sha>`. A snapshot
+  hf-fm's own multi-connection path had touched was found, because that
+  path writes the ref itself. `cache::read_ref` now resolves a
+  40-hex-digit revision to itself when `snapshots/<sha>/` exists, as
+  `hf-hub` does; a refs file, when present, still wins. Found by the
+  v0.12.3 consistency pass.
+
 ## [0.12.2] — Honest disk accounting
 
 ### Added

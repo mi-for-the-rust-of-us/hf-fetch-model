@@ -806,22 +806,38 @@ pub fn repo_has_partial(repo_id: &str) -> Result<bool, FetchError> {
     Ok(scan_partials(&blobs_dir).0)
 }
 
-/// Reads the commit hash from a refs file, if it exists.
+/// Resolves `revision` to the commit hash of its cached snapshot.
 ///
 /// Looks for `<repo_dir>/refs/<revision>` and returns the trimmed contents
-/// (a commit hash) or `None` if the file does not exist, is empty, or holds
-/// anything other than one plain name
-/// ([`crate::cache_layout::is_safe_hub_name`]): every caller goes on to build
-/// `snapshots/<commit_hash>/` from it.
+/// (a commit hash), ignoring a file that is empty or holds anything other
+/// than one plain name ([`crate::cache_layout::is_safe_hub_name`]): every
+/// caller goes on to build `snapshots/<commit_hash>/` from it.
+///
+/// A revision that is itself a full commit hash (40 hex digits) usually has
+/// no refs file: `hf-hub` and `huggingface_hub` skip it, since the revision
+/// already names its snapshot. Such a revision resolves to itself when
+/// `snapshots/<revision>/` exists, as `hf-hub` resolves it. `None` therefore
+/// means the revision is not cached; until v0.12.3 a snapshot pinned that
+/// way by `hf-hub` or Python read as not cached.
 #[must_use]
 pub fn read_ref(repo_dir: &Path, revision: &str) -> Option<String> {
     let ref_path = crate::cache_layout::ref_path(repo_dir, revision);
-    std::fs::read_to_string(ref_path)
+    let from_ref = std::fs::read_to_string(ref_path)
         .ok()
         // BORROW: explicit .to_owned() to convert trimmed &str → owned String
         .map(|s| s.trim().to_owned())
         // BORROW: explicit .as_str() instead of Deref coercion
-        .filter(|s| crate::cache_layout::is_safe_hub_name(s.as_str()))
+        .filter(|s| crate::cache_layout::is_safe_hub_name(s.as_str()));
+    if from_ref.is_some() {
+        return from_ref;
+    }
+    if crate::cache_layout::is_commit_hash(revision)
+        && crate::cache_layout::snapshot_dir(repo_dir, revision).is_dir()
+    {
+        // BORROW: explicit .to_owned() for the owned commit hash returned
+        return Some(revision.to_owned());
+    }
+    None
 }
 
 /// Returns the truly-downloaded byte count of a file's own chunked-download
@@ -2011,6 +2027,44 @@ mod tests {
                 None,
                 "{bad:?} should be refused"
             );
+        }
+    }
+
+    /// `hf-hub` and `huggingface_hub` write no refs file for a commit-hash
+    /// revision, so its snapshot directory is the only trace, and it must
+    /// resolve. Until v0.12.3 such a snapshot read as not cached.
+    #[test]
+    fn read_ref_resolves_a_commit_hash_revision_by_its_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        let sha = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+        assert_eq!(read_ref(&repo_dir, sha), None, "no snapshot: not cached");
+
+        std::fs::create_dir_all(crate::cache_layout::snapshot_dir(&repo_dir, sha)).unwrap();
+        assert_eq!(read_ref(&repo_dir, sha).as_deref(), Some(sha));
+
+        // A refs file, when one exists, still wins.
+        let refs = crate::cache_layout::refs_dir(&repo_dir);
+        std::fs::create_dir_all(&refs).unwrap();
+        let other = "2220a243fdf4706b3f48f1d95db1a4f5529b4d42";
+        std::fs::write(refs.join(sha), other).unwrap();
+        assert_eq!(read_ref(&repo_dir, sha).as_deref(), Some(other));
+    }
+
+    /// Only a full 40-hex-digit hash resolves to itself: a branch, a short
+    /// hash or a non-hex name with a matching snapshot directory still needs
+    /// its refs file.
+    #[test]
+    fn read_ref_resolves_only_a_full_commit_hash_by_its_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("models--org--model");
+        for name in [
+            "main",
+            "1110a24",
+            "1110a243fdf4706b3f48f1d95db1a4f5529b4d4z",
+        ] {
+            std::fs::create_dir_all(crate::cache_layout::snapshot_dir(&repo_dir, name)).unwrap();
+            assert_eq!(read_ref(&repo_dir, name), None, "{name} has no refs file");
         }
     }
 
