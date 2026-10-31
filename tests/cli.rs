@@ -5526,3 +5526,242 @@ fn cache_gc_dry_run_prints_du_s_duplicated_figure_and_what_it_leaves_out() {
         "and names what it leaves out, got:\n{stdout}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Relocated repos: a cache entry that links to a directory elsewhere (v0.12.5)
+// -----------------------------------------------------------------------
+
+/// Runs a command with `input` on its stdin, as a user answering a prompt.
+fn run_with_stdin(cmd: &mut Command, input: &str) -> (String, String, bool) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hf-fetch-model binary");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("write the answer");
+    let output = child.wait_with_output().expect("wait for the binary");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// Makes `link` a link to the directory `target`, the way a repo is moved to
+/// another disk and linked back: a symlink on Unix, a junction on Windows,
+/// which needs no privilege. Returns `false` when the platform refuses.
+fn try_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+}
+
+/// Moves `models--test-org--moved` out of the cache into `<root>/elsewhere/`
+/// under `target_name` and links it back. Returns the target directory, or
+/// `None` when the platform refuses links.
+fn stage_relocated_repo(
+    hf_home: &std::path::Path,
+    target_name: &str,
+) -> Option<std::path::PathBuf> {
+    stage_blob_and_copy(hf_home, "models--test-org--moved", "e1", "model.bin", 4096);
+    let hub = hf_home.join("hub");
+    let target = hf_home.join("elsewhere").join(target_name);
+    std::fs::create_dir_all(target.parent().expect("a parent")).expect("create target parent");
+    std::fs::rename(hub.join("models--test-org--moved"), &target).expect("move the repo out");
+    if try_dir_link(&target, &hub.join("models--test-org--moved")) {
+        Some(target)
+    } else {
+        eprintln!("skipped: this platform refuses directory links");
+        None
+    }
+}
+
+#[test]
+fn du_marks_a_relocated_repo_and_still_counts_its_bytes() {
+    let dir = temp_hf_home();
+    let Some(target) = stage_relocated_repo(dir.path(), "models--test-org--moved") else {
+        return;
+    };
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("test-org/moved") && l.contains('\u{2192}')),
+        "the row carries the arrow and the target, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("8.0 KiB  total (1 repo, 1 file)"),
+        "its bytes are cache usage wherever they live, got:\n{stdout}"
+    );
+
+    let entry = du_json_entry(dir.path(), "test-org/moved", "model");
+    let relocated = entry
+        .get("relocated_to")
+        .and_then(Value::as_str)
+        .expect("relocated_to in du --json");
+    assert!(
+        std::path::Path::new(relocated).ends_with("models--test-org--moved")
+            && relocated.contains("elsewhere"),
+        "the JSON names the target {target:?}, got {relocated}"
+    );
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/moved"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains("Relocated: test-org/moved is a link to"),
+        "the drill-down says where the bytes are, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn cache_delete_of_a_relocated_repo_removes_the_link_and_keeps_the_bytes() {
+    let dir = temp_hf_home();
+    let Some(target) = stage_relocated_repo(dir.path(), "models--test-org--moved") else {
+        return;
+    };
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/moved",
+        "--dry-run",
+    ]));
+    assert!(success, "--dry-run should succeed: {stderr}");
+    assert!(
+        stdout.contains("Only the link is removed") && stdout.contains("freeing 0 B"),
+        "the preview says nothing is freed here, got:\n{stdout}"
+    );
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/moved",
+        "--yes",
+    ]));
+    assert!(success, "deleting the link should succeed: {stderr}");
+    assert!(stdout.contains("Freed 0 B"), "got:\n{stdout}");
+    assert!(
+        !repo_exists(dir.path(), "models--test-org--moved"),
+        "the link is gone"
+    );
+    assert!(
+        target.join("blobs").join("e1").exists(),
+        "and every byte behind it is intact"
+    );
+}
+
+#[test]
+fn cache_delete_with_target_asks_even_under_yes_and_then_removes_both() {
+    let dir = temp_hf_home();
+    let Some(target) = stage_relocated_repo(dir.path(), "models--test-org--moved") else {
+        return;
+    };
+    let args = [
+        "cache",
+        "delete",
+        "test-org/moved",
+        "--with-target",
+        "--yes",
+    ];
+
+    let (stdout, _, success) = run_with_stdin(hf_fm().env("HF_HOME", dir.path()).args(args), "n\n");
+    assert!(success, "declining is not an error");
+    assert!(
+        stdout.contains("Aborted."),
+        "--yes did not answer for the user, got:\n{stdout}"
+    );
+    assert!(target.exists(), "nothing was removed");
+
+    let (stdout, stderr, success) =
+        run_with_stdin(hf_fm().env("HF_HOME", dir.path()).args(args), "y\n");
+    assert!(success, "--with-target should succeed: {stderr}\n{stdout}");
+    assert!(!target.exists(), "the bytes are gone");
+    assert!(
+        !repo_exists(dir.path(), "models--test-org--moved"),
+        "and so is the link"
+    );
+}
+
+#[test]
+fn cache_delete_with_target_refuses_a_target_not_named_like_the_repo() {
+    let dir = temp_hf_home();
+    let Some(target) = stage_relocated_repo(dir.path(), "precious-data") else {
+        return;
+    };
+
+    let (_, stderr, success) = run_with_stdin(
+        hf_fm().env("HF_HOME", dir.path()).args([
+            "cache",
+            "delete",
+            "test-org/moved",
+            "--with-target",
+        ]),
+        "y\n",
+    );
+    assert!(!success, "a mislabelled target is an error");
+    assert!(
+        stderr.contains("refusing to delete it"),
+        "and says why, got:\n{stderr}"
+    );
+    assert!(
+        target.join("blobs").join("e1").exists(),
+        "the target is untouched"
+    );
+}
+
+#[test]
+fn cache_gc_skips_a_relocated_repo_and_says_so() {
+    let dir = temp_hf_home();
+    if stage_relocated_repo(dir.path(), "models--test-org--moved").is_none() {
+        return;
+    }
+
+    let (_, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "gc",
+        "--max-size",
+        "1KiB",
+        "--dry-run",
+    ]));
+    assert!(success, "gc --dry-run should succeed: {stderr}");
+    assert!(
+        stderr.contains("note: 1 relocated repo skipped"),
+        "the relocated repo is reported as skipped, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn status_resolves_a_du_index_and_rejects_one_out_of_range() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--only", "e1", "m.bin", 1024);
+
+    let (_, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["status", "5"]));
+    assert!(!success, "an index past the end is an error");
+    assert!(
+        stderr.contains("index 5 is out of range (cache has 1 repo"),
+        "like `du 5`, not a Hub lookup of a repo named 5, got:\n{stderr}"
+    );
+}

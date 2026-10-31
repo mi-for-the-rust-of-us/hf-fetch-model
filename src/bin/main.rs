@@ -775,6 +775,9 @@ enum CacheCommands {
     /// `du`, and shifts after each deletion; the repo each index resolved to
     /// is printed, `--yes` or not. A dataset or Space is addressed behind
     /// its Hub prefix (`datasets/org/name`).
+    ///
+    /// A repo moved to another disk behind a link loses the link only; its
+    /// bytes stay, and `--with-target` deletes them too.
     Delete {
         /// Repository identifiers or numeric indexes from `du` output (one or more).
         #[arg(required = true, num_args = 1..)]
@@ -788,6 +791,15 @@ enum CacheCommands {
         /// or prompting.
         #[arg(long)]
         dry_run: bool,
+
+        /// For a repo moved to another disk behind a link, delete the bytes
+        /// at the link's target too.
+        ///
+        /// By default only the link is removed and the bytes stay where
+        /// they are. The target must be a directory named like the repo's
+        /// cache folder, and `--yes` does not skip the confirmation.
+        #[arg(long)]
+        with_target: bool,
     },
     /// Garbage-collect cached models by age and/or size budget.
     ///
@@ -1132,7 +1144,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             json,
             // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
         }) => run_status(
-            repo_id.as_str(),
+            resolve_status_arg(repo_id.as_str())?.as_str(),
             revision.as_deref(),
             token.as_deref(),
             preset.as_ref(),
@@ -1319,7 +1331,8 @@ fn run(cli: Cli) -> Result<(), FetchError> {
                 repo_ids,
                 yes,
                 dry_run,
-            } => run_cache_delete(&repo_ids, yes, dry_run),
+                with_target,
+            } => run_cache_delete(&repo_ids, yes, dry_run, with_target),
             CacheCommands::Gc {
                 older_than,
                 max_size,
@@ -3573,6 +3586,28 @@ fn resolve_index(
         })
 }
 
+/// Resolves `status`'s repo argument: a numeric `du` index becomes the cached
+/// model it names, and anything else is taken as the repo ID it is.
+///
+/// `status` asks the Hub about the repo, so a name that is not cached must
+/// still pass through (a first look at a repo is what it is for); only an
+/// index needs the cache. The resolved ID goes to stderr, so `--json` output
+/// stays clean.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidArgument`] if the index is out of range or
+/// names a dataset or Space.
+fn resolve_status_arg(arg: &str) -> Result<String, FetchError> {
+    if arg.parse::<usize>().is_err() {
+        // BORROW: explicit .to_owned() for &str → owned String
+        return Ok(arg.to_owned());
+    }
+    let repo_id = resolve_du_arg(arg)?;
+    eprintln!("  index {arg} is {repo_id}  (as listed by the last `du`)");
+    Ok(repo_id)
+}
+
 /// Resolves an argument to a cached *model's* repo ID, for the commands that
 /// work on models only (`cache path`, `cache verify`, `cache clean-partial`).
 ///
@@ -3768,6 +3803,73 @@ fn print_duplicate_verification(v: &DuplicateVerification) {
     }
 }
 
+/// The marker `du` prints after the row of a relocated repo: an arrow and the
+/// directory its cache entry links to, or nothing for an ordinary repo.
+fn relocation_marker(relocated_to: Option<&Path>) -> String {
+    relocated_to.map_or_else(String::new, |target| {
+        format!("  \u{2192} {}", target.display())
+    })
+}
+
+/// Prints the line that tells a relocated repo's drill-down where its bytes
+/// are, when its cache entry is a link.
+fn print_relocation(address: &str, relocated_to: Option<&Path>) {
+    let Some(target) = relocated_to else {
+        return;
+    };
+    let volume = target
+        .canonicalize()
+        .ok()
+        .and_then(|t| cache::volume_label(&t))
+        .map_or_else(String::new, |v| format!(" (volume {v})"));
+    println!(
+        "  Relocated: {address} is a link to {}{volume}\n",
+        target.display()
+    );
+}
+
+/// Bytes on disk by volume, largest first, when the cache's bytes sit on more
+/// than one: the cache directory's own volume, and the volumes its relocated
+/// repos were moved to. `None` when there is one volume, or no label for it.
+///
+/// `repos` yields each repo's total, the part of it in the shared blob store
+/// and, for a relocated repo, the directory it lives in. The shared store
+/// stays on the cache's volume, so a relocated repo's own bytes move to its
+/// target's volume and the rest of the arithmetic is `cache_bytes_on_disk`'s.
+fn volume_totals<'a>(
+    repos: impl Iterator<Item = (u64, u64, Option<&'a Path>)>,
+    store: u64,
+    cache_dir: &Path,
+) -> Option<Vec<(String, u64)>> {
+    let home = cache::volume_label(&std::fs::canonicalize(cache_dir).ok()?)?;
+    let mut by_volume: BTreeMap<String, u64> = BTreeMap::new();
+    by_volume.insert(home.clone(), store); // BORROW: explicit .clone() for owned String key
+    for (total, shared, relocated_to) in repos {
+        let volume = relocated_to
+            .and_then(|target| target.canonicalize().ok())
+            .and_then(|target| cache::volume_label(&target))
+            // BORROW: explicit .clone() for owned String
+            .unwrap_or_else(|| home.clone());
+        let slot = by_volume.entry(volume).or_default();
+        *slot = slot.saturating_add(total.saturating_sub(shared));
+    }
+    if by_volume.len() < 2 {
+        return None;
+    }
+    let mut totals: Vec<(String, u64)> = by_volume.into_iter().collect();
+    totals.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
+    Some(totals)
+}
+
+/// Prints `By volume: C: 640.12 GiB · D: 123.10 GiB` for [`volume_totals`].
+fn print_volume_totals(volumes: &[(String, u64)]) {
+    let cells: Vec<String> = volumes
+        .iter()
+        .map(|(volume, bytes)| format!("{volume} {}", format_size(*bytes)))
+        .collect();
+    println!("  By volume: {}", cells.join(" \u{b7} "));
+}
+
 /// Prints the line that names the duplicated copies, when there are any.
 ///
 /// Shared by `du`'s footer and the `cache gc` preview, which print the same
@@ -3826,8 +3928,16 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
         None
     };
 
+    let volumes = volume_totals(
+        summaries
+            .iter()
+            .map(|s| (s.total_size, s.shared_size, s.relocated_to.as_deref())),
+        store,
+        &cache_dir,
+    );
+
     if json {
-        return print_du_json(&summaries, store, &cache_dir, verification);
+        return print_du_json(&summaries, store, &cache_dir, verification, volumes);
     }
 
     println!("Cache: {}\n", cache_dir.display());
@@ -3926,8 +4036,10 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
             String::new()
         };
 
+        let relocated = relocation_marker(s.relocated_to.as_deref());
+
         println!(
-            "  {rank:>iw$}  {size_cell:>sw$}{dup_part}  {address:<repo_width$} {:>fw$}{age_part}{partial_marker}",
+            "  {rank:>iw$}  {size_cell:>sw$}{dup_part}  {address:<repo_width$} {:>fw$}{age_part}{partial_marker}{relocated}",
             s.file_count,
         );
     }
@@ -3955,9 +4067,15 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
         total_files,
         pluralize(total_files, "file", "files"),
     );
+    if let Some(volumes) = &volumes {
+        print_volume_totals(volumes);
+    }
     print_duplicate_footer(total_dup, dup_repos, total_size);
     if any_partial {
         println!("  \u{25cf} = partial downloads");
+    }
+    if summaries.iter().any(|s| s.relocated_to.is_some()) {
+        println!("  \u{2192} = relocated: the repo's directory is a link to where its bytes are");
     }
     if any_quant_alternatives {
         println!(
@@ -4011,6 +4129,7 @@ fn run_du_repo(
     let has_partial = cache::repo_has_partial_in(repo_type, repo_id)?;
     let usage = cache::repo_usage_in(repo_type, repo_id)?;
     let disk_bytes = usage.total_size;
+    let relocated = cache::repo_relocated_to(repo_type, repo_id)?;
     let verification = if verify && usage.duplicated_bytes > 0 {
         Some(verify_repo_duplicates(&[(
             repo_type,
@@ -4036,6 +4155,7 @@ fn run_du_repo(
     println!("Cache: {}\n", cache_dir.display());
 
     if files.is_empty() {
+        print_relocation(&address, relocated.as_deref());
         if disk_bytes == 0 {
             println!("No cached files found for {address}.");
         } else {
@@ -4055,6 +4175,7 @@ fn run_du_repo(
     }
 
     println!("  {address}:\n");
+    print_relocation(&address, relocated.as_deref());
     let fw = files
         .iter()
         .map(|f| f.filename.len())
@@ -4246,6 +4367,10 @@ struct DuRepoJson {
     /// blob, as `hf-hub` writes on Windows (new in v0.12.5). `0` when there
     /// are none.
     duplicated_bytes: u64,
+    /// Where the repo's bytes live, when its cache entry is a link to another
+    /// directory (new in v0.12.5). Omitted for an ordinary repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relocated_to: Option<String>,
     /// Number of files listed across the repo's snapshots.
     file_count: usize,
     /// Whether the repo holds a partial download's temp file (`.chunked.part`,
@@ -4296,6 +4421,11 @@ struct DuJson {
     /// What `--verify-duplicates` found; absent without the flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     verification: Option<DuplicateVerification>,
+    /// Bytes on disk by volume (a drive letter on Windows), present only when
+    /// the cache's bytes sit on more than one, as after a repo was moved to
+    /// another disk behind a link (new in v0.12.5). Sums to `total_bytes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_bytes: Option<BTreeMap<String, u64>>,
 }
 
 /// Top-level shape for `du <repo> --json` (per-file drill-down).
@@ -4322,6 +4452,10 @@ struct DuRepoDetailJson {
     /// `hf-hub` writes on Windows, and larger where symlinked entries share
     /// one blob, as across several cached revisions.
     listed_bytes: u64,
+    /// Where the repo's bytes live, when its cache entry is a link to another
+    /// directory (new in v0.12.5). Omitted for an ordinary repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relocated_to: Option<String>,
     /// Bytes of blobs that a snapshot file also holds as a separate copy
     /// (new in v0.12.5); part of `total_bytes`.
     duplicated_bytes: u64,
@@ -4366,6 +4500,7 @@ fn print_du_json(
     store: u64,
     cache_dir: &std::path::Path,
     verification: Option<DuplicateVerification>,
+    volumes: Option<Vec<(String, u64)>>,
 ) -> Result<(), FetchError> {
     let mut total_files: usize = 0;
     let mut duplicated_bytes: u64 = 0;
@@ -4381,6 +4516,7 @@ fn print_du_json(
             size: s.total_size,
             shared_bytes: (s.shared_size > 0).then_some(s.shared_size),
             duplicated_bytes: s.duplicated_bytes,
+            relocated_to: s.relocated_to.as_ref().map(|t| t.display().to_string()),
             file_count: s.file_count,
             has_partial: s.has_partial,
             last_modified: system_time_to_unix(s.last_modified),
@@ -4403,6 +4539,7 @@ fn print_du_json(
         total_files,
         shared_store_bytes: (store > 0).then_some(store),
         verification,
+        volume_bytes: volumes.map(|v| v.into_iter().collect()),
     };
     emit_json(&result)
 }
@@ -4436,6 +4573,7 @@ fn print_du_tree_json(
             size: r.total_size,
             shared_bytes: (r.shared_size > 0).then_some(r.shared_size),
             duplicated_bytes: r.duplicated_bytes,
+            relocated_to: r.relocated_to.as_ref().map(|t| t.display().to_string()),
             file_count: r.file_count,
             has_partial: r.has_partial,
             last_modified: system_time_to_unix(r.last_modified),
@@ -4458,6 +4596,14 @@ fn print_du_tree_json(
         total_files,
         shared_store_bytes: (store > 0).then_some(store),
         verification: None,
+        volume_bytes: volume_totals(
+            repos
+                .iter()
+                .map(|r| (r.total_size, r.shared_size, r.relocated_to.as_deref())),
+            store,
+            cache_dir,
+        )
+        .map(|v| v.into_iter().collect()),
     };
     emit_json(&result)
 }
@@ -4507,6 +4653,8 @@ fn print_du_repo_json(
         total_bytes: usage.total_size,
         listed_bytes,
         duplicated_bytes: usage.duplicated_bytes,
+        relocated_to: cache::repo_relocated_to(repo_type, repo_id)?
+            .map(|t| t.display().to_string()),
         orphan_blob_bytes: usage.orphan_blob_bytes,
         partial_bytes: usage.partial_bytes,
         bookkeeping_bytes: usage.bookkeeping_bytes,
@@ -4599,6 +4747,9 @@ struct CacheTreeRepo {
     /// Bytes of the repo that are duplicated copies, from
     /// [`cache::CachedModelSummary::duplicated_bytes`].
     duplicated_bytes: u64,
+    /// Where the repo's bytes live when its cache entry is a link, from
+    /// [`cache::CachedModelSummary::relocated_to`].
+    relocated_to: Option<PathBuf>,
     /// Bytes the repo occupies on disk, from
     /// [`cache::CachedModelSummary::total_size`]: every physical file in
     /// the repo's directory, counted once, plus the shared-store payloads it
@@ -4654,6 +4805,7 @@ fn build_cache_tree() -> Result<Vec<CacheTreeRepo>, FetchError> {
             repo_id: s.repo_id,
             repo_type: s.repo_type,
             duplicated_bytes: s.duplicated_bytes,
+            relocated_to: s.relocated_to,
             total_size: s.total_size,
             shared_size: s.shared_size,
             file_count: s.file_count,
@@ -4836,6 +4988,7 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
     let size_str = format_repo_size_cell(repo.total_size, repo.gguf_size_range);
     let files_str = format_file_count(repo.file_count);
     let partial_marker = if repo.has_partial { "  \u{25cf}" } else { "" };
+    let relocated = relocation_marker(repo.relocated_to.as_deref());
 
     // `widths.repo >= repo_id.len()` and `widths.size >= size_str.len()` by
     // construction, so the saturating_subs are defensive, not load-bearing.
@@ -4850,7 +5003,7 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
             .last_modified
             .map_or_else(|| "\u{2014}".to_owned(), format_age);
         println!(
-            "  {connector}{repo}{leader}{size}  {files:<fw$}  {age_str:<aw$}{partial_marker}",
+            "  {connector}{repo}{leader}{size}  {files:<fw$}  {age_str:<aw$}{partial_marker}{relocated}",
             repo = repo.address,
             size = size_str,
             files = files_str,
@@ -4859,7 +5012,7 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
         );
     } else {
         println!(
-            "  {connector}{repo}{leader}{size}  {files}{partial_marker}",
+            "  {connector}{repo}{leader}{size}  {files}{partial_marker}{relocated}",
             repo = repo.address,
             size = size_str,
             files = files_str,
@@ -4939,9 +5092,21 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
         total_files,
         pluralize(total_files, "file", "files"),
     );
+    if let Some(volumes) = volume_totals(
+        repos
+            .iter()
+            .map(|r| (r.total_size, r.shared_size, r.relocated_to.as_deref())),
+        store,
+        &cache_dir,
+    ) {
+        print_volume_totals(&volumes);
+    }
     print_duplicate_footer(total_dup, dup_repos, total_size);
     if any_partial {
         println!("  \u{25cf} = partial downloads");
+    }
+    if repos.iter().any(|r| r.relocated_to.is_some()) {
+        println!("  \u{2192} = relocated: the repo's directory is a link to where its bytes are");
     }
     if any_quant_alternatives {
         println!(
@@ -5072,49 +5237,95 @@ fn run_cache_clean_partial(
     Ok(())
 }
 
-/// Removes a cached repo by deleting its `<type>--org--name/` directory.
+/// Removes a cache link (a symlink, or a Windows junction) without touching
+/// what it points at.
+///
+/// A directory link is removed as a directory on Windows, whichever kind it
+/// is, and as a file on Unix; neither follows it.
+fn remove_cache_link(link: &Path) -> Result<(), FetchError> {
+    let removed = if cfg!(windows) {
+        std::fs::remove_dir(link)
+    } else {
+        std::fs::remove_file(link)
+    };
+    removed.map_err(|e| FetchError::Io {
+        // BORROW: explicit .to_path_buf() for owned PathBuf
+        path: link.to_path_buf(),
+        source: e,
+    })
+}
+
+/// Removes a cached repo from the cache: its `<type>--org--name/` directory,
+/// or, when that entry is a link to a directory elsewhere (a repo moved to
+/// another disk), the link alone.
 ///
 /// Low-level helper shared by `run_cache_delete` and `run_cache_gc`. Caller
-/// owns any preview/prompt rendering. The function refuses to follow
-/// symlinks (HF cache repos are always real directories) so a malicious or
-/// accidental symlink can't redirect deletion outside the cache.
+/// owns any preview/prompt rendering. A link is never followed: deleting a
+/// relocated repo removes the link and leaves its bytes where they are, so a
+/// tampered cache cannot redirect a deletion. Only `with_target` goes on to
+/// delete the directory the link resolves to, and only when that directory is
+/// named like this repo's cache folder, so a link pointed at anything else
+/// cannot be used to remove it.
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::InvalidArgument`] when the repo is not cached or
-/// when its cache entry is a symlink. Returns [`FetchError::Io`] on
+/// Returns [`FetchError::InvalidArgument`] when the repo is not cached, or
+/// when `with_target` is set and the link does not resolve to a directory
+/// named like the repo's cache folder. Returns [`FetchError::Io`] on
 /// filesystem failure during removal.
-fn delete_repo_dir(repo_type: cache::RepoType, repo_id: &str) -> Result<(), FetchError> {
+fn delete_repo_dir(
+    repo_type: cache::RepoType,
+    repo_id: &str,
+    with_target: bool,
+) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
     let repo_dir = hf_fetch_model::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id);
     let address = repo_type.address(repo_id);
 
-    if !repo_dir.exists() {
-        return Err(FetchError::InvalidArgument(format!(
-            "{address} is not cached"
-        )));
+    // Not `exists()`, which follows a link: a link whose target is gone is
+    // still a cache entry, and one that can be removed.
+    let meta = std::fs::symlink_metadata(&repo_dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FetchError::InvalidArgument(format!("{address} is not cached"))
+        } else {
+            FetchError::Io {
+                // BORROW: explicit .clone() for owned PathBuf
+                path: repo_dir.clone(),
+                source: e,
+            }
+        }
+    })?;
+
+    if !meta.file_type().is_symlink() {
+        return std::fs::remove_dir_all(&repo_dir).map_err(|e| FetchError::Io {
+            // BORROW: explicit .clone() for owned PathBuf
+            path: repo_dir.clone(),
+            source: e,
+        });
     }
 
-    // Defensive: refuse to follow symlinks. `remove_dir_all` on Unix follows
-    // symlinks and would delete the target, not the link — dangerous if the
-    // cache dir was tampered with.
-    let meta = std::fs::symlink_metadata(&repo_dir).map_err(|e| FetchError::Io {
-        // BORROW: explicit .clone() for owned PathBuf
-        path: repo_dir.clone(),
-        source: e,
-    })?;
-    if meta.file_type().is_symlink() {
-        return Err(FetchError::InvalidArgument(format!(
-            "{address} cache entry is a symlink; refusing to delete"
-        )));
+    // A link: `remove_dir_all` on Unix would follow it and delete the target.
+    if with_target {
+        let target = std::fs::canonicalize(&repo_dir).map_err(|e| FetchError::Io {
+            // BORROW: explicit .clone() for owned PathBuf
+            path: repo_dir.clone(),
+            source: e,
+        })?;
+        let folder = hf_fetch_model::cache_layout::repo_folder_name_for(repo_type, repo_id);
+        if target.file_name().and_then(std::ffi::OsStr::to_str) != Some(folder.as_str()) {
+            return Err(FetchError::InvalidArgument(format!(
+                "{address} links to {} (not a directory named {folder}); refusing to delete it",
+                target.display()
+            )));
+        }
+        // `canonicalize` has resolved every link on the way, so this is the
+        // real directory, and `remove_dir_all` does not follow links inside it.
+        std::fs::remove_dir_all(&target).map_err(|e| FetchError::Io {
+            path: target,
+            source: e,
+        })?;
     }
-
-    std::fs::remove_dir_all(&repo_dir).map_err(|e| FetchError::Io {
-        // BORROW: explicit .clone() for owned PathBuf
-        path: repo_dir.clone(),
-        source: e,
-    })?;
-    Ok(())
+    remove_cache_link(&repo_dir)
 }
 
 /// One repo that `cache delete` has resolved from an argument and checked.
@@ -5125,6 +5336,12 @@ struct DeleteTarget {
     repo_id: String,
     /// Its footprint, for the preview and the figure it frees.
     usage: cache::RepoUsage,
+    /// Where its bytes live, when its cache entry is a link to another
+    /// directory.
+    relocated_to: Option<PathBuf>,
+    /// Whether deleting it removes the link and leaves its bytes: a relocated
+    /// repo, without `--with-target`.
+    link_only: bool,
 }
 
 impl DeleteTarget {
@@ -5133,9 +5350,14 @@ impl DeleteTarget {
         self.repo_type.address(self.repo_id.as_str())
     }
 
-    /// Bytes deleting the repo frees: its links into `huggingface_hub`'s
-    /// shared blob store go, the payloads they point to stay.
+    /// Bytes deleting the repo frees from the cache: its links into
+    /// `huggingface_hub`'s shared blob store go, the payloads they point to
+    /// stay; and a relocated repo's bytes are not in the cache, so deleting
+    /// only its link frees none of them.
     fn freed(&self) -> u64 {
+        if self.link_only {
+            return 0;
+        }
         self.usage.total_size.saturating_sub(self.usage.shared_size)
     }
 }
@@ -5155,7 +5377,10 @@ impl DeleteTarget {
 /// (see [`resolve_repo_arg`]) or names a repo that is not cached, and
 /// [`FetchError::Io`] when the cache cannot be read. Nothing has been
 /// deleted by then.
-fn resolve_delete_targets(args: &[String]) -> Result<Vec<DeleteTarget>, FetchError> {
+fn resolve_delete_targets(
+    args: &[String],
+    with_target: bool,
+) -> Result<Vec<DeleteTarget>, FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
     let mut targets: Vec<DeleteTarget> = Vec::with_capacity(args.len());
     // The listing behind an index is computed once, however many are given.
@@ -5187,7 +5412,9 @@ fn resolve_delete_targets(args: &[String]) -> Result<Vec<DeleteTarget>, FetchErr
         }
         let repo_dir =
             hf_fetch_model::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id.as_str());
-        if !repo_dir.exists() {
+        // `symlink_metadata`, not `exists()`: a link to a vanished target is
+        // still a cache entry, and one that `cache delete` can remove.
+        if std::fs::symlink_metadata(&repo_dir).is_err() {
             return Err(FetchError::InvalidArgument(format!(
                 "{} is not cached",
                 repo_type.address(repo_id.as_str())
@@ -5195,13 +5422,53 @@ fn resolve_delete_targets(args: &[String]) -> Result<Vec<DeleteTarget>, FetchErr
         }
         // Targeted scan, not the full cache.
         let usage = cache::repo_usage_in(repo_type, repo_id.as_str())?;
+        let relocated_to = cache::relocated_target(&repo_dir);
+        let link_only = relocated_to.is_some() && !with_target;
         targets.push(DeleteTarget {
             repo_type,
             repo_id,
             usage,
+            relocated_to,
+            link_only,
         });
     }
     Ok(targets)
+}
+
+/// Prints one `cache delete` target's preview: its size and file count, what
+/// stays in the shared blob store, and, for a relocated repo, what happens to
+/// the bytes behind its link.
+fn print_delete_preview(t: &DeleteTarget) {
+    println!(
+        "  {}  ({}, {} {}){}",
+        t.address(),
+        format_size(t.usage.total_size),
+        t.usage.file_count,
+        pluralize(t.usage.file_count, "file", "files"),
+        relocation_marker(t.relocated_to.as_deref()),
+    );
+    if let Some(target) = &t.relocated_to {
+        if t.link_only {
+            println!(
+                "  Only the link is removed: its {} stay at {}. `--with-target` deletes them too.",
+                format_size(t.usage.total_size),
+                target.display()
+            );
+        } else {
+            println!(
+                "  The link and the {} at {} are deleted (`--with-target`).",
+                format_size(t.usage.total_size),
+                target.display()
+            );
+        }
+    }
+    if t.usage.shared_size > 0 {
+        println!(
+            "  {} of it is in huggingface_hub's shared blob store and stays \
+             there; `hf cache prune` reclaims what no repo links to.",
+            format_size(t.usage.shared_size)
+        );
+    }
 }
 
 /// Deletes cached repos by repo ID or `du` index.
@@ -5212,11 +5479,21 @@ fn resolve_delete_targets(args: &[String]) -> Result<Vec<DeleteTarget>, FetchErr
 /// and deletes. A deletion that fails does not stop the others; the command
 /// fails at the end if any did.
 ///
+/// A relocated repo (its cache entry is a link to a directory elsewhere) loses
+/// the link only, unless `with_target`, which also deletes the bytes behind
+/// it. That is the one deletion `--yes` does not confirm: it always asks, with
+/// the paths in front of the user.
+///
 /// # Errors
 ///
 /// Returns the errors of [`resolve_delete_targets`], or
 /// [`FetchError::InvalidArgument`] when one or more deletions fail.
-fn run_cache_delete(args: &[String], yes: bool, dry_run: bool) -> Result<(), FetchError> {
+fn run_cache_delete(
+    args: &[String],
+    yes: bool,
+    dry_run: bool,
+    with_target: bool,
+) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
 
     if !cache_dir.exists() {
@@ -5224,23 +5501,10 @@ fn run_cache_delete(args: &[String], yes: bool, dry_run: bool) -> Result<(), Fet
         return Ok(());
     }
 
-    let targets = resolve_delete_targets(args)?;
+    let targets = resolve_delete_targets(args, with_target)?;
 
     for t in &targets {
-        println!(
-            "  {}  ({}, {} {})",
-            t.address(),
-            format_size(t.usage.total_size),
-            t.usage.file_count,
-            pluralize(t.usage.file_count, "file", "files")
-        );
-        if t.usage.shared_size > 0 {
-            println!(
-                "  {} of it is in huggingface_hub's shared blob store and stays \
-                 there; `hf cache prune` reclaims what no repo links to.",
-                format_size(t.usage.shared_size)
-            );
-        }
+        print_delete_preview(t);
     }
     let total_freed = targets
         .iter()
@@ -5257,16 +5521,27 @@ fn run_cache_delete(args: &[String], yes: bool, dry_run: bool) -> Result<(), Fet
         return Ok(());
     }
 
-    let prompt = if count == 1 {
-        "  Delete? [y/N]".to_owned()
+    // Deleting the bytes behind a link is never confirmed by `--yes` alone.
+    let deletes_behind_links = targets
+        .iter()
+        .any(|t| t.relocated_to.is_some() && !t.link_only);
+    let confirmed = if deletes_behind_links {
+        confirm_prompt("  Delete the links and the bytes at the paths above? [y/N]")
+    } else if yes {
+        true
+    } else if count == 1 {
+        confirm_prompt("  Delete? [y/N]")
     } else {
-        format!(
-            "  Delete {count} {repo_word}, freeing {}? [y/N]",
-            format_size(total_freed)
+        // BORROW: explicit .as_str() instead of Deref coercion
+        confirm_prompt(
+            format!(
+                "  Delete {count} {repo_word}, freeing {}? [y/N]",
+                format_size(total_freed)
+            )
+            .as_str(),
         )
     };
-    // BORROW: explicit .as_str() instead of Deref coercion
-    if !yes && !confirm_prompt(prompt.as_str()) {
+    if !confirmed {
         println!("  Aborted.");
         return Ok(());
     }
@@ -5275,7 +5550,7 @@ fn run_cache_delete(args: &[String], yes: bool, dry_run: bool) -> Result<(), Fet
     let mut failures: usize = 0;
     for t in &targets {
         // BORROW: explicit .as_str() instead of Deref coercion
-        match delete_repo_dir(t.repo_type, t.repo_id.as_str()) {
+        match delete_repo_dir(t.repo_type, t.repo_id.as_str(), with_target) {
             Ok(()) if count == 1 => {
                 freed = freed.saturating_add(t.freed());
                 println!("  Deleted. Freed {}.", format_size(t.freed()));
@@ -5606,6 +5881,10 @@ struct GcPlan {
     /// Repos skipped because of an active partial download (see
     /// [`FRESH_PARTIAL_WINDOW_SECS`]).
     skipped_partials: Vec<EvictionEntry>,
+    /// Repos skipped because their cache entry is a link to another
+    /// directory: their bytes are not in the cache's volume, so evicting one
+    /// would free nothing there.
+    skipped_relocated: Vec<EvictionEntry>,
     /// Total cache size before gc, in bytes.
     size_before: u64,
     /// Total cache size after gc, in bytes (computed).
@@ -5662,7 +5941,8 @@ fn select_age_evictions(
 ///
 /// Algorithm:
 /// 1. Partition `summaries` into `protected` (in `criteria.except`),
-///    `skipped_partials` (active in-flight downloads), and `eligible`.
+///    `skipped_partials` (active in-flight downloads), `skipped_relocated`
+///    (repos moved behind a link), and `eligible`.
 /// 2. Apply age eviction over `eligible` → preliminary evict set.
 /// 3. If `criteria.max_size` is set and the post-step-2 cache is still
 ///    over budget, sort the remaining eligible by `(last_modified,
@@ -5696,10 +5976,15 @@ fn compute_gc_plan(
     // Step 1: partition.
     let mut protected: Vec<EvictionEntry> = Vec::new();
     let mut skipped_partials: Vec<EvictionEntry> = Vec::new();
+    let mut skipped_relocated: Vec<EvictionEntry> = Vec::new();
     let mut eligible: Vec<&cache::CachedModelSummary> = Vec::new();
     for s in summaries {
         if criteria.except.contains(s.repo_id.as_str()) {
             protected.push(EvictionEntry::from(s));
+            continue;
+        }
+        if s.relocated_to.is_some() {
+            skipped_relocated.push(EvictionEntry::from(s));
             continue;
         }
         // Judged by the partial's own mtime: `last_modified` is the age of
@@ -5785,6 +6070,7 @@ fn compute_gc_plan(
         protected,
         kept,
         skipped_partials,
+        skipped_relocated,
         size_before,
         size_after,
         budget_shortfall,
@@ -5831,6 +6117,14 @@ fn render_gc_plan_preview(plan: &GcPlan, notes: &GcCacheNotes) {
         println!("Skipped (active partial downloads):");
         for entry in &plan.skipped_partials {
             println!("  {}", entry.repo_id);
+        }
+        println!();
+    }
+
+    if !plan.skipped_relocated.is_empty() {
+        println!("Skipped (relocated behind a link; evicting them frees nothing here):");
+        for entry in &plan.skipped_relocated {
+            println!("  {}  {}", entry.repo_id, format_size(entry.size));
         }
         println!();
     }
@@ -6001,6 +6295,15 @@ fn run_cache_gc(
         );
     }
 
+    if !plan.skipped_relocated.is_empty() {
+        let n = plan.skipped_relocated.len();
+        eprintln!(
+            "note: {n} relocated {} skipped (the bytes are behind a link, not in this cache); \
+             `hf-fm cache delete` removes one",
+            pluralize(n, "repo", "repos")
+        );
+    }
+
     if plan.evict.is_empty() {
         println!("No repos matched eviction criteria.");
         return Ok(());
@@ -6021,7 +6324,7 @@ fn run_cache_gc(
     let mut freed: u64 = 0;
     for entry in &plan.evict {
         // BORROW: explicit .as_str() for owned String → &str argument.
-        match delete_repo_dir(cache::RepoType::Model, entry.repo_id.as_str()) {
+        match delete_repo_dir(cache::RepoType::Model, entry.repo_id.as_str(), false) {
             Ok(()) => freed = freed.saturating_add(entry.size),
             Err(e) => {
                 eprintln!("error: failed to delete {}: {e}", entry.repo_id);
@@ -12104,6 +12407,7 @@ mod tests {
             gguf_size_range: None,
             repo_type: cache::RepoType::Model,
             duplicated_bytes: 0,
+            relocated_to: None,
         }
     }
 
@@ -12171,6 +12475,95 @@ mod tests {
             max_size: None,
             except: HashSet::new(),
         }
+    }
+
+    /// A repo whose cache entry is a link to another directory is never
+    /// evicted, by age or by budget: its bytes are not here to free.
+    #[test]
+    fn compute_gc_plan_skips_a_relocated_repo() {
+        let now = fixed_now();
+        let mut moved = make_summary(
+            "old/moved",
+            5_000,
+            Some(now - Duration::from_secs(86_400 * 60)),
+            false,
+        );
+        moved.relocated_to = Some(PathBuf::from("elsewhere/models--old--moved"));
+        let summaries = [
+            moved,
+            make_summary(
+                "old/here",
+                1_000,
+                Some(now - Duration::from_secs(86_400 * 60)),
+                false,
+            ),
+        ];
+        let mut crit = empty_criteria();
+        crit.older_than_secs = Some(86_400 * 30);
+        crit.max_size = Some(1);
+        let plan = compute_gc_plan(&summaries, &crit, now, false, 0);
+
+        let evicted: Vec<&str> = plan.evict.iter().map(|e| e.repo_id.as_str()).collect();
+        assert_eq!(evicted, ["old/here"]);
+        let skipped: Vec<&str> = plan
+            .skipped_relocated
+            .iter()
+            .map(|e| e.repo_id.as_str())
+            .collect();
+        assert_eq!(skipped, ["old/moved"]);
+        assert_eq!(
+            plan.size_before, 6_000,
+            "it still counts in the cache's size"
+        );
+    }
+
+    #[test]
+    fn resolve_index_is_one_based_and_bounded_by_the_listing() {
+        let summaries = [
+            make_summary("org/first", 3, None, false),
+            make_summary("org/second", 2, None, false),
+        ];
+
+        assert_eq!(
+            resolve_index(1, &summaries).unwrap(),
+            (cache::RepoType::Model, "org/first".to_owned())
+        );
+        assert_eq!(
+            resolve_index(2, &summaries).unwrap().1,
+            "org/second".to_owned()
+        );
+        for n in [0, 3] {
+            let err = resolve_index(n, &summaries).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("index {n} is out of range (cache has 2 repos")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn volume_totals_split_a_relocated_repos_own_bytes_from_the_cache_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("hub");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // One volume: nothing to split, whatever the repos are.
+        let plain = [(100_u64, 0_u64, None), (50, 10, None)];
+        assert_eq!(
+            volume_totals(plain.iter().copied(), 7, &cache_dir),
+            None,
+            "a cache on one volume prints no per-volume line"
+        );
+
+        // A relocated repo on another volume is only checkable where one
+        // exists; the bookkeeping that is not is covered above.
+        let same_volume_target = tmp.path();
+        let linked = [(100_u64, 0_u64, Some(same_volume_target))];
+        assert_eq!(
+            volume_totals(linked.iter().copied(), 0, &cache_dir),
+            None,
+            "a relocated repo on the cache's own volume does not split it"
+        );
     }
 
     #[test]

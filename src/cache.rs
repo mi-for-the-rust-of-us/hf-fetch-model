@@ -620,6 +620,11 @@ pub struct CachedModelSummary {
     /// stores twice on Windows. See [`RepoUsage::duplicated_bytes`] for how a
     /// copy is recognised. `0` where the pointers are symlinks or hard links.
     pub duplicated_bytes: u64,
+    /// Where the repo's bytes really live, when its cache entry is a symlink
+    /// or a Windows junction to another directory, as when it was moved to
+    /// another disk (new in v0.12.5). `None` for an ordinary directory. See
+    /// [`relocated_target`].
+    pub relocated_to: Option<PathBuf>,
 }
 
 /// Scans the entire HF cache and returns a summary for each cached model.
@@ -650,6 +655,73 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
 /// Returns [`FetchError::Io`] if the cache directory cannot be read.
 pub fn cache_summary_all() -> Result<Vec<CachedModelSummary>, FetchError> {
     summarize_repos(&RepoType::ALL)
+}
+
+/// Where a repo's bytes really live, when `repo_dir` is a symlink or a
+/// Windows junction instead of a directory (new in v0.12.5).
+///
+/// That is what a repo looks like after it was moved to another disk and
+/// linked back, to keep one cache. Every size this module reports follows the
+/// link, so the repo counts as cache usage wherever its bytes are; this
+/// says where they are. `None` for an ordinary directory, or a path that does
+/// not exist. A link that no longer resolves reports the target it names.
+#[must_use]
+pub fn relocated_target(repo_dir: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(repo_dir).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let target = std::fs::canonicalize(repo_dir)
+        .or_else(|_| std::fs::read_link(repo_dir))
+        .unwrap_or_else(|_| repo_dir.to_path_buf());
+    Some(strip_verbatim_prefix(target))
+}
+
+/// Drops the `\\?\` that Windows' `canonicalize` puts before a drive path, so
+/// the path prints as a user typed it. A UNC path keeps its prefix.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    // BORROW: explicit .to_string_lossy() for Path → str conversion
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+/// The disk a path lives on, as a short label for a per-volume total: a drive
+/// letter on Windows (`D:`), the device number on Unix (`device 2049`) (new
+/// in v0.12.5).
+///
+/// `path` should be absolute and canonical, as [`relocated_target`] returns
+/// it. `None` when the platform has no such label or the path cannot be read.
+#[must_use]
+pub fn volume_label(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        // A path with no prefix (a relative one) names no volume.
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return None;
+        };
+        if let Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) = prefix.kind() {
+            return Some(format!("{}:", char::from(letter).to_ascii_uppercase()));
+        }
+        // A network share or a device namespace: its own prefix is the label.
+        // BORROW: explicit .to_string_lossy() for OsStr → str conversion
+        Some(prefix.as_os_str().to_string_lossy().into_owned())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| format!("device {}", meta.dev()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Walks every cached repo whose type is in `repo_types` and summarises it.
@@ -704,6 +776,7 @@ fn summarize_repos_in(
             duplicated_bytes,
             ..
         } = walk_repo_files(&repo_dir);
+        let relocated_to = relocated_target(&repo_dir);
         let file_count = cached_files.len();
         // BORROW: explicit .as_str() instead of Deref coercion
         let sized: Vec<(&str, Option<u64>)> = cached_files
@@ -734,6 +807,7 @@ fn summarize_repos_in(
             gguf_size_range,
             repo_type,
             duplicated_bytes,
+            relocated_to,
         });
     }
 
@@ -747,6 +821,22 @@ fn summarize_repos_in(
     });
 
     Ok(summaries)
+}
+
+/// Like [`relocated_target`], for a repo of any type, addressed by ID (new in
+/// v0.12.5).
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+pub fn repo_relocated_to(
+    repo_type: RepoType,
+    repo_id: &str,
+) -> Result<Option<PathBuf>, FetchError> {
+    let cache_dir = hf_cache_dir()?;
+    Ok(relocated_target(&crate::cache_layout::repo_dir_for(
+        &cache_dir, repo_type, repo_id,
+    )))
 }
 
 /// Returns the snapshot file count and the physical bytes on disk for a
@@ -3302,5 +3392,115 @@ mod tests {
         );
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].repo_id, "org/m");
+    }
+
+    /// Links `link` to the directory `target` the way a repo is moved to
+    /// another disk and linked back: a directory symlink where the platform
+    /// allows one, and on Windows, whatever the privileges, a junction, which
+    /// needs none. Returns `false` when neither could be made.
+    fn try_dir_link(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    #[test]
+    fn relocated_target_is_none_for_an_ordinary_directory_and_a_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert_eq!(relocated_target(tmp.path()), None);
+        assert_eq!(relocated_target(&tmp.path().join("nope")), None);
+    }
+
+    /// A repo moved to another directory and linked back reports where its
+    /// bytes are, and every size still follows the link.
+    #[test]
+    fn a_linked_repo_reports_its_target_and_keeps_its_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("hub");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&cache).unwrap();
+        let moved = elsewhere.join("models--org--moved");
+        let blobs = crate::cache_layout::blobs_dir(&moved);
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("e1"), vec![b'x'; 700]).unwrap();
+        if !try_dir_link(&moved, &cache.join("models--org--moved")) {
+            eprintln!("skipped: this platform refuses directory links");
+            return;
+        }
+
+        let summaries = summarize_repos_in(&cache, &[RepoType::Model]).unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].total_size, 700, "the size follows the link");
+        let target = summaries[0].relocated_to.clone().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&target).unwrap(),
+            std::fs::canonicalize(&moved).unwrap(),
+            "and the target is where the bytes are"
+        );
+        assert!(
+            !target.to_string_lossy().starts_with(r"\\?\"),
+            "printed as a user typed it, got {target:?}"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_drops_the_drive_prefix_only() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\D:\hf-cache\models--gpt2")),
+            PathBuf::from(r"D:\hf-cache\models--gpt2")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share")),
+            PathBuf::from(r"\\?\UNC\server\share"),
+            "a UNC path keeps its prefix"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from("/data/hub")),
+            PathBuf::from("/data/hub")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_label_is_the_drive_letter_however_the_path_is_spelled() {
+        assert_eq!(
+            volume_label(Path::new(r"D:\hf-cache")).as_deref(),
+            Some("D:")
+        );
+        assert_eq!(volume_label(Path::new(r"c:\x")).as_deref(), Some("C:"));
+        assert_eq!(
+            volume_label(Path::new(r"\\?\E:\x\y")).as_deref(),
+            Some("E:")
+        );
+        assert_eq!(volume_label(Path::new("relative")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_label_names_one_device_for_paths_on_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+
+        let a = volume_label(tmp.path()).unwrap();
+        assert!(a.starts_with("device "), "got {a}");
+        assert_eq!(volume_label(&tmp.path().join("sub")), Some(a));
+        assert_eq!(volume_label(&tmp.path().join("missing")), None);
     }
 }
