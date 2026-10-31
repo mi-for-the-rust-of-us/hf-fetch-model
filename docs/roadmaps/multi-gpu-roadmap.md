@@ -6,7 +6,7 @@
 
 ---
 
-## v0.13.0 — Multi-GPU + multi-context `--check-gpu` matrix
+## v0.14.0 — Multi-GPU + multi-context `--check-gpu` matrix
 
 | Feature | Scope |
 |---------|-------|
@@ -19,9 +19,9 @@
 
 `hypomnesis` 0.2.15 gives both a firmer footing, without removing the need for hardware here: when `NVML` loads but cannot start, `device_info` and `Snapshot::all` now return the cause instead of reading as zero GPUs, `process_name` names a PID, and `hmn ps` shows which GPU each process is on. Upstream checked that on two multi-GPU Linux nodes (8× V100 and 2× H100 NVL under Slurm) and pins it in CI with a fake `NVML`. That is `hypomnesis` exercised on several devices, not hf-fm, so the hardware prerequisite below stands.
 
-**Theme: broaden `--check-gpu` from a single verdict to a matrix.** v0.10.1 introduced single-device, weights-only `--check-gpu`; v0.10.4 added KV-cache and hybrid-Mamba budgeting at a user-supplied context. v0.13.0 closes out the family: instead of one device × one context giving one verdict, the user can ask for all devices × a context-length sweep and read off a table. Deferred to v0.13.0 because both features want real multi-GPU hardware to validate (the iteration ordering, the auto-pick heuristic, and the per-GPU sweep all need an actual second device on the box).
+**Theme: broaden `--check-gpu` from a single verdict to a matrix.** v0.10.1 introduced single-device, weights-only `--check-gpu`; v0.10.4 added KV-cache and hybrid-Mamba budgeting at a user-supplied context. v0.14.0 closes out the family: instead of one device × one context giving one verdict, the user can ask for all devices × a context-length sweep and read off a table. Deferred to v0.14.0 because both features want real multi-GPU hardware to validate (the iteration ordering, the auto-pick heuristic, and the per-GPU sweep all need an actual second device on the box).
 
-**Why v0.13 and not v0.11.x or any v0.12.x.** The v0.11 line is dedicated to remote-inspect framework work (`HttpRangeReader` + format coverage) — stitching multi-GPU into v0.11 would dilute that focus. v0.12.0 was then claimed by backlog cleaning (in the [release plan](cache-management-roadmap.md)) rather than left idle while waiting on hardware, since none of that phase's six items need a second GPU either — and v0.12.1's quant-aware fit planning follows the same reasoning, surfaced by dogfooding after the v0.12.0 scope was already fixed. v0.12.2's disk-accounting follow-through needed no second GPU either, and v0.12.3's inspect API ergonomics need none. That keeps each boundary clean: *v0.11 = format reach, v0.12.0 = backlog cleaning, v0.12.1 = quant/fit-planning reach, v0.12.2 = honest disk accounting, v0.12.3 = inspect API ergonomics, v0.12.4 = the TLS advisories, v0.12.5 = `du` names the duplicates, v0.12.6 = `cache dedupe`, v0.13 = GPU reach* — and means v0.13.0 can slip freely against hardware availability without blocking anything else.
+**Why v0.14 and not v0.11.x or any v0.12.x.** The v0.11 line is dedicated to remote-inspect framework work (`HttpRangeReader` + format coverage) — stitching multi-GPU into v0.11 would dilute that focus. v0.12.0 was then claimed by backlog cleaning (in the [release plan](cache-management-roadmap.md)) rather than left idle while waiting on hardware, since none of that phase's six items need a second GPU either — and v0.12.1's quant-aware fit planning follows the same reasoning, surfaced by dogfooding after the v0.12.0 scope was already fixed. v0.12.2's disk-accounting follow-through needed no second GPU either, and v0.12.3's inspect API ergonomics need none. That keeps each boundary clean: *v0.11 = format reach, v0.12.0 = backlog cleaning, v0.12.1 = quant/fit-planning reach, v0.12.2 = honest disk accounting, v0.12.3 = inspect API ergonomics, v0.12.4 = the TLS advisories, v0.12.5 = `du` names the duplicates, v0.12.6 = `cache dedupe`, v0.13.0 = `cache move`, v0.14 = GPU reach* — and means v0.14.0 can slip freely against hardware availability without blocking anything else.
 
 **Hardware prerequisite.** Maintainer's box gains a second GPU (5050 8GiB alongside the 5060 Ti 16GiB) before this lands — the multi-GPU iteration ordering, the auto-pick heuristic, and the per-device sweep numbers all want a real second device to be exercised against, not a mock.
 
@@ -61,7 +61,7 @@
 
 3. *Power.* The slot supplies the standard PCIe 75 W. RTX 5050 8 GB TDP ≈ 130 W → needs an external 8-pin (or 6+2) PCIe power cable from the PSU. The 850 W PSU has ample cables.
 
-**Performance implications for the v0.13.0 pipeline-parallel use case.** For PP-style serving where the second GPU receives intermediate activations across a layer boundary:
+**Performance implications for the v0.14.0 pipeline-parallel use case.** For PP-style serving where the second GPU receives intermediate activations across a layer boundary:
 
 | Operation | Data per event | Time at PCIe 3.0 ×2 (~2 GB/s) | Acceptable? |
 |---|---|---|---|
@@ -77,4 +77,4 @@ For autoregressive inference the PCIe 3.0 ×2 wiring is fine. Prefill on long se
 1. *Chipset-link contention.* All chipset PCIe traffic shares one PCIe 4.0 ×4 link to the CPU (≈ 8 GB/s aggregate). Heavy concurrent M.2 SSD reads + GPU on PCIEX2 + USB traffic could in principle contend; for inference workloads this won't bite — 2 GB/s GPU + ≈ 1 GB/s M.2 reads at startup is well under the ceiling.
 2. *No BIOS configuration required.* §1 and §2 of the manual mention no disabling or sharing of PCIEX2 lanes. The slot is hardwired ×2 from the chipset regardless of which other slots are populated. Both GPUs will appear in `nvidia-smi` and in `hypomnesis::device_count()` automatically — which is exactly what `inspect --check-gpu all` needs.
 
-**Conclusion.** Hardware plan is viable for the v0.13.0 work. Only material risk before purchase is **physical clearance with the existing 5060 Ti's cooler** — measure first. PSU, power delivery, BIOS, and chipset routing are all fine.
+**Conclusion.** Hardware plan is viable for the v0.14.0 work. Only material risk before purchase is **physical clearance with the existing 5060 Ti's cooler** — measure first. PSU, power delivery, BIOS, and chipset routing are all fine.

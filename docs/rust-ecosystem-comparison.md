@@ -374,7 +374,7 @@ In June the question was whether hf-fm's `--check-gpu` had peers; in October the
   - `sift`: throughput estimates and a measured bits-per-weight;
   - `llmfit`: breadth (multi-vendor, multi-GPU, a model catalog) and by far the largest user base;
   - `mistral.rs`: the verdict wired straight into the engine that runs the model;
-  - hf-fm's multi-GPU sweep is planned for v0.13.0.
+  - hf-fm's multi-GPU sweep is planned for v0.14.0.
 
 ---
 
