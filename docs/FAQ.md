@@ -43,6 +43,7 @@ A living list of the questions we and our early users have actually run into. If
 - [Installation and authentication](#installation-and-authentication)
   - [How do I install it? What is the Minimum Rust Version?](#how-do-i-install-it-what-is-the-minimum-rust-version)
   - [How do I upgrade hf-fm? Why does `cargo install` silently keep the old version?](#how-do-i-upgrade-hf-fm-why-does-cargo-install-silently-keep-the-old-version)
+  - [Does hf-fm pin its TLS dependencies? How do I pick up a security fix as a library user?](#does-hf-fm-pin-its-tls-dependencies-how-do-i-pick-up-a-security-fix-as-a-library-user)
   - [Is the `hf-fm` binary code-signed? Why did my antivirus flag it?](#is-the-hf-fm-binary-code-signed-why-did-my-antivirus-flag-it)
   - [What is the `cli` feature and do I need it?](#what-is-the-cli-feature-and-do-i-need-it)
   - [How do I pass a HuggingFace token? Why does a gated model fail?](#how-do-i-pass-a-huggingface-token-why-does-a-gated-model-fail)
@@ -131,6 +132,14 @@ hf-fm --version
 ```
 
 Without `--force`, `cargo install` short-circuits whenever **any** version of the binary is already in `~/.cargo/bin/` — even when crates.io has a newer release. The "already installed" notice is logged to stderr at low priority and is easy to miss in a busy terminal: the install command exits `0`, looks like it succeeded, but the binary on `PATH` is unchanged. `--force` bypasses the short-circuit and always builds the latest. The companion note at [`docs/dogfooding-feedbacks/cargo-install-silent-skip.md`](dogfooding-feedbacks/cargo-install-silent-skip.md) captures the failure mode in full — including a reproduction recipe and the proposed `hf-fm --check-update` flag tracked as a future patch-release candidate.
+
+### Does hf-fm pin its TLS dependencies? How do I pick up a security fix as a library user?
+
+Since v0.12.4, `Cargo.toml` requires `rustls` 0.23.46 and `rustls-webpki` 0.103.16 directly, with default features off, so they add no code and no feature: they only set a floor that no dependency graph containing hf-fm can resolve below. That matters because Cargo never reads a dependency's `Cargo.lock`, so a library such as `candle-mi` can only be protected by a requirement, never by hf-fm's lockfile. A `cargo install` without `--locked` resolves fresh versions (the floors bound them from below); with `--locked` it uses the lockfile published with the crate. If your own lockfile is older than the floors, move it:
+
+```
+cargo update -p rustls -p rustls-webpki
+```
 
 ### Is the `hf-fm` binary code-signed? Why did my antivirus flag it?
 

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Floors on the TLS stack: `rustls` 0.23.46 and `rustls-webpki` 0.103.16.**
+  Two direct requirements in `Cargo.toml`, each with `default-features =
+  false`, so they enable nothing beyond what `reqwest` already selects and
+  no source file names either crate. Their only effect is that no
+  dependency graph containing hf-fm can resolve below them, which a
+  lockfile cannot do for a library consumer such as candle-mi: Cargo never
+  reads a dependency's `Cargo.lock`. `rustls` 0.23.46 fixes
+  RUSTSEC-2026-0346 to -0349; of those, -0349 (an unauthenticated
+  ServerHello downgrading a resuming client's later connections to classical
+  key exchange) applies to hf-fm, -0346 only if a session is formatted with
+  `{:?}`, and -0347 (ECH) and -0348 (Brotli certificate compression) not at
+  all, since neither feature is enabled. `rustls` 0.23.46 still accepts
+  `rustls-webpki` from 0.103.14, so the second floor is not redundant:
+  0.103.16 fixes RUSTSEC-2026-0382, certificate verification that may
+  accept distrusted intermediates, which reaches every connection hf-fm
+  makes. A library user whose lockfile is older runs `cargo update -p
+  rustls -p rustls-webpki`.
+- **Lockfile refreshed for three advisories no hf-fm build reaches.**
+  `quinn-proto` 0.11.16 -> 0.11.19 (RUSTSEC-2026-0338 to -0342; recorded in
+  `Cargo.lock` but in no graph hf-fm builds, which is why `cargo audit`,
+  which reads the lockfile, reported it and `cargo deny`, which walks the
+  graph, did not), `webpki-root-certs` 1.0.9 -> 1.0.11 (RUSTSEC-2026-0383; a
+  `wasm32`-only dependency of `rustls-platform-verifier`) and `tokio` 1.53.2
+  -> 1.54.1 (RUSTSEC-2026-0386, an `unsound` warning about `AsyncFd`, which
+  hf-fm does not use). Lockfile only, with no requirement, because there is
+  nothing to protect a consumer from.
+
+### Changed
+
+- **The `zip` dev-dependency is gone** (RUSTSEC-2026-0367 to -0369, fixed
+  only in `zip` 9). It served one test helper, `make_in_memory_npz`, which
+  now writes its `STORED` archive by hand, with the CRC-32 from `flate2::Crc`
+  (already a direct dependency); an archive from the new writer passes
+  Python's `zipfile.testzip()` and loads with `numpy.load`. Test-only: no
+  effect on the published crate or on the binary.
+
 ## [0.12.3] — Inspect API ergonomics and growing read-ahead
 
 ### Added

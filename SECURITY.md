@@ -91,6 +91,14 @@ Out of scope:
 - A `cargo audit` CI job that fails the build on any RUSTSEC advisory, a
   `cargo-deny` job that checks licences, banned crates and sources (crates.io
   only), and Dependabot for routine and security dependency updates.
+- Floors on the TLS stack: `Cargo.toml` requires `rustls` 0.23.46 and
+  `rustls-webpki` 0.103.16 directly, with no features and no code behind
+  them, so no dependency graph containing hf-fm can resolve a TLS stack with
+  the defects fixed there (RUSTSEC-2026-0346 to -0349 and -0382, the last
+  being certificate verification that may accept distrusted intermediates).
+  A lockfile alone would protect only the binary: Cargo never reads a
+  dependency's `Cargo.lock`, so a library consumer is reached by a
+  requirement or not at all.
 - `Cargo.lock` committed for reproducible builds; the release workflow
   packages and publishes with `--locked`, so a lockfile that disagrees with
   `Cargo.toml` stops the release.
