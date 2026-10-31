@@ -768,14 +768,26 @@ enum CacheCommands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Delete a cached model by repo ID or numeric index.
+    /// Delete cached repos by repo ID or numeric index.
+    ///
+    /// Every argument is resolved first, then the repos are deleted, so one
+    /// bad argument removes nothing. A numeric index is the `#` of the last
+    /// `du`, and shifts after each deletion; the repo each index resolved to
+    /// is printed, `--yes` or not. A dataset or Space is addressed behind
+    /// its Hub prefix (`datasets/org/name`).
     Delete {
-        /// Repository identifier or numeric index from `du` output.
-        repo_id: String,
+        /// Repository identifiers or numeric indexes from `du` output (one or more).
+        #[arg(required = true, num_args = 1..)]
+        repo_ids: Vec<String>,
 
         /// Skip confirmation prompt.
         #[arg(long)]
         yes: bool,
+
+        /// Print what would be deleted and what it frees, without deleting
+        /// or prompting.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Garbage-collect cached models by age and/or size budget.
     ///
@@ -1303,11 +1315,11 @@ fn run(cli: Cli) -> Result<(), FetchError> {
                 run_cache_clean_partial(resolved.as_deref(), yes, dry_run)
             }
             // BORROW: explicit .as_str() for String → &str conversion
-            CacheCommands::Delete { repo_id, yes } => {
-                let resolved = resolve_du_arg(repo_id.as_str())?;
-                // BORROW: explicit .as_str() instead of Deref coercion
-                run_cache_delete(resolved.as_str(), yes)
-            }
+            CacheCommands::Delete {
+                repo_ids,
+                yes,
+                dry_run,
+            } => run_cache_delete(&repo_ids, yes, dry_run),
             CacheCommands::Gc {
                 older_than,
                 max_size,
@@ -3512,22 +3524,7 @@ fn resolve_repo_arg(arg: &str) -> Result<(cache::RepoType, String), FetchError> 
 
     // Numeric index: resolve against the listing `du` prints.
     if let Ok(n) = arg.parse::<usize>() {
-        let summaries = du_listing()?;
-
-        if n == 0 || n > summaries.len() {
-            return Err(FetchError::InvalidArgument(format!(
-                "index {n} is out of range (cache has {} {} — use 1..{})",
-                summaries.len(),
-                pluralize(summaries.len(), "repo", "repos"),
-                summaries.len()
-            )));
-        }
-
-        // INDEX: n is bounded by 1..=summaries.len() checked above
-        #[allow(clippy::indexing_slicing)]
-        let chosen = &summaries[n - 1];
-        // BORROW: explicit .clone() for owned String
-        return Ok((chosen.repo_type, chosen.repo_id.clone()));
+        return resolve_index(n, &du_listing()?);
     }
 
     // A bare name: a cached root-level repo such as `gpt2`.
@@ -3551,6 +3548,29 @@ fn resolve_repo_arg(arg: &str) -> Result<(cache::RepoType, String), FetchError> 
     Err(FetchError::InvalidArgument(format!(
         "\"{arg}\" is not a valid repo ID (expected \"org/model\", or the bare name of a cached repo) or numeric index"
     )))
+}
+
+/// Resolves a 1-based `du` index against `summaries`, the listing `du` printed.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidArgument`] if `n` is `0` or past the end.
+fn resolve_index(
+    n: usize,
+    summaries: &[cache::CachedModelSummary],
+) -> Result<(cache::RepoType, String), FetchError> {
+    n.checked_sub(1)
+        .and_then(|i| summaries.get(i))
+        // BORROW: explicit .clone() for owned String
+        .map(|s| (s.repo_type, s.repo_id.clone()))
+        .ok_or_else(|| {
+            FetchError::InvalidArgument(format!(
+                "index {n} is out of range (cache has {} {} — use 1..{})",
+                summaries.len(),
+                pluralize(summaries.len(), "repo", "repos"),
+                summaries.len()
+            ))
+        })
 }
 
 /// Resolves an argument to a cached *model's* repo ID, for the commands that
@@ -3748,11 +3768,13 @@ fn print_duplicate_verification(v: &DuplicateVerification) {
     }
 }
 
-/// Prints the footer line that names the duplicated copies, and what they
-/// are, when there are any.
-fn print_duplicate_footer(duplicated_bytes: u64, repo_count: usize, total_size: u64) {
+/// Prints the line that names the duplicated copies, when there are any.
+///
+/// Shared by `du`'s footer and the `cache gc` preview, which print the same
+/// figure for the same cache. Returns whether it printed.
+fn print_duplicate_figure(duplicated_bytes: u64, repo_count: usize, total_size: u64) -> bool {
     if duplicated_bytes == 0 {
-        return;
+        return false;
     }
     println!(
         "  {} of {} are duplicated copies ({} {})",
@@ -3761,6 +3783,15 @@ fn print_duplicate_footer(duplicated_bytes: u64, repo_count: usize, total_size: 
         repo_count,
         pluralize(repo_count, "repo", "repos"),
     );
+    true
+}
+
+/// Prints `du`'s footer line for the duplicated copies, and the note on
+/// what they are, when there are any.
+fn print_duplicate_footer(duplicated_bytes: u64, repo_count: usize, total_size: u64) {
+    if !print_duplicate_figure(duplicated_bytes, repo_count, total_size) {
+        return;
+    }
     println!(
         "  Note: a duplicated copy is a snapshot file stored again beside its blob, \
          which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; \
@@ -5041,10 +5072,7 @@ fn run_cache_clean_partial(
     Ok(())
 }
 
-/// Deletes a cached model by removing its `models--org--name/` directory.
-///
-/// Shows a size preview and prompts for confirmation unless `--yes` is passed.
-/// Removes the `models--org--name/` directory for `repo_id`.
+/// Removes a cached repo by deleting its `<type>--org--name/` directory.
 ///
 /// Low-level helper shared by `run_cache_delete` and `run_cache_gc`. Caller
 /// owns any preview/prompt rendering. The function refuses to follow
@@ -5053,16 +5081,17 @@ fn run_cache_clean_partial(
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::InvalidArgument`] when `repo_id` is not cached or
-/// when its `models--…` entry is a symlink. Returns [`FetchError::Io`] on
+/// Returns [`FetchError::InvalidArgument`] when the repo is not cached or
+/// when its cache entry is a symlink. Returns [`FetchError::Io`] on
 /// filesystem failure during removal.
-fn delete_repo_dir(repo_id: &str) -> Result<(), FetchError> {
+fn delete_repo_dir(repo_type: cache::RepoType, repo_id: &str) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
-    let repo_dir = hf_fetch_model::cache_layout::repo_dir(&cache_dir, repo_id);
+    let repo_dir = hf_fetch_model::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id);
+    let address = repo_type.address(repo_id);
 
     if !repo_dir.exists() {
         return Err(FetchError::InvalidArgument(format!(
-            "{repo_id} is not cached"
+            "{address} is not cached"
         )));
     }
 
@@ -5076,7 +5105,7 @@ fn delete_repo_dir(repo_id: &str) -> Result<(), FetchError> {
     })?;
     if meta.file_type().is_symlink() {
         return Err(FetchError::InvalidArgument(format!(
-            "{repo_id} cache entry is a symlink; refusing to delete"
+            "{address} cache entry is a symlink; refusing to delete"
         )));
     }
 
@@ -5088,7 +5117,106 @@ fn delete_repo_dir(repo_id: &str) -> Result<(), FetchError> {
     Ok(())
 }
 
-fn run_cache_delete(repo_id: &str, yes: bool) -> Result<(), FetchError> {
+/// One repo that `cache delete` has resolved from an argument and checked.
+struct DeleteTarget {
+    /// The kind of repo.
+    repo_type: cache::RepoType,
+    /// The repo ID, without the type prefix.
+    repo_id: String,
+    /// Its footprint, for the preview and the figure it frees.
+    usage: cache::RepoUsage,
+}
+
+impl DeleteTarget {
+    /// How the repo is printed and addressed.
+    fn address(&self) -> String {
+        self.repo_type.address(self.repo_id.as_str())
+    }
+
+    /// Bytes deleting the repo frees: its links into `huggingface_hub`'s
+    /// shared blob store go, the payloads they point to stay.
+    fn freed(&self) -> u64 {
+        self.usage.total_size.saturating_sub(self.usage.shared_size)
+    }
+}
+
+/// Resolves every `cache delete` argument, de-duplicates the results, and
+/// checks that each repo is cached, before anything is deleted.
+///
+/// An index and an ID can name the same repo, so the resolved list is
+/// de-duplicated. Every argument that was a numeric index prints the repo it
+/// resolved to, under `--yes` too, which has no prompt to carry the
+/// safeguard: the indexes are those of the last `du`, and they shift after
+/// each deletion.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidArgument`] when an argument does not resolve
+/// (see [`resolve_repo_arg`]) or names a repo that is not cached, and
+/// [`FetchError::Io`] when the cache cannot be read. Nothing has been
+/// deleted by then.
+fn resolve_delete_targets(args: &[String]) -> Result<Vec<DeleteTarget>, FetchError> {
+    let cache_dir = cache::hf_cache_dir()?;
+    let mut targets: Vec<DeleteTarget> = Vec::with_capacity(args.len());
+    // The listing behind an index is computed once, however many are given.
+    let mut listing: Option<Vec<cache::CachedModelSummary>> = None;
+
+    for arg in args {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        let (repo_type, repo_id) = match arg.as_str().parse::<usize>() {
+            Ok(n) => {
+                if listing.is_none() {
+                    listing = Some(du_listing()?);
+                }
+                let (repo_type, repo_id) =
+                    resolve_index(n, listing.as_deref().unwrap_or_default())?;
+                println!(
+                    "  index {n} is {}  (as listed by the last `du`)",
+                    repo_type.address(repo_id.as_str())
+                );
+                (repo_type, repo_id)
+            }
+            // BORROW: explicit .as_str() instead of Deref coercion
+            Err(_) => resolve_repo_arg(arg.as_str())?,
+        };
+        if targets
+            .iter()
+            .any(|t| t.repo_type == repo_type && t.repo_id == repo_id)
+        {
+            continue;
+        }
+        let repo_dir =
+            hf_fetch_model::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id.as_str());
+        if !repo_dir.exists() {
+            return Err(FetchError::InvalidArgument(format!(
+                "{} is not cached",
+                repo_type.address(repo_id.as_str())
+            )));
+        }
+        // Targeted scan, not the full cache.
+        let usage = cache::repo_usage_in(repo_type, repo_id.as_str())?;
+        targets.push(DeleteTarget {
+            repo_type,
+            repo_id,
+            usage,
+        });
+    }
+    Ok(targets)
+}
+
+/// Deletes cached repos by repo ID or `du` index.
+///
+/// Every argument is resolved and checked first, so one bad argument aborts
+/// before anything is removed. With `--dry-run` it then prints what would go
+/// and what it frees, and stops; otherwise it prompts once, unless `--yes`,
+/// and deletes. A deletion that fails does not stop the others; the command
+/// fails at the end if any did.
+///
+/// # Errors
+///
+/// Returns the errors of [`resolve_delete_targets`], or
+/// [`FetchError::InvalidArgument`] when one or more deletions fail.
+fn run_cache_delete(args: &[String], yes: bool, dry_run: bool) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
 
     if !cache_dir.exists() {
@@ -5096,41 +5224,90 @@ fn run_cache_delete(repo_id: &str, yes: bool) -> Result<(), FetchError> {
         return Ok(());
     }
 
-    let repo_dir = hf_fetch_model::cache_layout::repo_dir(&cache_dir, repo_id);
+    let targets = resolve_delete_targets(args)?;
 
-    if !repo_dir.exists() {
-        return Err(FetchError::InvalidArgument(format!(
-            "{repo_id} is not cached"
-        )));
-    }
-
-    // Get size and file count for the preview (targeted scan, not full cache).
-    let usage = cache::repo_usage(repo_id)?;
-    // Removing the directory removes the repo's links into huggingface_hub's
-    // shared blob store, not the payloads they point to.
-    let freed = usage.total_size.saturating_sub(usage.shared_size);
-
-    println!(
-        "  {repo_id}  ({}, {} {})",
-        format_size(usage.total_size),
-        usage.file_count,
-        pluralize(usage.file_count, "file", "files")
-    );
-    if usage.shared_size > 0 {
+    for t in &targets {
         println!(
-            "  {} of it is in huggingface_hub's shared blob store and stays \
-             there; `hf cache prune` reclaims what no repo links to.",
-            format_size(usage.shared_size)
+            "  {}  ({}, {} {})",
+            t.address(),
+            format_size(t.usage.total_size),
+            t.usage.file_count,
+            pluralize(t.usage.file_count, "file", "files")
         );
+        if t.usage.shared_size > 0 {
+            println!(
+                "  {} of it is in huggingface_hub's shared blob store and stays \
+                 there; `hf cache prune` reclaims what no repo links to.",
+                format_size(t.usage.shared_size)
+            );
+        }
+    }
+    let total_freed = targets
+        .iter()
+        .map(DeleteTarget::freed)
+        .fold(0_u64, u64::saturating_add);
+    let count = targets.len();
+    let repo_word = pluralize(count, "repo", "repos");
+
+    if dry_run {
+        println!(
+            "  Dry run: would delete {count} {repo_word}, freeing {}. Nothing was deleted.",
+            format_size(total_freed)
+        );
+        return Ok(());
     }
 
-    if !yes && !confirm_prompt("  Delete? [y/N]") {
+    let prompt = if count == 1 {
+        "  Delete? [y/N]".to_owned()
+    } else {
+        format!(
+            "  Delete {count} {repo_word}, freeing {}? [y/N]",
+            format_size(total_freed)
+        )
+    };
+    // BORROW: explicit .as_str() instead of Deref coercion
+    if !yes && !confirm_prompt(prompt.as_str()) {
         println!("  Aborted.");
         return Ok(());
     }
 
-    delete_repo_dir(repo_id)?;
-    println!("  Deleted. Freed {}.", format_size(freed));
+    let mut freed: u64 = 0;
+    let mut failures: usize = 0;
+    for t in &targets {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        match delete_repo_dir(t.repo_type, t.repo_id.as_str()) {
+            Ok(()) if count == 1 => {
+                freed = freed.saturating_add(t.freed());
+                println!("  Deleted. Freed {}.", format_size(t.freed()));
+            }
+            Ok(()) => {
+                freed = freed.saturating_add(t.freed());
+                println!(
+                    "  Deleted {}. Freed {}.",
+                    t.address(),
+                    format_size(t.freed())
+                );
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("error: failed to delete {}: {e}", t.address());
+            }
+        }
+    }
+    if count > 1 {
+        let deleted = count - failures;
+        println!(
+            "  Deleted {deleted} {}. Freed {}.",
+            pluralize(deleted, "repo", "repos"),
+            format_size(freed)
+        );
+    }
+    if failures > 0 {
+        return Err(FetchError::InvalidArgument(format!(
+            "{failures} {} failed to delete",
+            pluralize(failures, "repo", "repos")
+        )));
+    }
     Ok(())
 }
 
@@ -5441,6 +5618,22 @@ struct GcPlan {
     shared_store: u64,
 }
 
+/// What the `cache gc` preview says about the cache beyond the models it
+/// selects among.
+struct GcCacheNotes {
+    /// Bytes across every cached repo that are duplicated copies: the figure
+    /// `du`'s footer prints.
+    duplicated_bytes: u64,
+    /// Repos holding duplicated copies.
+    duplicated_repos: usize,
+    /// Bytes on disk across the whole cache, `du`'s total.
+    cache_bytes: u64,
+    /// Dataset and Space repos, which `gc` never evicts.
+    other_repos: usize,
+    /// Bytes those repos occupy.
+    other_bytes: u64,
+}
+
 /// Returns the set of repo IDs from `summaries` that are older than
 /// `threshold_secs` relative to `now`.
 ///
@@ -5627,7 +5820,7 @@ fn render_eviction_table(entries: &[EvictionEntry]) {
 /// Renders the human-readable gc preview to stdout, in this order:
 /// `Will remove`, `Skipped (active partial downloads)`, `Protected by --except`,
 /// optional `Keep`, then a summary line `Cache: X → Y (free Z)`.
-fn render_gc_plan_preview(plan: &GcPlan) {
+fn render_gc_plan_preview(plan: &GcPlan, notes: &GcCacheNotes) {
     if !plan.evict.is_empty() {
         println!("Will remove:");
         render_eviction_table(&plan.evict);
@@ -5670,6 +5863,27 @@ fn render_gc_plan_preview(plan: &GcPlan) {
              above. gc removes repos' links to it, never the files; \
              `hf cache prune` reclaims what no repo links to.",
             format_size(plan.shared_store)
+        );
+    }
+
+    if print_duplicate_figure(
+        notes.duplicated_bytes,
+        notes.duplicated_repos,
+        notes.cache_bytes,
+    ) {
+        println!(
+            "  gc selects whole repos by age and budget and does not deduplicate: \
+             removing models to recover space that deduplication would recover \
+             without losing any is what this figure warns against. `hf-fm du` \
+             names the copies per repo."
+        );
+    }
+    if notes.other_repos > 0 {
+        println!(
+            "Note: {} dataset or Space {} ({}) not counted above; gc evicts models only.",
+            notes.other_repos,
+            pluralize(notes.other_repos, "repo", "repos"),
+            format_size(notes.other_bytes)
         );
     }
 
@@ -5718,11 +5932,41 @@ fn run_cache_gc(
 
     println!("Cache: {}\n", cache_dir.display());
 
-    let summaries = cache::cache_summary()?;
+    // Every repo is scanned once: the models are what gc selects among, and
+    // the rest is only reported on, so `du` and `gc` visibly agree on the
+    // duplicated figure and disagree about the total for a stated reason.
+    let (summaries, others): (Vec<_>, Vec<_>) = cache::cache_summary_all()?
+        .into_iter()
+        .partition(|s| s.repo_type == cache::RepoType::Model);
     if summaries.is_empty() {
         println!("No models in cache.");
         return Ok(());
     }
+    let store = cache::shared_store_size()?;
+    let notes = GcCacheNotes {
+        duplicated_bytes: summaries
+            .iter()
+            .chain(&others)
+            .map(|s| s.duplicated_bytes)
+            .fold(0_u64, u64::saturating_add),
+        duplicated_repos: summaries
+            .iter()
+            .chain(&others)
+            .filter(|s| s.duplicated_bytes > 0)
+            .count(),
+        cache_bytes: cache_bytes_on_disk(
+            summaries
+                .iter()
+                .chain(&others)
+                .map(|s| (s.total_size, s.shared_size)),
+            store,
+        ),
+        other_repos: others.len(),
+        other_bytes: others
+            .iter()
+            .map(|s| s.total_size)
+            .fold(0_u64, u64::saturating_add),
+    };
 
     // BORROW: explicit .as_str() to expose owned `repo_id: String` and the
     // `--except` `String` argument as borrowed keys for the lookup set.
@@ -5745,7 +5989,7 @@ fn run_cache_gc(
         &criteria,
         std::time::SystemTime::now(),
         list_kept,
-        cache::shared_store_size()?,
+        store,
     );
 
     if !plan.skipped_partials.is_empty() {
@@ -5762,7 +6006,7 @@ fn run_cache_gc(
         return Ok(());
     }
 
-    render_gc_plan_preview(&plan);
+    render_gc_plan_preview(&plan, &notes);
 
     if dry_run {
         return Ok(());
@@ -5777,7 +6021,7 @@ fn run_cache_gc(
     let mut freed: u64 = 0;
     for entry in &plan.evict {
         // BORROW: explicit .as_str() for owned String → &str argument.
-        match delete_repo_dir(entry.repo_id.as_str()) {
+        match delete_repo_dir(cache::RepoType::Model, entry.repo_id.as_str()) {
             Ok(()) => freed = freed.saturating_add(entry.size),
             Err(e) => {
                 eprintln!("error: failed to delete {}: {e}", entry.repo_id);

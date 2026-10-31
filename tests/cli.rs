@@ -4995,7 +4995,12 @@ fn quants_nonexistent_base_json_is_valid_with_empty_artifacts() {
 
 /// Stages a dataset repo with one file stored once, in `snapshots/` only, as
 /// the maintainer's `datasets--TheQweaker--rented_boxes` is.
-fn stage_dataset(hf_home: &std::path::Path, repo_folder: &str, filename: &str, bytes: usize) {
+fn stage_snapshot_only_repo(
+    hf_home: &std::path::Path,
+    repo_folder: &str,
+    filename: &str,
+    bytes: usize,
+) {
     let snapshot = hf_home
         .join("hub")
         .join(repo_folder)
@@ -5032,7 +5037,7 @@ fn du_names_the_duplicated_copies_in_a_dup_column_and_a_footer() {
         "model.bin",
         3072,
     );
-    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 1024);
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--plain", "data.bin", 1024);
 
     let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
     assert!(success, "du should succeed: {stderr}");
@@ -5091,7 +5096,7 @@ fn du_prints_no_dup_column_for_a_cache_of_symlinks() {
 fn du_sort_dup_orders_by_duplicated_bytes_and_keeps_the_size_rank() {
     let dir = temp_hf_home();
     // Biggest by size, no copies: rank 1.
-    stage_dataset(dir.path(), "datasets--test-org--big", "data.bin", 50_000);
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--big", "data.bin", 50_000);
     // Smaller, but with copies: rank 2 and first under --sort dup.
     stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 8192);
 
@@ -5101,20 +5106,15 @@ fn du_sort_dup_orders_by_duplicated_bytes_and_keeps_the_size_rank() {
     assert!(success, "du --sort dup should succeed: {stderr}");
     let rows: Vec<&str> = stdout.lines().filter(|l| l.contains("test-org/")).collect();
     let [first, second] = rows.as_slice() else {
-        panic!(
-            "two repos expected, got:
-{stdout}"
-        );
+        panic!("two repos expected, got:\n{stdout}");
     };
     assert!(
         first.contains("test-org/twice") && first.trim_start().starts_with('2'),
-        "the repo with copies leads and keeps its size rank, got:
-{stdout}"
+        "the repo with copies leads and keeps its size rank, got:\n{stdout}"
     );
     assert!(
         second.contains("datasets/test-org/big") && second.trim_start().starts_with('1'),
-        "the rest follows, got:
-{stdout}"
+        "the rest follows, got:\n{stdout}"
     );
 }
 
@@ -5128,7 +5128,7 @@ fn du_json_reports_duplicated_bytes_and_the_repo_type() {
         "model.bin",
         3072,
     );
-    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 1024);
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--plain", "data.bin", 1024);
 
     let model = du_json_entry(dir.path(), "test-org/dup-repo", "model");
     assert_eq!(
@@ -5202,8 +5202,8 @@ fn du_repo_json_reports_the_partition_of_the_bytes_on_disk() {
 #[test]
 fn du_lists_dataset_repos_and_addresses_them_behind_their_prefix() {
     let dir = temp_hf_home();
-    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 2048);
-    stage_dataset(dir.path(), "datasets--wikitext", "train.parquet", 4096);
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--plain", "data.bin", 2048);
+    stage_snapshot_only_repo(dir.path(), "datasets--wikitext", "train.parquet", 4096);
 
     let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
     assert!(success, "du should succeed: {stderr}");
@@ -5237,7 +5237,7 @@ fn a_bare_name_resolves_to_a_cached_root_level_model_only() {
         "fake0000000000000000000000000000000000000",
     )
     .expect("write ref");
-    stage_dataset(dir.path(), "datasets--wikitext", "train.parquet", 4096);
+    stage_snapshot_only_repo(dir.path(), "datasets--wikitext", "train.parquet", 4096);
 
     let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "gpt2"]));
     assert!(success, "du gpt2 should succeed: {stderr}");
@@ -5325,12 +5325,204 @@ fn du_verify_duplicates_hashes_each_copy_against_its_blob() {
 #[test]
 fn du_tree_lists_dataset_repos_too() {
     let dir = temp_hf_home();
-    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 2048);
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--plain", "data.bin", 2048);
 
     let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--tree"]));
     assert!(success, "du --tree should succeed: {stderr}");
     assert!(
         stdout.contains("datasets/test-org/plain") && stdout.contains("data.bin"),
         "the tree lists the dataset and its file, got:\n{stdout}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// cache delete: --dry-run, several repos per call, resolved indexes (v0.12.5)
+// -----------------------------------------------------------------------
+
+/// Stages three repos of different sizes, so `du` ranks them
+/// `test-org/large` (1), `test-org/medium` (2), `test-org/small` (3).
+fn stage_three_repos(hf_home: &std::path::Path) {
+    stage_snapshot_only_repo(hf_home, "models--test-org--large", "m.bin", 30_000);
+    stage_snapshot_only_repo(hf_home, "models--test-org--medium", "m.bin", 20_000);
+    stage_snapshot_only_repo(hf_home, "models--test-org--small", "m.bin", 10_000);
+}
+
+fn repo_exists(hf_home: &std::path::Path, folder: &str) -> bool {
+    hf_home.join("hub").join(folder).exists()
+}
+
+#[test]
+fn cache_delete_dry_run_reports_what_it_frees_and_deletes_nothing() {
+    let dir = temp_hf_home();
+    stage_three_repos(dir.path());
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/small",
+        "test-org/medium",
+        "--dry-run",
+    ]));
+    assert!(success, "--dry-run should succeed: {stderr}");
+    assert!(
+        stdout.contains("Dry run: would delete 2 repos, freeing 29.3 KiB. Nothing was deleted."),
+        "the dry run states the figure, got:\n{stdout}"
+    );
+    assert!(
+        repo_exists(dir.path(), "models--test-org--small")
+            && repo_exists(dir.path(), "models--test-org--medium"),
+        "and removes nothing"
+    );
+}
+
+#[test]
+fn cache_delete_takes_several_repos_and_frees_the_sum() {
+    let dir = temp_hf_home();
+    stage_three_repos(dir.path());
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/small",
+        "test-org/medium",
+        "--yes",
+    ]));
+    assert!(success, "a multi-repo delete should succeed: {stderr}");
+    assert!(
+        stdout.contains("Deleted 2 repos. Freed 29.3 KiB."),
+        "the summary sums what was freed, got:\n{stdout}"
+    );
+    assert!(!repo_exists(dir.path(), "models--test-org--small"));
+    assert!(!repo_exists(dir.path(), "models--test-org--medium"));
+    assert!(
+        repo_exists(dir.path(), "models--test-org--large"),
+        "an unnamed repo stays"
+    );
+}
+
+#[test]
+fn cache_delete_with_one_bad_argument_removes_nothing() {
+    let dir = temp_hf_home();
+    stage_three_repos(dir.path());
+
+    let (_, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/small",
+        "test-org/missing",
+        "--yes",
+    ]));
+    assert!(!success, "an uncached repo is an error");
+    assert!(
+        stderr.contains("test-org/missing is not cached"),
+        "naming it, got:\n{stderr}"
+    );
+    assert!(
+        repo_exists(dir.path(), "models--test-org--small"),
+        "the valid argument before it was not deleted either"
+    );
+}
+
+#[test]
+fn cache_delete_prints_the_repo_each_index_resolved_to_even_under_yes() {
+    let dir = temp_hf_home();
+    stage_three_repos(dir.path());
+
+    // Indexes are those of one `du`: 3 is small, 1 is large. Resolved
+    // together, neither shifts under the other.
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "delete", "3", "1", "--yes"]));
+    assert!(success, "index deletes should succeed: {stderr}");
+    assert!(
+        stdout.contains("index 3 is test-org/small")
+            && stdout.contains("index 1 is test-org/large"),
+        "each index names its repo, got:\n{stdout}"
+    );
+    assert!(!repo_exists(dir.path(), "models--test-org--small"));
+    assert!(!repo_exists(dir.path(), "models--test-org--large"));
+    assert!(
+        repo_exists(dir.path(), "models--test-org--medium"),
+        "the repo in between was never named"
+    );
+}
+
+#[test]
+fn cache_delete_names_a_repo_once_however_it_is_given() {
+    let dir = temp_hf_home();
+    stage_three_repos(dir.path());
+
+    // `test-org/small` is also index 3.
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/small",
+        "3",
+        "--yes",
+    ]));
+    assert!(success, "a repeated repo should not fail: {stderr}");
+    assert!(
+        stdout.contains("Deleted. Freed 9.8 KiB."),
+        "one repo, deleted once, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn cache_delete_removes_a_dataset_behind_its_prefix_and_leaves_the_model() {
+    let dir = temp_hf_home();
+    // A model and a dataset sharing one `org/name`.
+    stage_snapshot_only_repo(dir.path(), "models--test-org--same", "m.bin", 1024);
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--same", "d.bin", 2048);
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "datasets/test-org/same",
+        "--yes",
+    ]));
+    assert!(success, "deleting a dataset should succeed: {stderr}");
+    assert!(stdout.contains("datasets/test-org/same"), "got:\n{stdout}");
+    assert!(!repo_exists(dir.path(), "datasets--test-org--same"));
+    assert!(
+        repo_exists(dir.path(), "models--test-org--same"),
+        "the model of the same name is untouched"
+    );
+}
+
+// -----------------------------------------------------------------------
+// cache gc names the duplicated bytes beside its proposal (v0.12.5)
+// -----------------------------------------------------------------------
+
+#[test]
+fn cache_gc_dry_run_prints_du_s_duplicated_figure_and_what_it_leaves_out() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 10_240);
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--plain", "d.bin", 2048);
+
+    let (du_stdout, du_stderr, du_success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(du_success, "du should succeed: {du_stderr}");
+    let figure = du_stdout
+        .lines()
+        .find(|l| l.contains("are duplicated copies"))
+        .expect("du's footer names the duplicates")
+        .to_owned();
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "gc",
+        "--max-size",
+        "1KiB",
+        "--dry-run",
+    ]));
+    assert!(success, "gc --dry-run should succeed: {stderr}");
+    assert!(
+        stdout.lines().any(|l| l == figure),
+        "gc prints the line du's footer prints ({figure:?}), got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "1 dataset or Space repo (2.0 KiB) not counted above; gc evicts models only."
+        ),
+        "and names what it leaves out, got:\n{stdout}"
     );
 }
