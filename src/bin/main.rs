@@ -12618,8 +12618,53 @@ mod tests {
         }
     }
 
+    /// A second directory on a different volume from `reference`, when the
+    /// machine has one: `D:\` on Windows, `/dev/shm` on Linux. `None` (and the
+    /// test returns) on a machine with a single volume.
+    fn tempdir_on_another_volume(reference: &Path) -> Option<tempfile::TempDir> {
+        let candidates: [&str; 3] = [r"D:\", r"E:\", "/dev/shm"];
+        let home = cache::volume_label(&std::fs::canonicalize(reference).ok()?)?;
+        candidates.iter().find_map(|root| {
+            let dir = tempfile::Builder::new().tempdir_in(root).ok()?;
+            let label = cache::volume_label(&std::fs::canonicalize(dir.path()).ok()?)?;
+            (label != home).then_some(dir)
+        })
+    }
+
+    /// The path behind `By volume:`: a relocated repo's own bytes go to its
+    /// target's volume, everything else (and the shared store) stays on the
+    /// cache's, and the result is largest first. Needs a second volume.
     #[test]
     fn volume_totals_split_a_relocated_repos_own_bytes_from_the_cache_volume() {
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache_dir = cache_root.path().join("hub");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let Some(elsewhere) = tempdir_on_another_volume(&cache_dir) else {
+            eprintln!("skipped: this machine has no second volume to place a target on");
+            return;
+        };
+        let target = elsewhere.path().join("models--org--moved");
+        std::fs::create_dir_all(&target).unwrap();
+        let home = cache::volume_label(&std::fs::canonicalize(&cache_dir).unwrap()).unwrap();
+        let away = cache::volume_label(&std::fs::canonicalize(&target).unwrap()).unwrap();
+
+        // (total, shared, relocated_to): a relocated repo of 100 bytes, and a
+        // local one of 50 of which 10 are in the shared store (7 bytes).
+        let repos = [(100_u64, 0_u64, Some(target.as_path())), (50, 10, None)];
+        let volumes = volume_totals(repos.iter().copied(), 7, &cache_dir).unwrap();
+
+        // Local: 7 (store) + 50 - 10 = 47; away: 100. Largest first.
+        assert_eq!(volumes, vec![(away, 100), (home, 47)]);
+        let total: u64 = volumes.iter().map(|&(_, bytes)| bytes).sum();
+        assert_eq!(
+            total,
+            cache_bytes_on_disk(repos.iter().map(|&(t, sh, _)| (t, sh)), 7),
+            "the split adds up to the cache's total"
+        );
+    }
+
+    #[test]
+    fn volume_totals_stay_silent_when_the_cache_is_on_one_volume() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path().join("hub");
         std::fs::create_dir_all(&cache_dir).unwrap();
