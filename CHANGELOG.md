@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python's `zipfile.testzip()` and loads with `numpy.load`. Test-only: no
   effect on the published crate or on the binary.
 
+- **`[profile.dev]` keeps line tables, not full debug info.** With full debug
+  info the `basic` and `bench` examples failed to link with MSVC on Windows
+  (`LNK1140: program database limit exceeded`) once the lockfile took
+  `serde_json` 1.0.154, so a local `cargo test` could not finish; the examples'
+  PDB is 2.4 GiB even at line-table level, so there was little room left.
+  Backtraces keep function names and line numbers and breakpoints work; a
+  debugger no longer shows local variables. Development only: no effect on
+  the published crate or on a release build.
+
 - **`hypomnesis` bumped `0.2.14` → `0.2.15`**, in the runtime and the dev
   entry alike (the `cli` feature's one GPU dependency). One change reaches
   `inspect --check-gpu`: when `NVML` loads but cannot start or count (for
