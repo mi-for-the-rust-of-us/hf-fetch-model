@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.5] — `du` names the duplicates and lists dataset repos
+
 ### Added
 
 - **`du` names the duplicated copies.** Since v0.12.2 every repo-level figure is
