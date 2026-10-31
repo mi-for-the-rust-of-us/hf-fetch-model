@@ -58,7 +58,7 @@ hf-hub = "1.0"
 # which only the binary compiles (`#[path]` from `src/bin/main.rs`). Library
 # consumers such as candle-mi therefore no longer build NVML / DXGI / Metal
 # bindings they never call.
-hypomnesis = { version = "0.2.14", optional = true, default-features = false, features = [
+hypomnesis = { version = "0.2.15", optional = true, default-features = false, features = [
     "nvml",
     "nvidia-smi-fallback",
     "dxgi",
@@ -125,7 +125,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 # `test-helpers`): dev-dependencies unify with normal ones in the test build,
 # so a bare entry here would re-introduce the `cli` union this crate just
 # opted out of.
-hypomnesis = { version = "0.2.14", default-features = false, features = [
+hypomnesis = { version = "0.2.15", default-features = false, features = [
     "nvml",
     "nvidia-smi-fallback",
     "dxgi",

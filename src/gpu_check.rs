@@ -78,7 +78,7 @@ pub fn query_gpu(index: u32) -> GpuCheckResult {
 /// | Variant | Message |
 /// |---------|---------|
 /// | `DeviceIndexOutOfRange { index, count }` | `"index {N} out of range (have {M} device(s))"` (with singular/plural agreement) |
-/// | `NoGpuSource` | `"no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)"`, or on macOS `"no GPU detected (Metal / NVML / nvidia-smi not usable)"` |
+/// | `NoGpuSource` | `"no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)"` on Windows, `"no NVIDIA device detected (NVML / nvidia-smi not usable)"` on Linux and elsewhere, `"no GPU detected (Metal / NVML / nvidia-smi not usable)"` on macOS |
 /// | `Nvml(s)` / `Dxgi(s)` / `NvidiaSmi(s)` | `"{backend} backend reported: {s}"` |
 /// | `Ram(_)` / `Io(_)` / `Pdh(_)` / `ProcessListDenied { .. }` | `"unexpected error: {err}"` (should not occur for `device_info`) |
 /// | future variants (`HypomnesisError` is `#[non_exhaustive]`) | `"hypomnesis error: {err}"` (generic fallthrough) |
@@ -89,14 +89,7 @@ fn friendly_error(err: &hypomnesis::HypomnesisError) -> String {
             let plural = if *count == 1 { "device" } else { "devices" };
             format!("index {index} out of range (have {count} {plural})")
         }
-        // `cfg!` rather than `#[cfg]`, so both texts compile, and are linted,
-        // on every platform. They name the backends hypomnesis tries there.
-        E::NoGpuSource => if cfg!(target_os = "macos") {
-            "no GPU detected (Metal / NVML / nvidia-smi not usable)"
-        } else {
-            "no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)"
-        }
-        .to_owned(),
+        E::NoGpuSource => no_gpu_source_text().to_owned(),
         E::Nvml(s) => format!("NVML backend reported: {s}"),
         E::Dxgi(s) => format!("DXGI backend reported: {s}"),
         E::NvidiaSmi(s) => format!("nvidia-smi backend reported: {s}"),
@@ -111,6 +104,22 @@ fn friendly_error(err: &hypomnesis::HypomnesisError) -> String {
         }
         // EXHAUSTIVE: HypomnesisError is `#[non_exhaustive]`; cover future variants generically
         _ => format!("hypomnesis error: {err}"),
+    }
+}
+
+/// The line [`friendly_error`] prints for `NoGpuSource`: it names the
+/// backends `hypomnesis` tries on the platform this binary runs on, as
+/// `hypomnesis` 0.2.15's own text does.
+///
+/// `cfg!` rather than `#[cfg]`, so every text compiles, and is linted, on
+/// every platform.
+const fn no_gpu_source_text() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "no GPU detected (Metal / NVML / nvidia-smi not usable)"
+    } else if cfg!(target_os = "windows") {
+        "no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)"
+    } else {
+        "no NVIDIA device detected (NVML / nvidia-smi not usable)"
     }
 }
 
@@ -1043,11 +1052,43 @@ mod tests {
 
     use super::{
         GpuCheckResult, KvCachePath, KvComputed, classify_hybrid_layers, dominant_dtype_label,
-        format_params, gpu_check_json, kv_cache_bytes, mamba2_state_bytes_per_layer,
-        sum_tensor_bytes,
+        format_params, friendly_error, gpu_check_json, kv_cache_bytes,
+        mamba2_state_bytes_per_layer, sum_tensor_bytes,
     };
     use hf_fetch_model::inspect::{ModelConfig, TensorInfo, torch_dtype_bytes};
     use hypomnesis::GpuDeviceInfo;
+
+    #[test]
+    fn no_gpu_source_names_only_the_platforms_backends() {
+        let text = friendly_error(&hypomnesis::HypomnesisError::NoGpuSource);
+        assert!(
+            text.contains("NVML") && text.contains("nvidia-smi"),
+            "NVML and nvidia-smi exist on every platform: {text}"
+        );
+        assert_eq!(
+            text.contains("DXGI"),
+            cfg!(target_os = "windows"),
+            "DXGI is named on Windows only: {text}"
+        );
+        assert_eq!(
+            text.contains("Metal"),
+            cfg!(target_os = "macos"),
+            "Metal is named on macOS only: {text}"
+        );
+    }
+
+    #[test]
+    fn a_broken_nvidia_driver_is_reported_by_its_call_and_code() {
+        // hypomnesis 0.2.15 returns this, not `NoGpuSource`, when `NVML`
+        // loads but cannot start (a driver upgraded without a reboot).
+        let err = hypomnesis::HypomnesisError::Nvml(
+            "nvmlInit_v2 returned NVML_ERROR_LIB_RM_VERSION_MISMATCH (18)".to_owned(),
+        );
+        assert_eq!(
+            friendly_error(&err),
+            "NVML backend reported: nvmlInit_v2 returned NVML_ERROR_LIB_RM_VERSION_MISMATCH (18)"
+        );
+    }
 
     fn make_tensor(name: &str, dtype: &str, shape: Vec<usize>, byte_len: u64) -> TensorInfo {
         TensorInfo {

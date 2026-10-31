@@ -45,6 +45,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python's `zipfile.testzip()` and loads with `numpy.load`. Test-only: no
   effect on the published crate or on the binary.
 
+- **`hypomnesis` bumped `0.2.14` → `0.2.15`**, in the runtime and the dev
+  entry alike (the `cli` feature's one GPU dependency). One change reaches
+  `inspect --check-gpu`: when `NVML` loads but cannot start or count (for
+  example `NVML_ERROR_LIB_RM_VERSION_MISMATCH` after a driver upgrade
+  without a reboot), `device_info` now returns `HypomnesisError::Nvml`, naming
+  the call and the code, where 0.2.14 returned `NoGpuSource` and the check
+  read as "no GPU". On Windows, a `DXGI` count of zero no longer stands in for
+  a broken `NVML` either, which matters for `TCC`-mode datacenter GPUs. The
+  existing `NVML backend reported: …` rendering already prints it. The rest
+  of 0.2.15 (`process_name`, `hmn ps` and `hmn watch` on multi-GPU nodes, a
+  fake `NVML` for CI) is `hmn` surface that this crate's
+  `default-features = false` pin never compiles.
+
+### Fixed
+
+- **`--check-gpu`'s no-GPU message named `DXGI` on Linux.** `NoGpuSource`
+  read `no NVIDIA device detected (NVML / DXGI / nvidia-smi not usable)` on
+  every platform but macOS, though `DXGI` exists only on Windows, so a Linux
+  node that lost its GPU read as though a Windows backend had been tried.
+  `hypomnesis` 0.2.15 corrected its own text for the same reason. The
+  message now names the backends of the platform it runs on: `NVML /
+  nvidia-smi` on Linux and elsewhere, `NVML / DXGI / nvidia-smi` on Windows
+  (unchanged), `Metal / NVML / nvidia-smi` on macOS (unchanged). A test pins
+  each platform's text.
+
 ## [0.12.3] — Inspect API ergonomics and growing read-ahead
 
 ### Added
