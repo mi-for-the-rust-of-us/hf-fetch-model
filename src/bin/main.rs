@@ -11458,6 +11458,8 @@ mod tests {
             partial_modified: if has_partial { mtime } else { None },
             last_modified: mtime,
             gguf_size_range: None,
+            repo_type: cache::RepoType::Model,
+            duplicated_bytes: 0,
         }
     }
 

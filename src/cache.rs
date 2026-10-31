@@ -11,11 +11,14 @@
 //! `HuggingFace` LFS metadata.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::FetchError;
+
+pub use crate::cache_layout::RepoType;
 
 /// Filename of the per-repo `hf-fm` snapshot sidecar.
 ///
@@ -117,19 +120,9 @@ pub fn write_snapshot(repo_dir: &Path, snapshot: &Snapshot) -> Result<(), FetchE
 ///
 /// Returns `None` if the directory name does not start with `models--`.
 fn repo_id_from_folder_name(dir_name: &str) -> Option<String> {
-    let repo_part = dir_name.strip_prefix("models--")?;
-
-    // Reconstruct repo_id: replace first "--" with "/".
-    let repo_id = match repo_part.find("--") {
-        Some(pos) => {
-            let (org, name_with_sep) = repo_part.split_at(pos);
-            let name = name_with_sep.get(2..).unwrap_or_default();
-            format!("{org}/{name}")
-        }
-        None => repo_part.to_string(),
-    };
-
-    Some(repo_id)
+    crate::cache_layout::parse_repo_folder_name(dir_name)
+        .filter(|(repo_type, _)| *repo_type == RepoType::Model)
+        .map(|(_, repo_id)| repo_id)
 }
 
 /// Returns the `HuggingFace` Hub cache directory.
@@ -617,26 +610,65 @@ pub struct CachedModelSummary {
     /// logical file (see [`crate::discover::gguf_size_range`]). `None` when
     /// not applicable — `total_size` is already the correct figure then.
     pub gguf_size_range: Option<(u64, u64)>,
+    /// The kind of repository this is (new in v0.12.5). [`cache_summary`]
+    /// returns models only; [`cache_summary_all`] also lists datasets and
+    /// Spaces.
+    pub repo_type: RepoType,
+    /// Bytes of `blobs/` that a snapshot entry also holds as a separate
+    /// full copy, in the same repo (new in v0.12.5). It is part of
+    /// [`total_size`](Self::total_size), not added to it: the bytes `hf-hub`
+    /// stores twice on Windows. See [`RepoUsage::duplicated_bytes`] for how a
+    /// copy is recognised. `0` where the pointers are symlinks or hard links.
+    pub duplicated_bytes: u64,
 }
 
 /// Scans the entire HF cache and returns a summary for each cached model.
 ///
 /// This is a local-only operation (no API calls). It lists all `models--*`
 /// directories and, for each, counts its snapshot files and the bytes its
-/// whole directory occupies.
+/// whole directory occupies. Dataset and Space repos are not included, so
+/// that `cache gc` and `status`, which read this list, only ever act on
+/// models; [`cache_summary_all`] lists them too.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::Io`] if the cache directory cannot be read.
 pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
-    let cache_dir = hf_cache_dir()?;
+    summarize_repos(&[RepoType::Model])
+}
 
+/// Like [`cache_summary`], but also lists the cache's dataset and Space repos
+/// (new in v0.12.5), each marked by [`CachedModelSummary::repo_type`].
+///
+/// This is the list `du` reports, so its total is the cache's. It is kept
+/// apart from [`cache_summary`] on purpose: a dataset `org/name` must never
+/// resolve to the model of the same name, nor become a candidate for
+/// `cache gc`. Sorted by repo ID within each type, models first.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be read.
+pub fn cache_summary_all() -> Result<Vec<CachedModelSummary>, FetchError> {
+    summarize_repos(&RepoType::ALL)
+}
+
+/// Walks every cached repo whose type is in `repo_types` and summarises it.
+fn summarize_repos(repo_types: &[RepoType]) -> Result<Vec<CachedModelSummary>, FetchError> {
+    summarize_repos_in(&hf_cache_dir()?, repo_types)
+}
+
+/// [`summarize_repos`] for the cache directory `cache_dir`.
+fn summarize_repos_in(
+    cache_dir: &Path,
+    repo_types: &[RepoType],
+) -> Result<Vec<CachedModelSummary>, FetchError> {
     if !cache_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let entries = std::fs::read_dir(&cache_dir).map_err(|e| FetchError::Io {
-        path: cache_dir.clone(),
+    let entries = std::fs::read_dir(cache_dir).map_err(|e| FetchError::Io {
+        // BORROW: explicit .to_path_buf() for owned PathBuf
+        path: cache_dir.to_path_buf(),
         source: e,
     })?;
 
@@ -648,9 +680,13 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
         // BORROW: explicit .to_string_lossy() for OsString → str conversion
         let dir_str = dir_name.to_string_lossy();
 
-        let Some(repo_id) = repo_id_from_folder_name(&dir_str) else {
+        let Some((repo_type, repo_id)) = crate::cache_layout::parse_repo_folder_name(&dir_str)
+        else {
             continue;
         };
+        if !repo_types.contains(&repo_type) {
+            continue;
+        }
 
         let repo_dir = entry.path();
 
@@ -665,6 +701,8 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
             total_size,
             shared_size,
             last_modified,
+            duplicated_bytes,
+            ..
         } = walk_repo_files(&repo_dir);
         let file_count = cached_files.len();
         // BORROW: explicit .as_str() instead of Deref coercion
@@ -694,10 +732,19 @@ pub fn cache_summary() -> Result<Vec<CachedModelSummary>, FetchError> {
             partial_modified,
             last_modified,
             gguf_size_range,
+            repo_type,
+            duplicated_bytes,
         });
     }
 
-    summaries.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    // Models first, then datasets and Spaces, each by repo ID: `RepoType::ALL`
+    // is the display order.
+    summaries.sort_by(|a, b| {
+        let rank = |t: RepoType| RepoType::ALL.iter().position(|&x| x == t);
+        rank(a.repo_type)
+            .cmp(&rank(b.repo_type))
+            .then_with(|| a.repo_id.cmp(&b.repo_id))
+    });
 
     Ok(summaries)
 }
@@ -736,6 +783,24 @@ pub struct RepoUsage {
     /// [`CachedModelSummary::shared_size`] counts it. `cache delete` frees
     /// `total_size - shared_size`.
     pub shared_size: u64,
+    /// Bytes of `blobs/` that a snapshot entry also holds as a separate full
+    /// copy (new in v0.12.5): what `hf-hub` leaves behind on Windows, where
+    /// it never tries a symlink. A blob counts when a snapshot entry of the
+    /// same length exists that is neither a link nor the blob itself, each
+    /// blob pairing with at most one entry. Detection is by length, so it
+    /// is an estimate until [`verify_duplicates`] hashes the copies.
+    pub duplicated_bytes: u64,
+    /// Bytes of `blobs/` that neither a snapshot entry points at, nor a copy
+    /// duplicates, nor a partial download owns (new in v0.12.5): blobs left
+    /// behind by an interrupted or superseded download.
+    pub orphan_blob_bytes: u64,
+    /// Bytes of partial downloads in `blobs/` (new in v0.12.5): the
+    /// `.chunked.part` and `.incomplete` temp files, and this crate's
+    /// `.chunked.part.state` resume sidecars.
+    pub partial_bytes: u64,
+    /// Bytes outside `blobs/` and `snapshots/` (new in v0.12.5): `refs/` and
+    /// hf-fm's own sidecars (`.hf-fm-header-cache/`, `.hf-fm-snapshot.json`).
+    pub bookkeeping_bytes: u64,
 }
 
 /// Returns one cached repo's file count, bytes on disk, and the part of
@@ -749,13 +814,27 @@ pub struct RepoUsage {
 ///
 /// Returns [`FetchError::Io`] if the cache directory cannot be determined.
 pub fn repo_usage(repo_id: &str) -> Result<RepoUsage, FetchError> {
+    repo_usage_in(RepoType::Model, repo_id)
+}
+
+/// Like [`repo_usage`], for a repo of any type (new in v0.12.5): a dataset or
+/// a Space, as [`cache_summary_all`] lists them.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+pub fn repo_usage_in(repo_type: RepoType, repo_id: &str) -> Result<RepoUsage, FetchError> {
     let cache_dir = hf_cache_dir()?;
-    let repo_dir = crate::cache_layout::repo_dir(&cache_dir, repo_id);
+    let repo_dir = crate::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id);
     let walk = walk_repo_files(&repo_dir);
     Ok(RepoUsage {
         file_count: walk.files.len(),
         total_size: walk.total_size,
         shared_size: walk.shared_size,
+        duplicated_bytes: walk.duplicated_bytes,
+        orphan_blob_bytes: walk.orphan_blob_bytes,
+        partial_bytes: walk.partial_bytes,
+        bookkeeping_bytes: walk.bookkeeping_bytes,
     })
 }
 
@@ -800,8 +879,17 @@ fn dir_bytes(dir: &Path) -> u64 {
 ///
 /// Returns [`FetchError::Io`] if the cache directory cannot be determined.
 pub fn repo_has_partial(repo_id: &str) -> Result<bool, FetchError> {
+    repo_has_partial_in(RepoType::Model, repo_id)
+}
+
+/// Like [`repo_has_partial`], for a repo of any type (new in v0.12.5).
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+pub fn repo_has_partial_in(repo_type: RepoType, repo_id: &str) -> Result<bool, FetchError> {
     let cache_dir = hf_cache_dir()?;
-    let repo_dir = crate::cache_layout::repo_dir(&cache_dir, repo_id);
+    let repo_dir = crate::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id);
     let blobs_dir = crate::cache_layout::blobs_dir(&repo_dir);
     Ok(scan_partials(&blobs_dir).0)
 }
@@ -912,6 +1000,14 @@ fn incomplete_etag(name: &str) -> Option<&str> {
 /// download's `.chunked.part.state` sidecar is not one.
 fn is_partial_name(name: &str) -> bool {
     name.ends_with(CHUNKED_PART_SUFFIX) || incomplete_etag(name).is_some()
+}
+
+/// Whether `name` is a partial download's temp file, or the resume sidecar
+/// (`.chunked.part.state`, and its `.tmp` write buffer) that this crate keeps
+/// beside it. The sidecars are not partials for `status` and `clean-partial`,
+/// but their bytes belong to the download in progress, not to a model.
+fn is_partial_bytes_name(name: &str) -> bool {
+    is_partial_name(name) || name.contains(".chunked.part.")
 }
 
 /// Whether `blobs_dir` holds any partial download, and the newest
@@ -1183,8 +1279,20 @@ pub struct CacheFileUsage {
 ///
 /// Returns [`FetchError::Io`] if the cache directory cannot be determined.
 pub fn cache_repo_usage(repo_id: &str) -> Result<Vec<CacheFileUsage>, FetchError> {
+    cache_repo_usage_in(RepoType::Model, repo_id)
+}
+
+/// Like [`cache_repo_usage`], for a repo of any type (new in v0.12.5).
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+pub fn cache_repo_usage_in(
+    repo_type: RepoType,
+    repo_id: &str,
+) -> Result<Vec<CacheFileUsage>, FetchError> {
     let cache_dir = hf_cache_dir()?;
-    let repo_dir = crate::cache_layout::repo_dir(&cache_dir, repo_id);
+    let repo_dir = crate::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id);
 
     if !repo_dir.exists() {
         return Ok(Vec::new());
@@ -1283,6 +1391,44 @@ struct RepoFileWalk {
     /// repo with none, across its other files (blobs, sidecars, `refs/`).
     /// `None` only when the directory holds no readable file at all.
     last_modified: Option<std::time::SystemTime>,
+    /// Bytes of blobs that a snapshot entry also holds as a separate copy;
+    /// see [`RepoUsage::duplicated_bytes`]. Part of `total_size`.
+    duplicated_bytes: u64,
+    /// Bytes of blobs no entry points at and no copy duplicates; see
+    /// [`RepoUsage::orphan_blob_bytes`]. Part of `total_size`.
+    orphan_blob_bytes: u64,
+    /// Bytes of partial downloads in `blobs/`; see
+    /// [`RepoUsage::partial_bytes`]. Part of `total_size`.
+    partial_bytes: u64,
+    /// Bytes outside `blobs/` and `snapshots/`; see
+    /// [`RepoUsage::bookkeeping_bytes`]. Part of `total_size`.
+    bookkeeping_bytes: u64,
+    /// The blob and copy behind each of `duplicated_bytes`, for
+    /// [`verify_duplicates`].
+    duplicates: Vec<DuplicatePair>,
+}
+
+/// A blob and the snapshot copy of it that `walk_repo_files` paired.
+struct DuplicatePair {
+    /// The blob under `blobs/`.
+    blob: PathBuf,
+    /// The snapshot entry holding a separate full copy of it.
+    copy: PathBuf,
+    /// Their shared length in bytes.
+    len: u64,
+}
+
+/// A regular file directly under `blobs/`, kept so the walk can tell, once
+/// the snapshots are read, what each one is for.
+struct BlobRecord {
+    /// Absolute path of the blob.
+    path: PathBuf,
+    /// Length in bytes.
+    len: u64,
+    /// Its [`physical_id`], where the platform provides one.
+    id: Option<(u64, u64)>,
+    /// Whether it is a partial download's temp file or resume sidecar.
+    partial: bool,
 }
 
 /// Walks one cached repo, returning its snapshot file list, its physical
@@ -1336,9 +1482,16 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     let mut files: Vec<CacheFileUsage> = Vec::new();
     let mut total_size: u64 = 0;
     let mut shared_size: u64 = 0;
+    let mut partial_bytes: u64 = 0;
     let mut last_modified: Option<std::time::SystemTime> = None;
     // Identities of the physical files already charged to `total_size`.
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    // What the blobs and the snapshot entries are, for pairing them once both
+    // are read.
+    let mut blobs: Vec<BlobRecord> = Vec::new();
+    let mut copies: Vec<(u64, PathBuf)> = Vec::new();
+    let mut entry_ids: HashSet<(u64, u64)> = HashSet::new();
+    let mut linked_blobs: HashSet<OsString> = HashSet::new();
     // Newest mtime outside `snapshots/`: the age of a repo that has no
     // snapshot files at all.
     let mut other_modified: Option<std::time::SystemTime> = None;
@@ -1357,8 +1510,10 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
         &mut BlobTotals {
             total_size: &mut total_size,
             shared_size: &mut shared_size,
+            partial_size: &mut partial_bytes,
             seen: &mut seen,
             newest: &mut other_modified,
+            blobs: &mut blobs,
         },
     );
 
@@ -1376,15 +1531,21 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
                 &snap_path,
                 "",
                 &mut files,
-                &mut total_size,
-                &mut last_modified,
-                &mut seen,
+                &mut SnapshotTotals {
+                    total_size: &mut total_size,
+                    last_modified: &mut last_modified,
+                    seen: &mut seen,
+                    copies: &mut copies,
+                    entry_ids: &mut entry_ids,
+                    linked_blobs: &mut linked_blobs,
+                },
             );
         }
     }
 
     // Everything else the directory holds, so the total is what deleting
     // it frees.
+    let before_bookkeeping = total_size;
     if let Ok(entries) = std::fs::read_dir(repo_dir) {
         for entry in entries {
             let Ok(entry) = entry else { continue };
@@ -1400,6 +1561,9 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
             );
         }
     }
+    let bookkeeping_bytes = total_size.saturating_sub(before_bookkeeping);
+
+    let scan = pair_duplicates(blobs, copies, &entry_ids, &linked_blobs);
 
     RepoFileWalk {
         files,
@@ -1411,7 +1575,81 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
         // age at all: `cache gc --older-than` could never select it, and the
         // guard that spares an active download could not recognise it.
         last_modified: last_modified.or(other_modified),
+        duplicated_bytes: scan.duplicated_bytes,
+        orphan_blob_bytes: scan.orphan_bytes,
+        partial_bytes,
+        bookkeeping_bytes,
+        duplicates: scan.pairs,
     }
+}
+
+/// What [`pair_duplicates`] found.
+struct DuplicateScan {
+    /// Bytes of blobs that have a separate copy among the snapshot entries.
+    duplicated_bytes: u64,
+    /// Bytes of blobs that nothing points at and nothing copies.
+    orphan_bytes: u64,
+    /// The blob and copy behind `duplicated_bytes`, in blob-path order.
+    pairs: Vec<DuplicatePair>,
+}
+
+/// Pairs each blob with the snapshot copy of it, if there is one.
+///
+/// A blob that a snapshot entry points at is *paired* and counts nowhere
+/// beyond the listing: a symlink entry names it in its target (`linked_blobs`
+/// holds those file names), and a hard-linked entry shares its identity
+/// (`entry_ids`, on platforms that have one). Any other blob is a *duplicate*
+/// when an entry that holds bytes of its own has the same length, and an
+/// *orphan* when none does. Partial downloads belong to neither. Each copy
+/// pairs with at most one blob, and a blob that two revisions both copy
+/// pairs with one of them, so the figure is the bytes a blob occupies, once.
+///
+/// Matching is by length alone, which is why [`verify_duplicates`] exists:
+/// two different files of one length can pair by chance, and then the bytes
+/// are attributed to the wrong class, never invented. Empty files never pair.
+fn pair_duplicates(
+    mut blobs: Vec<BlobRecord>,
+    copies: Vec<(u64, PathBuf)>,
+    entry_ids: &HashSet<(u64, u64)>,
+    linked_blobs: &HashSet<OsString>,
+) -> DuplicateScan {
+    // `read_dir` order is arbitrary; sorting makes the pairing repeatable.
+    blobs.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut by_len: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    for (len, path) in copies {
+        by_len.entry(len).or_default().push(path);
+    }
+    // Descending, so `pop` hands out the path that sorts first.
+    for paths in by_len.values_mut() {
+        paths.sort_by(|a, b| b.cmp(a));
+    }
+
+    let mut scan = DuplicateScan {
+        duplicated_bytes: 0,
+        orphan_bytes: 0,
+        pairs: Vec::new(),
+    };
+    for blob in blobs.into_iter().filter(|b| !b.partial && b.len > 0) {
+        let pointed_at = blob.id.is_some_and(|id| entry_ids.contains(&id))
+            || blob
+                .path
+                .file_name()
+                .is_some_and(|name| linked_blobs.contains(name));
+        if pointed_at {
+            continue;
+        }
+        if let Some(copy) = by_len.get_mut(&blob.len).and_then(Vec::pop) {
+            scan.duplicated_bytes = scan.duplicated_bytes.saturating_add(blob.len);
+            scan.pairs.push(DuplicatePair {
+                blob: blob.path,
+                copy,
+                len: blob.len,
+            });
+        } else {
+            scan.orphan_bytes = scan.orphan_bytes.saturating_add(blob.len);
+        }
+    }
+    scan
 }
 
 /// The running totals [`walk_blob_files`] adds to.
@@ -1420,10 +1658,15 @@ struct BlobTotals<'a> {
     total_size: &'a mut u64,
     /// The part of `total_size` that lives in the shared blob store.
     shared_size: &'a mut u64,
+    /// The part of `total_size` that is a partial download's temp file or
+    /// resume sidecar.
+    partial_size: &'a mut u64,
     /// Identities of the physical files already charged.
     seen: &'a mut HashSet<(u64, u64)>,
     /// Newest mtime seen outside `snapshots/`.
     newest: &'a mut Option<std::time::SystemTime>,
+    /// Every regular blob charged, for pairing with the snapshot entries.
+    blobs: &'a mut Vec<BlobRecord>,
 }
 
 /// Charges every regular file directly under `blobs/` to the repo's total,
@@ -1455,6 +1698,17 @@ fn walk_blob_files(blobs_dir: &Path, shared_store: Option<&Path>, totals: &mut B
                 continue;
             }
             *totals.total_size = totals.total_size.saturating_add(meta.len());
+            // BORROW: explicit .to_string_lossy() for OsString → str conversion
+            let partial = is_partial_bytes_name(&entry.file_name().to_string_lossy());
+            if partial {
+                *totals.partial_size = totals.partial_size.saturating_add(meta.len());
+            }
+            totals.blobs.push(BlobRecord {
+                path: entry.path(),
+                len: meta.len(),
+                id: physical_id(&meta),
+                partial,
+            });
             continue;
         }
         // Not a regular file: only a symlink into the shared store counts. A
@@ -1532,6 +1786,25 @@ fn note_newest_mtime(newest: &mut Option<std::time::SystemTime>, meta: &std::fs:
     }
 }
 
+/// The running totals [`walk_snapshot_files`] adds to.
+struct SnapshotTotals<'a> {
+    /// The repo's bytes on disk.
+    total_size: &'a mut u64,
+    /// Newest mtime across the snapshot files.
+    last_modified: &'a mut Option<std::time::SystemTime>,
+    /// Identities of the physical files already charged.
+    seen: &'a mut HashSet<(u64, u64)>,
+    /// Length and path of every entry that holds bytes of its own: the
+    /// candidates for being a copy of a blob.
+    copies: &'a mut Vec<(u64, PathBuf)>,
+    /// Identities of the physical files the entries resolve to; a blob in
+    /// this set has a hard link among them.
+    entry_ids: &'a mut HashSet<(u64, u64)>,
+    /// File names that the symlink entries' targets end in; a blob with one
+    /// of these names has a symlink pointing at it.
+    linked_blobs: &'a mut HashSet<OsString>,
+}
+
 /// Recursively walks a snapshot directory, collecting [`CacheFileUsage`]
 /// entries while accumulating `total_size` and `last_modified` alongside.
 ///
@@ -1546,9 +1819,7 @@ fn walk_snapshot_files(
     dir: &Path,
     prefix: &str,
     files: &mut Vec<CacheFileUsage>,
-    total_size: &mut u64,
-    last_modified: &mut Option<std::time::SystemTime>,
-    seen: &mut HashSet<(u64, u64)>,
+    totals: &mut SnapshotTotals<'_>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1566,7 +1837,7 @@ fn walk_snapshot_files(
             } else {
                 format!("{prefix}/{name}")
             };
-            walk_snapshot_files(&path, &child_prefix, files, total_size, last_modified, seen);
+            walk_snapshot_files(&path, &child_prefix, files, totals);
         } else {
             let filename = if prefix.is_empty() {
                 name
@@ -1591,21 +1862,37 @@ fn walk_snapshot_files(
             };
             let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
             if let Some(modified) = metadata.as_ref().and_then(|m| m.modified().ok()) {
-                match *last_modified {
+                match *totals.last_modified {
                     Some(current) if modified <= current => {} // EXPLICIT: current mtime is more recent, keep it
-                    _ => *last_modified = Some(modified),
+                    _ => *totals.last_modified = Some(modified),
                 }
+            }
+            // What the entry resolves to, for telling a pointer from a copy:
+            // a symlink names its blob in its target, and a hard link shares
+            // the blob's identity.
+            let id = metadata.as_ref().and_then(physical_id);
+            if let Some(id) = id {
+                totals.entry_ids.insert(id);
+            }
+            if is_link
+                && let Some(name) = std::fs::read_link(&path)
+                    .ok()
+                    .and_then(|target| target.file_name().map(OsStr::to_os_string))
+            {
+                totals.linked_blobs.insert(name);
             }
             // A symlink holds none of its own bytes; they were counted under
             // `blobs/`. A real file is charged unless it is a hard link to
-            // something already counted.
+            // something already counted, and one that is charged is a copy of
+            // its blob when it has one.
             if !is_link {
-                let first_sighting = match metadata.as_ref().and_then(physical_id) {
-                    Some(id) => seen.insert(id),
+                let first_sighting = match id {
+                    Some(id) => totals.seen.insert(id),
                     None => true,
                 };
                 if first_sighting {
-                    *total_size = total_size.saturating_add(size);
+                    *totals.total_size = totals.total_size.saturating_add(size);
+                    totals.copies.push((size, path));
                 }
             }
             files.push(CacheFileUsage { filename, size });
@@ -1851,6 +2138,102 @@ where
     }
 
     Ok(results)
+}
+
+/// What hashing a duplicated copy showed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateOutcome {
+    /// The copy's `SHA256` equals the blob's name, which for an LFS file is
+    /// the digest of its content: the copy holds the blob's bytes.
+    Identical,
+    /// The copy's `SHA256` differs from the blob's name: the two are not the
+    /// same bytes, so the pair is a coincidence of length (or one of them is
+    /// corrupt) and not a duplicate.
+    Differs,
+    /// The blob is not named by a `SHA256` (a git-stored file is named by its
+    /// git object hash), so hashing the copy proves nothing about it.
+    Unverifiable,
+}
+
+/// One duplicated copy and what hashing it showed, from [`verify_duplicates`]
+/// (new in v0.12.5).
+#[derive(Debug, Clone)]
+pub struct DuplicateCheck {
+    /// Absolute path of the snapshot entry holding the copy.
+    pub copy: PathBuf,
+    /// Absolute path of the blob it was paired with.
+    pub blob: PathBuf,
+    /// Length of both in bytes.
+    pub size: u64,
+    /// Whether the copy holds the blob's bytes.
+    pub outcome: DuplicateOutcome,
+}
+
+/// Whether `name` is a blob name that is the `SHA256` of its content: 64
+/// lowercase hex digits, as the Hub names an LFS file's blob.
+fn is_sha256_hex(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Hashes every duplicated copy in a cached repo and compares it with its
+/// blob (new in v0.12.5).
+///
+/// [`RepoUsage::duplicated_bytes`] pairs a blob with a snapshot entry of the
+/// same length, which is cheap and almost always right. This settles it: for
+/// an LFS file the blob's name is the `SHA256` of its content, so hashing the
+/// copy and comparing the digest with the name shows whether the copy holds
+/// those bytes. A blob named otherwise (a git-stored file, named by its git
+/// object hash) is reported [`DuplicateOutcome::Unverifiable`]: its byte
+/// comparison belongs to a command that would act on the pair.
+///
+/// Slow by design: it reads every copy once. Returns an empty `Vec` for a
+/// repo that is not cached or holds no duplicates.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined, or
+/// when a copy cannot be read.
+pub fn verify_duplicates(
+    repo_type: RepoType,
+    repo_id: &str,
+) -> Result<Vec<DuplicateCheck>, FetchError> {
+    let cache_dir = hf_cache_dir()?;
+    check_duplicates(&crate::cache_layout::repo_dir_for(
+        &cache_dir, repo_type, repo_id,
+    ))
+}
+
+/// [`verify_duplicates`] for the repo directory `repo_dir`.
+fn check_duplicates(repo_dir: &Path) -> Result<Vec<DuplicateCheck>, FetchError> {
+    let mut checks: Vec<DuplicateCheck> = Vec::new();
+    for pair in walk_repo_files(repo_dir).duplicates {
+        // BORROW: explicit .to_string_lossy() for OsStr → str conversion
+        let outcome = match pair.blob.file_name().map(|n| n.to_string_lossy()) {
+            Some(name) if is_sha256_hex(&name) => {
+                let digest = crate::checksum::sha256_hex_of_file(&pair.copy).map_err(|e| {
+                    FetchError::Io {
+                        // BORROW: explicit .clone() for owned PathBuf
+                        path: pair.copy.clone(),
+                        source: e,
+                    }
+                })?;
+                if digest == name {
+                    DuplicateOutcome::Identical
+                } else {
+                    DuplicateOutcome::Differs
+                }
+            }
+            _ => DuplicateOutcome::Unverifiable,
+        };
+        checks.push(DuplicateCheck {
+            copy: pair.copy,
+            blob: pair.blob,
+            size: pair.len,
+            outcome,
+        });
+    }
+    Ok(checks)
 }
 
 #[cfg(test)]
@@ -2681,5 +3064,243 @@ mod tests {
         assert_eq!(partial_chunk_size(&tmp, Some(sha)), Some(2048));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Adds a second snapshot copy of `blob` under a new commit, as a second
+    /// cached revision of the same file does.
+    fn add_revision_copy(repo_dir: &Path, blob: &Path, commit: &str) {
+        let snap = crate::cache_layout::snapshot_dir(repo_dir, commit);
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::copy(blob, snap.join("model.bin")).unwrap();
+    }
+
+    /// Windows' layout, as `hf-hub` writes it: the copy is the duplicate, and
+    /// the listed bytes, the duplicated ones and the rest add up to the total.
+    #[test]
+    fn walk_names_a_snapshot_copy_as_the_blobs_duplicate() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        std::fs::copy(&blob, snap.join("model.bin")).unwrap();
+        std::fs::create_dir_all(crate::cache_layout::refs_dir(&repo_dir)).unwrap();
+        std::fs::write(crate::cache_layout::ref_path(&repo_dir, "main"), "c0ffee").unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.duplicated_bytes, 1000);
+        assert_eq!(walk.orphan_blob_bytes, 0);
+        assert_eq!(walk.partial_bytes, 0);
+        assert_eq!(walk.bookkeeping_bytes, 6);
+        assert_eq!(walk.duplicates.len(), 1);
+        let listed: u64 = walk.files.iter().map(|f| f.size).sum();
+        assert_eq!(
+            listed
+                + walk.duplicated_bytes
+                + walk.orphan_blob_bytes
+                + walk.partial_bytes
+                + walk.bookkeeping_bytes,
+            walk.total_size,
+            "the figures partition the bytes on disk"
+        );
+    }
+
+    /// A symlinked pointer shares its blob: nothing is duplicated, and the
+    /// blob is not an orphan. The link is read by name, so this holds on
+    /// Windows too, where `physical_id` has nothing to say.
+    #[test]
+    fn walk_reports_no_duplicate_for_a_symlinked_pointer() {
+        let (_tmp, repo_dir, _blob, snap) = repo_with_blob(1000);
+        if !try_symlink(
+            &rel(&["..", "..", "blobs", "deadbeef"]),
+            &snap.join("model.bin"),
+        ) {
+            eprintln!("skipped: this platform refuses symlinks");
+            return;
+        }
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.duplicated_bytes, 0);
+        assert_eq!(walk.orphan_blob_bytes, 0);
+        assert_eq!(walk.total_size, 1000);
+    }
+
+    /// A hard-linked pointer is the blob itself, not a copy of it.
+    #[cfg(unix)]
+    #[test]
+    fn walk_reports_no_duplicate_for_a_hard_linked_pointer() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        std::fs::hard_link(&blob, snap.join("model.bin")).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.duplicated_bytes, 0);
+        assert_eq!(walk.orphan_blob_bytes, 0);
+    }
+
+    /// A blob nothing points at and nothing copies is an orphan, whatever its
+    /// neighbours are.
+    #[test]
+    fn walk_counts_an_unreferenced_blob_as_an_orphan() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        std::fs::copy(&blob, snap.join("model.bin")).unwrap();
+        std::fs::write(blob.with_file_name("feedface"), vec![b'y'; 300]).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.duplicated_bytes, 1000);
+        assert_eq!(walk.orphan_blob_bytes, 300);
+    }
+
+    /// Partial downloads and the resume sidecars beside them are their own
+    /// figure: neither orphans nor duplicates.
+    #[test]
+    fn walk_counts_partial_downloads_and_their_sidecars_apart() {
+        let (_tmp, repo_dir, blob, _snap) = repo_with_blob(1000);
+        let blobs = blob.parent().unwrap().to_path_buf();
+        std::fs::write(blobs.join("aaa.chunked.part"), vec![0_u8; 500]).unwrap();
+        std::fs::write(blobs.join("aaa.chunked.part.state"), vec![0_u8; 10]).unwrap();
+        std::fs::write(blobs.join("bbb.incomplete"), vec![0_u8; 700]).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.partial_bytes, 1210);
+        assert_eq!(
+            walk.orphan_blob_bytes, 1000,
+            "only the finished blob is an orphan"
+        );
+        assert_eq!(walk.duplicated_bytes, 0);
+    }
+
+    /// `refs/` and hf-fm's sidecars are bookkeeping.
+    #[test]
+    fn walk_counts_refs_and_sidecars_as_bookkeeping() {
+        let (_tmp, repo_dir, _blob, _snap) = repo_with_blob(1000);
+        std::fs::create_dir_all(crate::cache_layout::refs_dir(&repo_dir)).unwrap();
+        std::fs::write(crate::cache_layout::ref_path(&repo_dir, "main"), "c0ffee").unwrap();
+        std::fs::create_dir_all(crate::cache_layout::header_cache_dir(&repo_dir)).unwrap();
+        std::fs::write(
+            crate::cache_layout::header_cache_path(&repo_dir, "m.gguf", "e"),
+            vec![b'h'; 100],
+        )
+        .unwrap();
+        std::fs::write(snapshot_path(&repo_dir), vec![b's'; 40]).unwrap();
+
+        assert_eq!(walk_repo_files(&repo_dir).bookkeeping_bytes, 146);
+    }
+
+    /// Two cached revisions that each copy the blob: the blob is duplicated
+    /// once, so the figure is the bytes it occupies, and the extra copy
+    /// stays in the listing.
+    #[test]
+    fn walk_counts_a_blob_copied_by_two_revisions_once() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        std::fs::copy(&blob, snap.join("model.bin")).unwrap();
+        add_revision_copy(&repo_dir, &blob, "c0ffe2");
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.total_size, 3000);
+        assert_eq!(walk.duplicated_bytes, 1000);
+        let listed: u64 = walk.files.iter().map(|f| f.size).sum();
+        assert_eq!(listed + walk.duplicated_bytes, walk.total_size);
+    }
+
+    /// Empty files hold no bytes to save, and pairing them would only
+    /// produce noise.
+    #[test]
+    fn walk_never_pairs_empty_files() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(0);
+        std::fs::copy(&blob, snap.join("model.bin")).unwrap();
+
+        let walk = walk_repo_files(&repo_dir);
+
+        assert_eq!(walk.duplicated_bytes, 0);
+        assert_eq!(walk.orphan_blob_bytes, 0);
+    }
+
+    /// Names a blob after the `SHA256` of its content, as the Hub does an
+    /// LFS file's, and returns the new path.
+    fn rename_blob_to_its_digest(blob: &Path) -> PathBuf {
+        let digest = crate::checksum::sha256_hex_of_file(blob).unwrap();
+        let named = blob.with_file_name(digest);
+        std::fs::rename(blob, &named).unwrap();
+        named
+    }
+
+    #[test]
+    fn verify_confirms_a_copy_that_holds_the_blobs_bytes() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        let blob = rename_blob_to_its_digest(&blob);
+        std::fs::copy(&blob, snap.join("model.bin")).unwrap();
+
+        let checks = check_duplicates(&repo_dir).unwrap();
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].outcome, DuplicateOutcome::Identical);
+        assert_eq!(checks[0].size, 1000);
+    }
+
+    /// The case the length match cannot tell apart: a same-length file with
+    /// other content is paired, and hashing shows it is not the blob's copy.
+    #[test]
+    fn verify_refuses_a_same_length_file_with_other_content() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        rename_blob_to_its_digest(&blob);
+        std::fs::write(snap.join("model.bin"), vec![b'z'; 1000]).unwrap();
+
+        let checks = check_duplicates(&repo_dir).unwrap();
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].outcome, DuplicateOutcome::Differs);
+    }
+
+    /// A git-stored file's blob is named by its git object hash, which says
+    /// nothing about the copy's content.
+    #[test]
+    fn verify_leaves_a_git_named_blob_unverifiable() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(100);
+        std::fs::copy(&blob, snap.join("config.json")).unwrap();
+
+        let checks = check_duplicates(&repo_dir).unwrap();
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].outcome, DuplicateOutcome::Unverifiable);
+    }
+
+    /// `cache_summary_all` lists datasets and Spaces beside the models,
+    /// models first, a root-level dataset included; `cache_summary` keeps to
+    /// models, so `gc` and `status` cannot see the rest.
+    #[test]
+    fn summaries_list_other_repo_types_only_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        for folder in [
+            "models--org--m",
+            "datasets--org--d",
+            "datasets--wikitext",
+            "spaces--org--s",
+        ] {
+            let blobs = tmp.path().join(folder).join("blobs");
+            std::fs::create_dir_all(&blobs).unwrap();
+            std::fs::write(blobs.join("e"), vec![b'x'; 10]).unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("blobs")).unwrap();
+
+        let all = summarize_repos_in(tmp.path(), &RepoType::ALL).unwrap();
+        let models = summarize_repos_in(tmp.path(), &[RepoType::Model]).unwrap();
+
+        let listing: Vec<(RepoType, &str)> = all
+            .iter()
+            .map(|s| (s.repo_type, s.repo_id.as_str()))
+            .collect();
+        assert_eq!(
+            listing,
+            vec![
+                (RepoType::Model, "org/m"),
+                (RepoType::Dataset, "org/d"),
+                (RepoType::Dataset, "wikitext"),
+                (RepoType::Space, "org/s"),
+            ]
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].repo_id, "org/m");
     }
 }

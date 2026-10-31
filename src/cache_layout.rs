@@ -11,6 +11,83 @@
 
 use std::path::{Path, PathBuf};
 
+/// The kind of repository a cache folder holds (new in v0.12.5).
+///
+/// The `HuggingFace` cache keeps models, datasets and Spaces side by side,
+/// told apart by the plural that starts the folder name (`models--…`,
+/// `datasets--…`, `spaces--…`). Only [`RepoType::Model`] is downloaded by
+/// this crate; `du` lists the other two so its total is the cache's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RepoType {
+    /// A model repository: `models--org--name`.
+    Model,
+    /// A dataset repository: `datasets--org--name`.
+    Dataset,
+    /// A Space: `spaces--org--name`.
+    Space,
+}
+
+impl RepoType {
+    /// Every repo type, in the order `du` considers them.
+    pub const ALL: [Self; 3] = [Self::Model, Self::Dataset, Self::Space];
+
+    /// The plural that starts this type's cache folder names.
+    #[must_use]
+    pub const fn folder_prefix(self) -> &'static str {
+        match self {
+            Self::Model => "models",
+            Self::Dataset => "datasets",
+            Self::Space => "spaces",
+        }
+    }
+
+    /// The singular word for this type, as `du` prints and `--json` reports it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Dataset => "dataset",
+            Self::Space => "space",
+        }
+    }
+
+    /// How a repo of this type is addressed on the command line and on the
+    /// Hub: a model by its bare ID, the others behind their URL prefix
+    /// (`datasets/org/name`), since a model and a dataset may share an
+    /// `org/name`.
+    #[must_use]
+    pub fn address(self, repo_id: &str) -> String {
+        match self {
+            Self::Model => String::from(repo_id),
+            Self::Dataset => format!("datasets/{repo_id}"),
+            Self::Space => format!("spaces/{repo_id}"),
+        }
+    }
+}
+
+/// Splits a command-line repo argument into its type and bare ID: the inverse
+/// of [`RepoType::address`].
+///
+/// `datasets/org/name` is a dataset and `spaces/org/name` a Space; anything
+/// else is a model, returned unchanged. A prefix with nothing after it is not
+/// one (`datasets/` stays a model argument and fails later, as any unknown ID
+/// does).
+#[must_use]
+pub fn split_repo_address(arg: &str) -> (RepoType, &str) {
+    for repo_type in [RepoType::Dataset, RepoType::Space] {
+        let prefix = repo_type.folder_prefix();
+        if let Some(rest) = arg
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_prefix('/'))
+            .filter(|r| !r.is_empty())
+        {
+            return (repo_type, rest);
+        }
+    }
+    (RepoType::Model, arg)
+}
+
 /// Repo folder name: `"models--org--name"`.
 ///
 /// Constructed here rather than delegated: `hf-hub` 0.5 exposed the naming
@@ -23,7 +100,16 @@ use std::path::{Path, PathBuf};
 /// which is the guarantee that mattered.
 #[must_use]
 pub fn repo_folder_name(repo_id: &str) -> String {
-    let mut name = String::from("models");
+    repo_folder_name_for(RepoType::Model, repo_id)
+}
+
+/// Repo folder name for any repo type: `"datasets--org--name"`,
+/// `"spaces--org--name"`, or [`repo_folder_name`]'s `"models--org--name"`
+/// (new in v0.12.5).
+#[must_use]
+pub fn repo_folder_name_for(repo_type: RepoType, repo_id: &str) -> String {
+    // BORROW: explicit .to_owned() for &str → owned String
+    let mut name = repo_type.folder_prefix().to_owned();
     for segment in repo_id.split('/') {
         name.push_str("--");
         name.push_str(segment);
@@ -31,10 +117,39 @@ pub fn repo_folder_name(repo_id: &str) -> String {
     name
 }
 
+/// Reconstructs a repo's type and ID from a cache folder name such as
+/// `datasets--org--name`, or `None` for any other directory (the shared blob
+/// store, `.locks`, a stray file) (new in v0.12.5).
+///
+/// The first `--` after the type prefix becomes the `/` of the ID; a
+/// root-level repo (`models--gpt2`, `datasets--wikitext`) has none and keeps
+/// its bare name.
+#[must_use]
+pub fn parse_repo_folder_name(dir_name: &str) -> Option<(RepoType, String)> {
+    RepoType::ALL.into_iter().find_map(|repo_type| {
+        let repo_part = dir_name
+            .strip_prefix(repo_type.folder_prefix())?
+            .strip_prefix("--")?;
+        let repo_id = match repo_part.split_once("--") {
+            Some((org, name)) => format!("{org}/{name}"),
+            // BORROW: explicit .to_owned() for &str → owned String
+            None => repo_part.to_owned(),
+        };
+        Some((repo_type, repo_id))
+    })
+}
+
 /// Repo root directory: `{cache_root}/models--org--name/`.
 #[must_use]
 pub fn repo_dir(cache_root: &Path, repo_id: &str) -> PathBuf {
-    cache_root.join(repo_folder_name(repo_id))
+    repo_dir_for(cache_root, RepoType::Model, repo_id)
+}
+
+/// Repo root directory for any repo type:
+/// `{cache_root}/datasets--org--name/` and so on (new in v0.12.5).
+#[must_use]
+pub fn repo_dir_for(cache_root: &Path, repo_type: RepoType, repo_id: &str) -> PathBuf {
+    cache_root.join(repo_folder_name_for(repo_type, repo_id))
 }
 
 /// Snapshots directory: `{repo_dir}/snapshots/`.
@@ -278,6 +393,90 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn folder_names_carry_the_repo_type_plural() {
+        assert_eq!(repo_folder_name("org/name"), "models--org--name");
+        assert_eq!(
+            repo_folder_name_for(RepoType::Dataset, "org/name"),
+            "datasets--org--name"
+        );
+        assert_eq!(
+            repo_folder_name_for(RepoType::Space, "org/name"),
+            "spaces--org--name"
+        );
+        // A root-level repo has no organisation segment.
+        assert_eq!(
+            repo_folder_name_for(RepoType::Dataset, "wikitext"),
+            "datasets--wikitext"
+        );
+    }
+
+    #[test]
+    fn parse_repo_folder_name_inverts_repo_folder_name_for() {
+        for repo_type in RepoType::ALL {
+            for repo_id in ["org/name", "gpt2", "org/a-b"] {
+                let folder = repo_folder_name_for(repo_type, repo_id);
+                assert_eq!(
+                    parse_repo_folder_name(&folder),
+                    Some((repo_type, repo_id.to_owned())),
+                    "{folder}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_repo_folder_name_ignores_what_is_not_a_repo_folder() {
+        for name in [
+            "blobs",
+            ".locks",
+            "CACHEDIR.TAG",
+            "models",
+            "models-x",
+            "modelsx--a",
+        ] {
+            assert_eq!(parse_repo_folder_name(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn split_repo_address_reads_the_hub_url_prefix() {
+        assert_eq!(
+            split_repo_address("datasets/org/name"),
+            (RepoType::Dataset, "org/name")
+        );
+        assert_eq!(
+            split_repo_address("spaces/org/name"),
+            (RepoType::Space, "org/name")
+        );
+        assert_eq!(
+            split_repo_address("datasets/wikitext"),
+            (RepoType::Dataset, "wikitext")
+        );
+        assert_eq!(
+            split_repo_address("org/name"),
+            (RepoType::Model, "org/name")
+        );
+        assert_eq!(split_repo_address("gpt2"), (RepoType::Model, "gpt2"));
+        // A prefix with nothing after it, or a longer first segment, is a model argument.
+        assert_eq!(
+            split_repo_address("datasets/"),
+            (RepoType::Model, "datasets/")
+        );
+        assert_eq!(
+            split_repo_address("datasetsx/org"),
+            (RepoType::Model, "datasetsx/org")
+        );
+    }
+
+    #[test]
+    fn address_is_the_inverse_of_split_repo_address() {
+        for repo_type in RepoType::ALL {
+            let address = repo_type.address("org/name");
+            assert_eq!(split_repo_address(&address), (repo_type, "org/name"));
+        }
+    }
 
     #[test]
     fn blob_path_joins_repo_dir_and_etag() {
