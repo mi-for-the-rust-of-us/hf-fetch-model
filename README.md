@@ -407,4 +407,4 @@ or [MIT License](LICENSE-MIT) at your option.
 - Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev)
 - Git workflow managed with [Fork](https://fork.dev/)
 - All code follows [CONVENTIONS.md](CONVENTIONS.md), derived from [Amphigraphic-Strict](https://github.com/PCfVW/Amphigraphic-Strict)'s [Grit](https://github.com/PCfVW/Amphigraphic-Strict/tree/master/Grit) — a strict Rust subset designed to improve AI coding accuracy.
-- CI gates every push and PR: `cargo fmt --check`, `clippy --all-targets --all-features -D warnings`, and the test suite on **Linux and Windows**, plus a [`cargo audit`](https://github.com/rustsec/rustsec) security pass. Vulnerability disclosure: see [SECURITY.md](SECURITY.md).
+- CI gates every push and PR: `cargo fmt --check`, `clippy --all-targets --all-features -D warnings`, and the test suite on **Linux and Windows**, plus a [`cargo audit`](https://github.com/rustsec/rustsec) security pass and a [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) check of licences, banned crates and sources. Vulnerability disclosure: see [SECURITY.md](SECURITY.md).
