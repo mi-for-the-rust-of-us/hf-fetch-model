@@ -665,7 +665,7 @@ No implementation order imposed — the six items are independent (different sub
 
 **Implementation order.** Row 1 (`--group-by`) before row 2 (`quants` + `--fits`) is a hard dependency — the offload-plan arithmetic reads the rollup directly — and mirrors the report's own sequencing note: *"Gap 3 is the one to build first, because it is the only one that is purely local to a single header parse, and both of the others become straightforward once a byte rollup exists."* Rows 3 and 4 share one detection heuristic (self-contained multi-file quant repo vs. `index.json` shard set) and are natural to land together, in either order, independent of rows 1–2. Row 5 is independent perf work and can land at any point in the sequence.
 
-**Relationship to v0.13.0.** `--fits`'s offload plan and `--check-gpu`'s device verdict are complementary, not overlapping: `--check-gpu` answers "does this one already-chosen file fit on this one GPU, at this context length"; `--fits` answers "which of N candidate quant files fits at all, and what CPU-offload split do the tight ones need" *before* a file is chosen. Composing them — `--fits` narrowing the candidates, `--check-gpu` confirming the winner against live free VRAM rather than the nominal budget passed to `--fits` — is a natural follow-up but out of scope here, since `--fits` takes a user-supplied byte budget, not a live device query.
+**Relationship to [v0.13.0](multi-gpu-roadmap.md).** `--fits`'s offload plan and `--check-gpu`'s device verdict are complementary, not overlapping: `--check-gpu` answers "does this one already-chosen file fit on this one GPU, at this context length"; `--fits` answers "which of N candidate quant files fits at all, and what CPU-offload split do the tight ones need" *before* a file is chosen. Composing them — `--fits` narrowing the candidates, `--check-gpu` confirming the winner against live free VRAM rather than the nominal budget passed to `--fits` — is a natural follow-up but out of scope here, since `--fits` takes a user-supplied byte budget, not a live device query.
 
 ---
 
@@ -760,7 +760,7 @@ How far each `rustls` advisory reaches hf-fm, from the features its graph enable
 
 **candle-mi follows.** candle-mi raises its requirement from `"0.12.3"` to `"0.12.4"`, so the floor reaches candle-mi's own dependents and not just its lockfile. candle-mi's `deny.toml` keeps its three `zip` ignores (commit `823c65e`): there `zip` 8.6 is a required dependency of `candle-core` 0.11, which hf-fm cannot influence, and the ignores go when candle moves to `zip` 9 (huggingface/candle#4037, #4041).
 
-**Out of scope:** switching `reqwest` to `native-tls` or another TLS backend (it would bring in OpenSSL on Linux to avoid one patch release); a `rustls` `[patch]` or fork; and anything in the v0.13.0 multi-GPU plan.
+**Out of scope:** switching `reqwest` to `native-tls` or another TLS backend (it would bring in OpenSSL on Linux to avoid one patch release); a `rustls` `[patch]` or fork; and anything in the [v0.13.0 multi-GPU plan](multi-gpu-roadmap.md).
 
 **Status: implemented on `main`, unreleased** (the release commit, tag and publish are pending). Verified on 2026-10-31 on Windows: `cargo audit` exit 0 and `cargo deny check` clean with `ignore = []`; `cargo tree -i zip` empty; the full local gauntlet (fmt, clippy on both feature sets, tests in both forms, and clippy plus tests on MSRV 1.91); a cold-cache `download-file` of two repos and a remote range `inspect` of a `.safetensors` file through the new TLS stack. Not run here: the Linux lane (the change has no `cfg`-gated code).
 
@@ -808,7 +808,7 @@ How far each `rustls` advisory reaches hf-fm, from the features its graph enable
 
 **Deferred to [v0.12.6](#v0126--cache-dedupe-reclaim-the-duplicated-windows-copies-21), in the report's order.** Proposal 3, `cache dedupe`, with Windows hard-link recognition in the same release: `--dry-run` by default, content checked (SHA-256 against the blob's name for LFS files, byte comparison for small non-LFS ones), then the copy replaced by a hard link; recognition through the `same-file` crate, the one option stable today (it is what `walkdir` uses, and #21 notes it is in the lockfile only as an Android build-dependency). #21's open question, whether `huggingface_hub`'s `scan_cache_dir` and `try_to_load_from_cache` tolerate a hard-linked pointer, can be checked on the maintainer's machine before and after. Proposal 4, prevention: hf-fm's own writes try a hard link before copying, after a measurement of whether every download path goes through hf-fm's wrapper around `hf-hub`, whose writes stay copies. Once a hard link can exist, row 1's detector must not report a hard-linked pointer as a duplicate, which on Windows is the same recognition problem, so the two ship together. Until then, a hand-made hard link would be reported as a duplicate by the new column, just as `du`'s totals count it twice.
 
-**Out of scope:** `cache dedupe` and hard-link creation or recognition; dropping a blob once its snapshot copy is verified (#21 leaves it unproposed until `hf-hub` and `huggingface_hub` are checked against a missing blob); dataset and Space *downloads* (`--repo-type`), a separate gap of the [dataset-archive report](../dogfooding-feedbacks/hf-fm-dogfooding-dataset-archive-migration.md); and anything in the v0.13.0 multi-GPU plan.
+**Out of scope:** `cache dedupe` and hard-link creation or recognition; dropping a blob once its snapshot copy is verified (#21 leaves it unproposed until `hf-hub` and `huggingface_hub` are checked against a missing blob); dataset and Space *downloads* (`--repo-type`), a separate gap of the [dataset-archive report](../dogfooding-feedbacks/hf-fm-dogfooding-dataset-archive-migration.md); and anything in the [v0.13.0 multi-GPU plan](multi-gpu-roadmap.md).
 
 ### v0.12.6 — `cache dedupe`: reclaim the duplicated Windows copies ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21))
 
@@ -840,83 +840,13 @@ How far each `rustls` advisory reaches hf-fm, from the features its graph enable
 
 **Acceptance.** On the maintainer's cache (21 repos, 154.2 GiB duplicated, the figures of v0.12.5): `cache dedupe --dry-run` reports that figure; `cache dedupe --yes` then makes the volume's free space grow by it (within the cluster slack, 18 to 40 KB per repo, that v0.12.5's addendum measured), `du`'s total fall by the same amount, `DUP` read 0, and a second run report nothing; `hf-fm cache verify` passes on the touched repos that have LFS files (this one needs the network); Python `huggingface_hub`'s `scan_cache_dir` reports no warnings and `try_to_load_from_cache` loads one of them; `hf-fm download-file` reads "Cached". A fresh download of an LFS file on Windows leaves one physical file. The CHANGELOG records the `du` timing before and after, and the run's time and throughput for the hashing, which is the cost of decision 3.
 
-**Out of scope:** dropping the blob (decided against above); sharing identical payloads *across* repos, which hard links could also do, but which changes the unit of work from a repo to the whole cache; hard links on a volume that does not support them beyond skipping; and anything in the v0.13.0 multi-GPU plan.
+**Out of scope:** dropping the blob (decided against above); sharing identical payloads *across* repos, which hard links could also do, but which changes the unit of work from a repo to the whole cache; hard links on a volume that does not support them beyond skipping; and anything in the [v0.13.0 multi-GPU plan](multi-gpu-roadmap.md).
 
 ---
 
 ### v0.13.0 — Multi-GPU + multi-context `--check-gpu` matrix
 
-| Feature | Scope |
-|---------|-------|
-| `inspect --check-gpu all` | Multi-GPU verdict. Iterates over `hypomnesis::device_count()`, prints one `GPU N:` line per visible device with its own free/used numbers, and picks the device with the most free VRAM for the `Fit:` summary line. The `all` token is parsed via clap's `value_parser`: a bare `--check-gpu` keeps the v0.10.1 single-device default, `--check-gpu N` keeps single-device targeting, `--check-gpu all` enables the iteration. JSON path gains a `devices: [...]` array under `gpu_check` and the existing `device` key becomes an alias for the auto-picked entry. Closes the "I have a 5060 Ti and a 5050 in the same box" case without breaking the v0.10.1 single-device default. |
-| `inspect --check-gpu --context-sweep` | Multi-context fit-profile sweep. Prints a table of `Total = W + KV [+ Mamba]` and Fit verdicts at a representative set of context lengths (e.g. 4 K / 16 K / 64 K / 128 K) instead of a single context number. Composes with `--check-gpu N` and `--check-gpu all`, so the matrix can be one-GPU-many-contexts or many-GPUs-many-contexts. Reuses v0.10.4's KV + Mamba budgeting math at each cell. Natural companion to `--check-gpu all` — both are *"show me a matrix of verdicts"* — which is why they ship together. |
-| `inspect --check-gpu --processes` (hypomnesis `0.2.2` `PDH` backend) | Itemize the device's `used:` VRAM by process, so the verdict answers not just *"will it fit?"* but *"what do I need to close first?"*. The single-line `free: X, used: Y` becomes a short per-process breakdown (`ollama.exe 4.2 GiB`, `Code.exe 0.8 GiB`, …). Built on `hypomnesis::gpu_processes()`, whose Windows/`WDDM` per-process path landed in **hypomnesis 0.2.2** via the new `PDH` backend (reads the same `VidMm` data as Task Manager's *Dedicated GPU memory* column). hf-fm stayed on `0.2.1` through v0.10.x because `--check-gpu` only uses `device_info` (device-level totals) — the per-process backend was unused weight. This feature is the reason to finally bump: it turns the consumer-GPU "I have 2.76 GiB used and don't know by what" gap into an answer. |
-
-| `inspect --check-gpu` gated-repo estimated verdict | When the header Range request hits a gated repo's 401/403, fall back to the **public** file listing (gated repos' metadata — sizes, SHA256s — is public; only content is gated) and emit an *estimated* weights-only verdict from the summed `.safetensors` file sizes (file size ≈ weights + a few-KiB header; on Llama-3.1-8B the estimate and the header-precise figure are both 14.96 GiB). Output labels the provenance explicitly: `Fit (estimated from public file sizes — header-precise verdict needs the accepted license): ✗ short by 2.2 GiB`. `--context` cannot compose (a gated repo's `config.json` content is itself gated), so the estimate stays weights-only and says so. **Dogfooding origin (2026-06-12):** the "why must I accept a license before knowing whether the model even fits my GPU?" complaint while provisioning the Goodfire geometric-calculator replication; the session workaround — inspect a byte-identical ungated mirror, verified by matching LFS SHA256s — is documented in the FAQ's gated-model entry. This feature makes the workaround unnecessary for the weights question. Placed here because it extends the same `--check-gpu` verdict family, but small enough to pull forward into a v0.10.x patch if demand surfaces: the public listing is already fetched by `list-files`, and the 401/403 detection hook shipped in v0.10.5. |
-
-**Hypomnesis bump 0.2.1 → 0.2.3 — taken early in v0.10.5 (2026-06-12).** The original plan (below, kept for the record) was to hold at `0.2.1` until the v0.13.x `--check-gpu --processes` work, on the reasoning that 0.2.2's Windows `PDH` per-process backend was unused weight for a `device_info`-only consumer. That reasoning held for 0.2.2 — but **0.2.3 adds first-class macOS / Apple Silicon support, including the device-wide VRAM budget via `MTLDevice.recommendedMaxWorkingSetSize`, which is precisely the `device_info` figure `--check-gpu` reads.** That turns `inspect --check-gpu` from "no GPU detected" into a real fit verdict on a Mac — a `device_info` win the deferral never contemplated, so the bump was pulled forward. Cost on the hf-fm side was one line (`gpu_check.rs` `friendly_error` now handles the `HypomnesisError::Pdh` variant explicitly, satisfying `wildcard_enum_match_arm`); the new `objc2` / `objc2-metal` deps are `cfg(target_os = "macos")`-gated, so Linux/Windows builds are byte-identical. The per-process `gpu_processes()` path (PDH / Metal compute-process listing) remains unused until `--check-gpu --processes` lands in v0.13.x — that feature still drives the *next* hypomnesis interaction, just not the version pin.
-
-> *Original deferral note (superseded by the 0.2.3 adoption above):* Through the v0.10.x `--check-gpu` line hf-fm pins `hypomnesis = "0.2.1"`: the KV/Mamba budgeting work reads only `device_info` (device-level total/free/used), which 0.2.2 does not change, while 0.2.2's headline addition — the Windows `PDH` per-process-VRAM backend for `gpu_processes()` — would compile unused into the binary. The bump's natural home is the v0.13.x GPU-reach line. Until then, pinning 0.2.1 keeps hf-fm's build free of a backend it does not exercise.
-
-**Theme: broaden `--check-gpu` from a single verdict to a matrix.** v0.10.1 introduced single-device, weights-only `--check-gpu`; v0.10.4 added KV-cache and hybrid-Mamba budgeting at a user-supplied context. v0.13.0 closes out the family: instead of one device × one context giving one verdict, the user can ask for all devices × a context-length sweep and read off a table. Deferred to v0.13.0 because both features want real multi-GPU hardware to validate (the iteration ordering, the auto-pick heuristic, and the per-GPU sweep all need an actual second device on the box).
-
-**Why v0.13 and not v0.11.x or any v0.12.x.** The v0.11 line is dedicated to remote-inspect framework work (`HttpRangeReader` + format coverage) — stitching multi-GPU into v0.11 would dilute that focus. v0.12.0 was then claimed by backlog cleaning (above) rather than left idle while waiting on hardware, since none of that phase's six items need a second GPU either — and v0.12.1's quant-aware fit planning (above) follows the same reasoning, surfaced by dogfooding after the v0.12.0 scope was already fixed. v0.12.2's disk-accounting follow-through (above) needed no second GPU either, and v0.12.3's inspect API ergonomics need none. That keeps each boundary clean: *v0.11 = format reach, v0.12.0 = backlog cleaning, v0.12.1 = quant/fit-planning reach, v0.12.2 = honest disk accounting, v0.12.3 = inspect API ergonomics, v0.12.4 = the TLS advisories, v0.12.5 = `du` names the duplicates, v0.12.6 = `cache dedupe`, v0.13 = GPU reach* — and means v0.13.0 can slip freely against hardware availability without blocking anything else.
-
-**Hardware prerequisite.** Maintainer's box gains a second GPU (5050 8GiB alongside the 5060 Ti 16GiB) before this lands — the multi-GPU iteration ordering, the auto-pick heuristic, and the per-device sweep numbers all want a real second device to be exercised against, not a mock.
-
----
-
-#### Reference — RTX 5050 8 GB in PCIEX2 on the B550 GAMING X V2
-
-> Compatibility analysis verifying that the **Hardware prerequisite** above is feasible: can a second NVIDIA GPU (specifically an RTX 5050 8 GB) be added to the maintainer's existing system (B550 GAMING X V2 + RTX 5060 Ti 16 GB) in the PCIEX2 slot? Conducted 2026-05-19; source: GIGABYTE *B550 GAMING X V2 User's Manual* rev. 1301, §1-2 *Product Specifications* (p. 6), §1-5 *Installing an Expansion Card* (p. 10), and motherboard layout (p. 4).
-
-**Verdict.** The slot will physically and electrically accept the RTX 5050 8 GB, with three qualifications: PCIe 3.0 ×2 wiring (one-sixteenth the card's native bandwidth), physical clearance below the primary GPU must be verified, and the slot delivers only 75 W (rest from PSU).
-
-**Slot spec — verbatim from the manual** (§1-2, p. 6):
-
-> *"1 x PCI Express x16 slot (PCIEX2), integrated in the Chipset: Supporting PCIe 3.0 x2 mode"*
-
-| Attribute | Value | Implication |
-|---|---|---|
-| Physical connector | x16 (full-length) | Any PCIe card width (x1/x2/x4/x8/x16) fits mechanically. |
-| Electrical lanes | x2 (only 2 of 16 wired) | Card runs in compatibility mode at 2-lane width regardless of native width. |
-| PCIe generation | 3.0 | Card auto-negotiates down from its native generation (PCIe 5.0 on Blackwell). |
-| Lane source | Chipset (AMD B550), not CPU | Routes via the B550 chipset → CPU link (PCIe 4.0 ×4 on Ryzen 5000), shared with M.2 SB, SATA, other chipset slots/USB. |
-
-**Compatibility — three dimensions.**
-
-1. *Electrical / PCIe protocol — fully compatible.* PCIe is backward-compatible across generations and width-down-negotiable. RTX 5050 (PCIe 5.0 ×8 native) in this slot runs as PCIe 3.0 ×2 effective ≈ 1.97 GB/s peak unidirectional. Nothing in the manual prohibits or restricts which GPU goes here.
-
-2. *Physical clearance — verify against the primary GPU.* Motherboard layout (manual p. 4) shows slot order top-to-bottom: `PCIEX16 → PCIEX1_1 → PCIEX1_2 → PCIEX2 → PCIEX1_3`. PCIEX2 sits ~3 slot pitches (≈ 6 cm) below PCIEX16. The risk is the existing 5060 Ti's cooler shroud overhanging the PCIEX2 area:
-
-   | 5060 Ti slot width | Vertical occupation | Clearance to PCIEX2 |
-   |---|---|---|
-   | 2 slots | ~40 mm | ~20 mm headroom ✓ |
-   | 2.5 slots | ~50 mm | ~10 mm headroom ✓ |
-   | 3 slots | ~60 mm | Marginal — verify with calipers |
-   | 3.5+ slots | ~70+ mm | Blocked ✗ |
-
-   RTX 5050 8 GB is almost universally a 2-slot card, so it fits *into* PCIEX2 without issue; the only open question is whether the primary 5060 Ti's cooler overhangs it.
-
-3. *Power.* The slot supplies the standard PCIe 75 W. RTX 5050 8 GB TDP ≈ 130 W → needs an external 8-pin (or 6+2) PCIe power cable from the PSU. The 850 W PSU has ample cables.
-
-**Performance implications for the v0.13.0 pipeline-parallel use case.** For PP-style serving where the second GPU receives intermediate activations across a layer boundary:
-
-| Operation | Data per event | Time at PCIe 3.0 ×2 (~2 GB/s) | Acceptable? |
-|---|---|---|---|
-| One-time model load (~6 GiB worth of weights to Cuda(1)) | 6 GiB | ~3 s | ✓ once per session |
-| Prefill: per-layer-boundary activation transfer (seq=2048, hidden=4096, BF16) | 16 MiB | ~8 ms | ✓ |
-| Incremental decode: per-layer-boundary transfer (seq=1) | 8 KiB | ~4 µs | ✓ trivial |
-| KV cache transfer (KV lives on each layer's device — no cross-device transfer required) | n/a | n/a | n/a |
-
-For autoregressive inference the PCIe 3.0 ×2 wiring is fine. Prefill on long sequences incurs ~8 ms per layer boundary (≈ 16 ms per token in an 18/14 split with both forward boundaries); decode is bandwidth-trivial.
-
-**Two things the manual doesn't address but are worth knowing.**
-
-1. *Chipset-link contention.* All chipset PCIe traffic shares one PCIe 4.0 ×4 link to the CPU (≈ 8 GB/s aggregate). Heavy concurrent M.2 SSD reads + GPU on PCIEX2 + USB traffic could in principle contend; for inference workloads this won't bite — 2 GB/s GPU + ≈ 1 GB/s M.2 reads at startup is well under the ceiling.
-2. *No BIOS configuration required.* §1 and §2 of the manual mention no disabling or sharing of PCIEX2 lanes. The slot is hardwired ×2 from the chipset regardless of which other slots are populated. Both GPUs will appear in `nvidia-smi` and in `hypomnesis::device_count()` automatically — which is exactly what `inspect --check-gpu all` needs.
-
-**Conclusion.** Hardware plan is viable for the v0.13.0 work. Only material risk before purchase is **physical clearance with the existing 5060 Ti's cooler** — measure first. PSU, power delivery, BIOS, and chipset routing are all fine.
+Moved to the [multi-GPU roadmap](multi-gpu-roadmap.md) on 2026-10-31: its theme is GPU reach, not cache management, and it waits on hardware (a second GPU) rather than on anything in the v0.12.x line. `--check-gpu all`, `--check-gpu --context-sweep`, `--check-gpu --processes` and the gated-repo estimated verdict are all there, with the reference analysis for the RTX 5050 in the PCIEX2 slot.
 
 ---
 
