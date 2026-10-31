@@ -477,8 +477,12 @@ See also: hf-fm list-families, hf-fm discover")]
     Du {
         /// Repository identifier or numeric index (omit to show all cached repos).
         ///
-        /// Use a repo ID (e.g., `"google/gemma-2-2b-it"`) or a `#` index from the
-        /// `du` summary to drill into a specific repo's files.
+        /// Use a repo ID (e.g., `"google/gemma-2-2b-it"`), the bare name of a
+        /// cached root-level repo (`gpt2`), or a `#` index from the `du`
+        /// summary to drill into a specific repo's files. A dataset or Space
+        /// is addressed behind its Hub prefix: `datasets/org/name`,
+        /// `spaces/org/name`. `du` lists models, datasets and Spaces, so its
+        /// total is the cache's.
         repo_id: Option<String>,
         /// Show a last-modified age column (e.g., `"2 days ago"`, `"3 months ago"`).
         #[arg(long)]
@@ -490,6 +494,21 @@ See also: hf-fm list-families, hf-fm discover")]
         /// `--age`, which adds a last-modified column on each repo branch.
         #[arg(long, conflicts_with = "repo_id")]
         tree: bool,
+        /// Order the summary by `size` (the default) or by `dup`, the bytes
+        /// stored twice as duplicated copies.
+        ///
+        /// The `#` column stays each repo's rank by size, which is what
+        /// `du <N>` takes.
+        #[arg(long, value_enum, value_name = "KEY", conflicts_with_all = ["repo_id", "tree"])]
+        sort: Option<DuSort>,
+        /// Hash every duplicated copy and compare it with its blob.
+        ///
+        /// Duplicates are found by length, which is cheap and almost always
+        /// right; this reads every copy once (tens of GiB take minutes) and
+        /// confirms each against the blob's `SHA256` name. Git-stored files,
+        /// whose blob is named by a git hash, are reported as unverifiable.
+        #[arg(long, conflicts_with = "tree")]
+        verify_duplicates: bool,
         /// Output disk usage as JSON (flat by default; `--tree` nests files per repo).
         #[arg(long)]
         json: bool,
@@ -894,7 +913,31 @@ fn sort_subcommands_alphabetically(mut cmd: clap::Command) -> clap::Command {
     cmd
 }
 
+/// Stack size of the thread that parses the command line and runs the command.
+///
+/// The Windows main thread has 1 MiB, and in a debug build the `clap`
+/// derive's command builder alone, with one frame holding every subcommand's
+/// arguments, comes within a few arguments of it: adding the two flags of
+/// `du` in v0.12.5 overflowed the stack before `--version` could print. A
+/// worker with room to spare ends that for every flag still to come, in
+/// release builds too, whose frames are smaller but not unbounded.
+const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 fn main() -> ExitCode {
+    match std::thread::Builder::new()
+        .name("hf-fm".to_owned()) // BORROW: explicit .to_owned() for &str → owned String
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(run_cli)
+    {
+        // A panic has printed its message on the worker; report it as the
+        // runtime does for a panic on the main thread.
+        Ok(worker) => worker.join().unwrap_or(ExitCode::from(101)),
+        // No thread could be spawned: run on this one, as before.
+        Err(_) => run_cli(),
+    }
+}
+
+fn run_cli() -> ExitCode {
     let cmd = sort_subcommands_alphabetically(Cli::command());
     let matches = cmd.get_matches();
     let cli = match Cli::from_arg_matches(&matches) {
@@ -1141,24 +1184,30 @@ fn run(cli: Cli) -> Result<(), FetchError> {
             repo_id: Some(repo_id),
             age: _,
             tree: _, // EXPLICIT: clap conflicts_with rejects --tree alongside repo_id
+            sort: _, // EXPLICIT: clap conflicts_with rejects --sort alongside repo_id
+            verify_duplicates,
             json,
         }) => {
             // BORROW: explicit .as_str() instead of Deref coercion
-            let resolved = resolve_du_arg(repo_id.as_str())?;
-            run_du_repo(resolved.as_str(), json)
+            let (repo_type, resolved) = resolve_repo_arg(repo_id.as_str())?;
+            run_du_repo(repo_type, resolved.as_str(), verify_duplicates, json)
         }
         Some(Commands::Du {
             repo_id: None,
             age,
             tree: true,
+            sort: _, // EXPLICIT: clap conflicts_with rejects --sort alongside --tree
+            verify_duplicates: _, // EXPLICIT: clap conflicts_with rejects --verify-duplicates alongside --tree
             json,
         }) => run_du_tree(age, json),
         Some(Commands::Du {
             repo_id: None,
             age,
             tree: false,
+            sort,
+            verify_duplicates,
             json,
-        }) => run_du(age, json),
+        }) => run_du(age, sort.unwrap_or(DuSort::Size), verify_duplicates, json),
         // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
         Some(Commands::Inspect {
             repo_id,
@@ -3439,27 +3488,31 @@ fn run_status_all(json: bool) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// Resolves a `du` argument to a repo ID.
+/// Resolves a repo argument to a cached repo's type and ID.
 ///
-/// If the argument contains `/`, it is treated as a repo ID. If it parses
-/// as a number, it is treated as a 1-based index into the size-sorted cache
-/// summary. Otherwise, returns an error.
+/// A numeric argument is a 1-based index into [`du_listing`], the `#` column
+/// of `du`. An argument containing `/` is a repo ID (`google/gemma-2-2b-it`),
+/// or a dataset or Space behind its Hub prefix (`datasets/org/name`,
+/// `spaces/org/name`). Anything else is a bare name, accepted only when it
+/// names a cached root-level model (`gpt2`, `bert-base-uncased`), so a typo
+/// keeps failing here with a message that says what was expected.
 ///
 /// # Errors
 ///
 /// Returns [`FetchError::InvalidArgument`] if the index is out of range
-/// or the argument is not a valid repo ID or numeric index.
-fn resolve_du_arg(arg: &str) -> Result<String, FetchError> {
+/// or the argument is not a valid repo ID, a cached bare name or a numeric
+/// index.
+fn resolve_repo_arg(arg: &str) -> Result<(cache::RepoType, String), FetchError> {
     // Repo ID: contains '/' (e.g., "google/gemma-2-2b-it").
     if arg.contains('/') {
+        let (repo_type, repo_id) = cache_layout::split_repo_address(arg);
         // BORROW: explicit .to_owned() for &str → owned String
-        return Ok(arg.to_owned());
+        return Ok((repo_type, repo_id.to_owned()));
     }
 
-    // Numeric index: resolve against the size-sorted cache summary.
+    // Numeric index: resolve against the listing `du` prints.
     if let Ok(n) = arg.parse::<usize>() {
-        let mut summaries = cache::cache_summary()?;
-        summaries.sort_by_key(|s| std::cmp::Reverse(s.total_size));
+        let summaries = du_listing()?;
 
         if n == 0 || n > summaries.len() {
             return Err(FetchError::InvalidArgument(format!(
@@ -3471,13 +3524,54 @@ fn resolve_du_arg(arg: &str) -> Result<String, FetchError> {
         }
 
         // INDEX: n is bounded by 1..=summaries.len() checked above
-        // BORROW: explicit .clone() for owned String
         #[allow(clippy::indexing_slicing)]
-        return Ok(summaries[n - 1].repo_id.clone());
+        let chosen = &summaries[n - 1];
+        // BORROW: explicit .clone() for owned String
+        return Ok((chosen.repo_type, chosen.repo_id.clone()));
+    }
+
+    // A bare name: a cached root-level repo such as `gpt2`.
+    let cache_dir = cache::hf_cache_dir()?;
+    if cache_layout::repo_dir(&cache_dir, arg).is_dir() {
+        // BORROW: explicit .to_owned() for &str → owned String
+        return Ok((cache::RepoType::Model, arg.to_owned()));
+    }
+    // A bare name that only a dataset or Space has gets the way to ask for it.
+    let elsewhere = [cache::RepoType::Dataset, cache::RepoType::Space]
+        .into_iter()
+        .find(|&t| cache_layout::repo_dir_for(&cache_dir, t, arg).is_dir());
+    if let Some(repo_type) = elsewhere {
+        return Err(FetchError::InvalidArgument(format!(
+            "\"{arg}\" is not a cached model (but {} is a cached {})",
+            repo_type.address(arg),
+            repo_type.label()
+        )));
     }
 
     Err(FetchError::InvalidArgument(format!(
-        "\"{arg}\" is not a valid repo ID (expected \"org/model\") or numeric index"
+        "\"{arg}\" is not a valid repo ID (expected \"org/model\", or the bare name of a cached repo) or numeric index"
+    )))
+}
+
+/// Resolves an argument to a cached *model's* repo ID, for the commands that
+/// work on models only (`cache path`, `cache verify`, `cache clean-partial`).
+///
+/// The argument is read as [`resolve_repo_arg`] reads it, so a `du` index
+/// works for any of them; one that names a dataset or a Space is refused.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidArgument`] when the argument does not resolve
+/// (see [`resolve_repo_arg`]) or resolves to a dataset or Space.
+fn resolve_du_arg(arg: &str) -> Result<String, FetchError> {
+    let (repo_type, repo_id) = resolve_repo_arg(arg)?;
+    if repo_type == cache::RepoType::Model {
+        return Ok(repo_id);
+    }
+    Err(FetchError::InvalidArgument(format!(
+        "{} is a {} (this command takes models only)",
+        repo_type.address(repo_id.as_str()),
+        repo_type.label()
     )))
 }
 
@@ -3530,25 +3624,179 @@ fn shared_store_note(store: u64, cache_dir: &std::path::Path) -> Option<String> 
     })
 }
 
-/// Shows disk usage summary for all cached repos, sorted by size descending.
-fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
-    let cache_dir = cache::hf_cache_dir()?;
+/// How `du` orders its summary.
+// EXHAUSTIVE: internal CLI dispatch enum; crate owns all variants
+#[derive(Clone, Copy, ValueEnum)]
+enum DuSort {
+    /// Bytes on disk, largest first (the default).
+    Size,
+    /// Bytes stored twice as duplicated copies, largest first.
+    Dup,
+}
 
-    let mut summaries = cache::cache_summary()?;
-    // `du` reports disk usage — a repo contributing zero bytes and no
-    // partial download (an empty repo directory) doesn't belong in this
-    // view. Filtered here, at the display layer, rather than in
-    // `cache::cache_summary()` itself, so `cache gc`/`status` — which read
-    // the same function — still see and can act on these repos. A repo
-    // holding only hf-fm's header cache (`inspect --cache-headers` on a repo
-    // never downloaded) is not zero-byte, since its sidecar counts, so it is
-    // listed: `du` is where a user finds it.
+/// The repos `du` lists, ranked by bytes on disk, largest first.
+///
+/// Models, datasets and Spaces together, so the total is the cache's. A
+/// repo's 1-based position here is the `#` that `du` prints and the index
+/// that `du <N>`, `cache path <N>` and the other index-taking commands
+/// accept, so every one of them goes through this function.
+///
+/// `du` reports disk usage: a repo contributing zero bytes and no partial
+/// download (an empty repo directory) doesn't belong in this view. It is
+/// filtered here, at the display layer, rather than in
+/// [`cache::cache_summary_all`] itself, so the shared data layer stays
+/// complete. A repo holding only hf-fm's header cache (`inspect
+/// --cache-headers` on a repo never downloaded) is not zero-byte, since its
+/// sidecar counts, so it is listed: `du` is where a user finds it.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be read.
+fn du_listing() -> Result<Vec<cache::CachedModelSummary>, FetchError> {
+    let mut summaries = cache::cache_summary_all()?;
     summaries.retain(|s| s.total_size > 0 || s.file_count > 0 || s.has_partial);
     summaries.sort_by_key(|s| std::cmp::Reverse(s.total_size));
+    Ok(summaries)
+}
+
+/// What hashing the duplicated copies showed, across the repos checked
+/// (`du --verify-duplicates`).
+#[derive(Default, serde::Serialize)]
+struct DuplicateVerification {
+    /// Copies whose `SHA256` equals their blob's name.
+    identical: usize,
+    /// Bytes in the `identical` copies.
+    identical_bytes: u64,
+    /// Copies whose `SHA256` differs from their blob's name: not duplicates.
+    differs: usize,
+    /// Bytes in the `differs` copies.
+    differs_bytes: u64,
+    /// Copies of git-stored files, whose blob name says nothing about content.
+    unverifiable: usize,
+    /// Bytes in the `unverifiable` copies.
+    unverifiable_bytes: u64,
+    /// Paths of the copies that differ.
+    differing: Vec<String>,
+}
+
+/// Hashes the duplicated copies of every repo in `repos`, reporting each
+/// repo on stderr as it starts (a repo of tens of GiB takes minutes).
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if a copy cannot be read.
+fn verify_repo_duplicates(
+    repos: &[(cache::RepoType, &str, u64)],
+) -> Result<DuplicateVerification, FetchError> {
+    let mut result = DuplicateVerification::default();
+    for &(repo_type, repo_id, duplicated_bytes) in repos {
+        eprintln!(
+            "  verifying {} ({} to hash)...",
+            repo_type.address(repo_id),
+            format_size(duplicated_bytes)
+        );
+        for check in cache::verify_duplicates(repo_type, repo_id)? {
+            match check.outcome {
+                cache::DuplicateOutcome::Identical => {
+                    result.identical += 1;
+                    result.identical_bytes = result.identical_bytes.saturating_add(check.size);
+                }
+                cache::DuplicateOutcome::Differs => {
+                    result.differs += 1;
+                    result.differs_bytes = result.differs_bytes.saturating_add(check.size);
+                    result.differing.push(check.copy.display().to_string());
+                }
+                // EXPLICIT: any outcome added later counts as unverified, like `Unverifiable`
+                cache::DuplicateOutcome::Unverifiable | _ => {
+                    result.unverifiable += 1;
+                    result.unverifiable_bytes =
+                        result.unverifiable_bytes.saturating_add(check.size);
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Prints what [`verify_repo_duplicates`] found.
+fn print_duplicate_verification(v: &DuplicateVerification) {
+    println!(
+        "\n  Verified {} duplicated {} ({}): identical to their blob.",
+        v.identical,
+        pluralize(v.identical, "copy", "copies"),
+        format_size(v.identical_bytes),
+    );
+    if v.differs > 0 {
+        println!(
+            "  {} {} ({}) differ from their blob, so they are not duplicates:",
+            v.differs,
+            pluralize(v.differs, "copy", "copies"),
+            format_size(v.differs_bytes),
+        );
+        for path in &v.differing {
+            println!("    {path}");
+        }
+    }
+    if v.unverifiable > 0 {
+        println!(
+            "  {} {} ({}) cannot be checked: git-stored files, whose blob is named by a \
+             git hash rather than a SHA-256.",
+            v.unverifiable,
+            pluralize(v.unverifiable, "copy", "copies"),
+            format_size(v.unverifiable_bytes),
+        );
+    }
+}
+
+/// Prints the footer line that names the duplicated copies, and what they
+/// are, when there are any.
+fn print_duplicate_footer(duplicated_bytes: u64, repo_count: usize, total_size: u64) {
+    if duplicated_bytes == 0 {
+        return;
+    }
+    println!(
+        "  {} of {} are duplicated copies ({} {})",
+        format_size(duplicated_bytes),
+        format_size(total_size),
+        repo_count,
+        pluralize(repo_count, "repo", "repos"),
+    );
+    println!(
+        "  Note: a duplicated copy is a snapshot file stored again beside its blob, \
+         which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; \
+         `--verify-duplicates` hashes the copies to confirm them. Reclaiming them is \
+         tracked in https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21."
+    );
+}
+
+/// Shows disk usage summary for all cached repos, largest first, or by
+/// duplicated bytes with `--sort dup`.
+///
+/// The `DUP` column appears only when some repo holds duplicated copies, so a
+/// cache without any (every pointer a symlink) prints exactly as it did
+/// before the column existed. Under `--sort dup` the `#` stays the repo's
+/// rank by size, which is what `du <N>` takes.
+// EXPLICIT: sequential pipeline (list, verify, size the columns, print rows, print footers); splitting it hides the flow
+#[allow(clippy::too_many_lines)]
+fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), FetchError> {
+    let cache_dir = cache::hf_cache_dir()?;
+
+    let summaries = du_listing()?;
     let store = cache::shared_store_size()?;
+    let verification = if verify {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        let to_hash: Vec<(cache::RepoType, &str, u64)> = summaries
+            .iter()
+            .filter(|s| s.duplicated_bytes > 0)
+            .map(|s| (s.repo_type, s.repo_id.as_str(), s.duplicated_bytes))
+            .collect();
+        Some(verify_repo_duplicates(&to_hash)?)
+    } else {
+        None
+    };
 
     if json {
-        return print_du_json(&summaries, store, &cache_dir);
+        return print_du_json(&summaries, store, &cache_dir, verification);
     }
 
     println!("Cache: {}\n", cache_dir.display());
@@ -3558,47 +3806,76 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         return Ok(());
     }
 
-    // Compute REPO column width from the longest repo ID (minimum 48).
-    let repo_width = summaries
+    // Each row keeps its rank by size: that is the index `du <N>` takes.
+    let mut rows: Vec<(usize, &cache::CachedModelSummary)> = summaries
         .iter()
-        .map(|s| s.repo_id.len())
-        .max()
-        .unwrap_or(0)
-        .max(48);
+        .enumerate()
+        .map(|(i, s)| (i + 1, s))
+        .collect();
+    if matches!(sort, DuSort::Dup) {
+        rows.sort_by_key(|&(rank, s)| (std::cmp::Reverse(s.duplicated_bytes), rank));
+    }
+
+    // Compute REPO column width from the longest repo address (minimum 48).
+    let addresses: Vec<String> = rows
+        .iter()
+        .map(|(_, s)| s.repo_type.address(&s.repo_id))
+        .collect();
+    let repo_width = addresses.iter().map(String::len).max().unwrap_or(0).max(48);
 
     // Pre-format each row's size cell (plain total, or a `min to max` range
     // for a repo whose `.gguf` files are mutually-exclusive quant
     // alternatives — see `format_repo_size_cell`) so the SIZE column can
     // size itself to the widest cell, the same dynamic-width convention
     // every other hf-fm table uses.
-    let size_cells: Vec<String> = summaries
+    let size_cells: Vec<String> = rows
         .iter()
-        .map(|s| format_repo_size_cell(s.total_size, s.gguf_size_range))
+        .map(|(_, s)| format_repo_size_cell(s.total_size, s.gguf_size_range))
         .collect();
     let sw = size_cells.iter().map(String::len).max().unwrap_or(4).max(4); // floor: "SIZE".len()
+    // The DUP column exists only when some repo has duplicated copies.
+    let dup_cells: Vec<String> = rows
+        .iter()
+        .map(|(_, s)| {
+            if s.duplicated_bytes == 0 {
+                "-".to_owned()
+            } else {
+                format_size(s.duplicated_bytes)
+            }
+        })
+        .collect();
+    let total_dup = summaries
+        .iter()
+        .map(|s| s.duplicated_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let dup_repos = summaries.iter().filter(|s| s.duplicated_bytes > 0).count();
+    let dw = (total_dup > 0).then(|| dup_cells.iter().map(String::len).max().unwrap_or(3).max(3)); // floor: "DUP".len()
     // floor: the `#` column's historical width, so up to 999 repos print as before
     let iw = count_column_width(std::iter::once(summaries.len()), 3);
     // floor: "FILES".len()
     let fw = count_column_width(summaries.iter().map(|s| s.file_count), 5);
 
-    if age {
-        println!(
-            "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}  {:<15}",
-            "#", "SIZE", "REPO", "FILES", "AGE"
-        );
+    let dup_head = dw.map_or_else(String::new, |w| format!("  {:>w$}", "DUP"));
+    let age_head = if age {
+        format!("  {:<15}", "AGE")
     } else {
-        println!(
-            "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}",
-            "#", "SIZE", "REPO", "FILES"
-        );
-    }
+        String::new()
+    };
+    println!(
+        "  {:>iw$}  {:>sw$}{dup_head}  {:<repo_width$} {:>fw$}{age_head}",
+        "#", "SIZE", "REPO", "FILES"
+    );
 
     let mut total_files: usize = 0;
     let mut any_partial = false;
     let mut any_quant_alternatives = false;
 
     // EXPLICIT: accumulates the footer's totals and flags while printing each row.
-    for (i, (s, size_cell)) in summaries.iter().zip(size_cells.iter()).enumerate() {
+    for ((&(rank, s), size_cell), (dup_cell, address)) in rows
+        .iter()
+        .zip(size_cells.iter())
+        .zip(dup_cells.iter().zip(addresses.iter()))
+    {
         total_files = total_files.saturating_add(s.file_count);
         any_quant_alternatives |= s.gguf_size_range.is_some();
 
@@ -3608,38 +3885,29 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         } else {
             ""
         };
-
-        if age {
+        let dup_part = dw.map_or_else(String::new, |w| format!("  {dup_cell:>w$}"));
+        let age_part = if age {
             let age_str = s
                 .last_modified
                 .map_or_else(|| "\u{2014}".to_owned(), format_age);
-            println!(
-                "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}  {:<15}{}",
-                i + 1,
-                size_cell,
-                s.repo_id,
-                s.file_count,
-                age_str,
-                partial_marker,
-            );
+            format!("  {age_str:<15}")
         } else {
-            println!(
-                "  {:>iw$}  {:>sw$}  {:<repo_width$} {:>fw$}{}",
-                i + 1,
-                size_cell,
-                s.repo_id,
-                s.file_count,
-                partial_marker,
-            );
-        }
+            String::new()
+        };
+
+        println!(
+            "  {rank:>iw$}  {size_cell:>sw$}{dup_part}  {address:<repo_width$} {:>fw$}{age_part}{partial_marker}",
+            s.file_count,
+        );
     }
 
     // The rule spans a row after its 2-space margin, as in the tree and
     // `du <repo>` views: iw (#) + 2 + sw (SIZE) + 2 + repo_width + 1 + fw
-    // (FILES), plus 2 (gap) + 15 (AGE) with --age. A trailing
-    // partial-download marker is not counted, as in the tree.
+    // (FILES), plus 2 + dw (DUP) when that column is shown, and 2 + 15 (AGE)
+    // with --age. A trailing partial-download marker is not counted, as in
+    // the tree.
     let row_width = iw + 2 + sw + 2 + repo_width + 1 + fw;
-    let rule_width = if age { row_width + 2 + 15 } else { row_width };
+    let rule_width = row_width + dw.map_or(0, |w| 2 + w) + if age { 2 + 15 } else { 0 };
     println!("  {}", "\u{2500}".repeat(rule_width));
     let total_size = cache_bytes_on_disk(
         summaries.iter().map(|s| (s.total_size, s.shared_size)),
@@ -3656,6 +3924,7 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
         total_files,
         pluralize(total_files, "file", "files"),
     );
+    print_duplicate_footer(total_dup, dup_repos, total_size);
     if any_partial {
         println!("  \u{25cf} = partial downloads");
     }
@@ -3671,6 +3940,9 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
     if let Some(note) = shared_store_note(store, &cache_dir) {
         println!("{note}");
     }
+    if let Some(v) = &verification {
+        print_duplicate_verification(v);
+    }
 
     Ok(())
 }
@@ -3679,8 +3951,8 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
 ///
 /// Two figures can differ here, and both are shown when they print
 /// differently. The per-file listing is the repo's *logical* files, from
-/// [`cache::cache_repo_usage`]. The total is the bytes the repo occupies *on
-/// disk*, from [`cache::repo_disk_usage`]: every physical file in its
+/// [`cache::cache_repo_usage_in`]. The total is the bytes the repo occupies
+/// *on disk*, from [`cache::repo_usage_in`]: every physical file in its
 /// directory, counted once. That is the figure the whole-cache `du`
 /// sorts by and reports as this repo's `size` in `--json` (its text view
 /// shows a range instead for quant alternatives), and what `cache delete`
@@ -3691,29 +3963,57 @@ fn run_du(age: bool, json: bool) -> Result<(), FetchError> {
 /// which. Until v0.12.2 the total was that sum, which is how
 /// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)'s
 /// own example printed `5.18 GiB total` for a 10.36 GiB directory.
-fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
+///
+/// Since v0.12.5 a gap with the bytes on disk the larger is attributed in
+/// numbers, by [`du_repo_figures`], rather than named.
+// EXPLICIT: sequential pipeline (scan, list, total, attribute the gap); splitting it hides the flow
+#[allow(clippy::too_many_lines)]
+fn run_du_repo(
+    repo_type: cache::RepoType,
+    repo_id: &str,
+    verify: bool,
+    json: bool,
+) -> Result<(), FetchError> {
     let cache_dir = cache::hf_cache_dir()?;
-    let files = cache::cache_repo_usage(repo_id)?;
-    let has_partial = cache::repo_has_partial(repo_id)?;
-    let usage = cache::repo_usage(repo_id)?;
+    let address = repo_type.address(repo_id);
+    let files = cache::cache_repo_usage_in(repo_type, repo_id)?;
+    let has_partial = cache::repo_has_partial_in(repo_type, repo_id)?;
+    let usage = cache::repo_usage_in(repo_type, repo_id)?;
     let disk_bytes = usage.total_size;
+    let verification = if verify && usage.duplicated_bytes > 0 {
+        Some(verify_repo_duplicates(&[(
+            repo_type,
+            repo_id,
+            usage.duplicated_bytes,
+        )])?)
+    } else {
+        None
+    };
 
     if json {
-        return print_du_repo_json(repo_id, &files, usage, has_partial, &cache_dir);
+        return print_du_repo_json(
+            repo_type,
+            repo_id,
+            &files,
+            usage,
+            has_partial,
+            &cache_dir,
+            verification,
+        );
     }
 
     println!("Cache: {}\n", cache_dir.display());
 
     if files.is_empty() {
         if disk_bytes == 0 {
-            println!("No cached files found for {repo_id}.");
+            println!("No cached files found for {address}.");
         } else {
             // Blobs with no snapshot entry pointing at them (an interrupted
             // download), or only hf-fm's header cache (`inspect
             // --cache-headers` on a repo never downloaded): no files to list,
             // but real bytes that `cache delete` would free.
             println!(
-                "No snapshot files found for {repo_id}, but its directory holds {} on disk.",
+                "No snapshot files found for {address}, but its directory holds {} on disk.",
                 format_size(disk_bytes)
             );
         }
@@ -3723,7 +4023,7 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
         return Ok(());
     }
 
-    println!("  {repo_id}:\n");
+    println!("  {address}:\n");
     let fw = files
         .iter()
         .map(|f| f.filename.len())
@@ -3787,10 +4087,13 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     }
     // Under the range too: it hides the listing's sum, not the gap.
     if differs {
-        println!(
-            "\n  Note: {}",
-            du_repo_gap_note(listed_bytes, disk_bytes, has_partial)
-        );
+        match du_repo_figures(listed_bytes, &usage) {
+            Some(figures) => println!("\n  {figures}"),
+            None => println!(
+                "\n  Note: {}",
+                du_repo_gap_note(listed_bytes, disk_bytes, has_partial)
+            ),
+        }
     }
     if usage.shared_size > 0 {
         println!(
@@ -3800,6 +4103,9 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
             format_size(usage.shared_size)
         );
     }
+    if let Some(v) = &verification {
+        print_duplicate_verification(v);
+    }
 
     // Hint the user when this repo has partial downloads (computed above).
     if has_partial {
@@ -3807,6 +4113,33 @@ fn run_du_repo(repo_id: &str, json: bool) -> Result<(), FetchError> {
     }
 
     Ok(())
+}
+
+/// Attributes the bytes on disk that the listing does not show, as figures.
+///
+/// The listing's sum, the duplicated copies, the orphan blobs, the partial
+/// downloads and the bookkeeping together are the bytes on disk, so each
+/// non-zero figure is a cause of the gap. Returns `None` when they do not add
+/// up to the bytes on disk (the listing exceeds them, as where symlinked
+/// entries share a blob across revisions, or a layout this does not
+/// account for), and the caller falls back to [`du_repo_gap_note`], which
+/// names the possibilities instead.
+fn du_repo_figures(listed_bytes: u64, usage: &cache::RepoUsage) -> Option<String> {
+    let accounted = listed_bytes
+        .saturating_add(usage.duplicated_bytes)
+        .saturating_add(usage.orphan_blob_bytes)
+        .saturating_add(usage.partial_bytes)
+        .saturating_add(usage.bookkeeping_bytes);
+    if accounted != usage.total_size {
+        return None;
+    }
+    Some(format!(
+        "duplicated copies {} \u{b7} orphan blobs {} \u{b7} partial downloads {} \u{b7} bookkeeping {}",
+        format_size(usage.duplicated_bytes),
+        format_size(usage.orphan_blob_bytes),
+        format_size(usage.partial_bytes),
+        format_size(usage.bookkeeping_bytes),
+    ))
 }
 
 /// Says why `du <repo>`'s bytes on disk differ from its listing's sum.
@@ -3867,14 +4200,21 @@ struct DuFileJson {
 /// Per-repo entry for `du --json` (flat) and `du --tree --json` (with `files`).
 #[derive(serde::Serialize)]
 struct DuRepoJson {
-    /// Repository identifier.
+    /// Repository identifier, without the type prefix.
     repo_id: String,
+    /// What kind of repository this is: `"model"`, `"dataset"` or `"space"`
+    /// (new in v0.12.5).
+    repo_type: &'static str,
     /// Total size on disk in bytes, shared-store payloads it links included.
     size: u64,
     /// The part of `size` in `huggingface_hub`'s shared blob store, which
     /// deleting the repo does not free (new in v0.12.2). Omitted when zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     shared_bytes: Option<u64>,
+    /// The part of `size` that is a snapshot file stored again beside its
+    /// blob, as `hf-hub` writes on Windows (new in v0.12.5). `0` when there
+    /// are none.
+    duplicated_bytes: u64,
     /// Number of files listed across the repo's snapshots.
     file_count: usize,
     /// Whether the repo holds a partial download's temp file (`.chunked.part`,
@@ -3909,6 +4249,9 @@ struct DuJson {
     /// `huggingface_hub`'s shared blob store counted once (see
     /// `shared_store_bytes`).
     total_bytes: u64,
+    /// Bytes across all repos that are duplicated copies (new in v0.12.5);
+    /// part of `total_bytes`.
+    duplicated_bytes: u64,
     /// Total file count across all cached repos.
     total_files: usize,
     /// Number of cached repos.
@@ -3919,6 +4262,9 @@ struct DuJson {
     /// has no store.
     #[serde(skip_serializing_if = "Option::is_none")]
     shared_store_bytes: Option<u64>,
+    /// What `--verify-duplicates` found; absent without the flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<DuplicateVerification>,
 }
 
 /// Top-level shape for `du <repo> --json` (per-file drill-down).
@@ -3926,8 +4272,11 @@ struct DuJson {
 struct DuRepoDetailJson {
     /// HF cache directory.
     cache_dir: String,
-    /// Repository identifier.
+    /// Repository identifier, without the type prefix.
     repo_id: String,
+    /// What kind of repository this is: `"model"`, `"dataset"` or `"space"`
+    /// (new in v0.12.5).
+    repo_type: &'static str,
     /// Per-file entries, sorted by size descending.
     files: Vec<DuFileJson>,
     /// Bytes the repo occupies on disk: every physical file in its
@@ -3942,6 +4291,18 @@ struct DuRepoDetailJson {
     /// `hf-hub` writes on Windows, and larger where symlinked entries share
     /// one blob, as across several cached revisions.
     listed_bytes: u64,
+    /// Bytes of blobs that a snapshot file also holds as a separate copy
+    /// (new in v0.12.5); part of `total_bytes`.
+    duplicated_bytes: u64,
+    /// Bytes of blobs that no snapshot points at, no copy duplicates and no
+    /// partial download owns (new in v0.12.5); part of `total_bytes`.
+    orphan_blob_bytes: u64,
+    /// Bytes of partial downloads and their resume sidecars (new in
+    /// v0.12.5); part of `total_bytes`.
+    partial_bytes: u64,
+    /// Bytes outside `blobs/` and `snapshots/`: `refs/` and hf-fm's own
+    /// sidecars (new in v0.12.5); part of `total_bytes`.
+    bookkeeping_bytes: u64,
     /// The part of `total_bytes` in `huggingface_hub`'s shared blob store,
     /// which deleting the repo does not free (new in v0.12.2). Omitted when
     /// zero.
@@ -3962,6 +4323,10 @@ struct DuRepoDetailJson {
     /// Largest cached `.gguf` file's size, present only when `quant_alternatives` is `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     size_max: Option<u64>,
+    /// What `--verify-duplicates` found; absent without the flag, or when the
+    /// repo holds no duplicated copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<DuplicateVerification>,
 }
 
 /// Prints the `du` all-repos summary as JSON (flat — no per-file leaves).
@@ -3969,17 +4334,22 @@ fn print_du_json(
     summaries: &[cache::CachedModelSummary],
     store: u64,
     cache_dir: &std::path::Path,
+    verification: Option<DuplicateVerification>,
 ) -> Result<(), FetchError> {
     let mut total_files: usize = 0;
+    let mut duplicated_bytes: u64 = 0;
     let mut repos: Vec<DuRepoJson> = Vec::with_capacity(summaries.len());
     // EXPLICIT: accumulates totals alongside entry construction.
     for s in summaries {
         total_files = total_files.saturating_add(s.file_count);
+        duplicated_bytes = duplicated_bytes.saturating_add(s.duplicated_bytes);
         repos.push(DuRepoJson {
             // BORROW: explicit .clone() for owned String field
             repo_id: s.repo_id.clone(),
+            repo_type: s.repo_type.label(),
             size: s.total_size,
             shared_bytes: (s.shared_size > 0).then_some(s.shared_size),
+            duplicated_bytes: s.duplicated_bytes,
             file_count: s.file_count,
             has_partial: s.has_partial,
             last_modified: system_time_to_unix(s.last_modified),
@@ -3997,9 +4367,11 @@ fn print_du_json(
             summaries.iter().map(|s| (s.total_size, s.shared_size)),
             store,
         ),
+        duplicated_bytes,
         repos,
         total_files,
         shared_store_bytes: (store > 0).then_some(store),
+        verification,
     };
     emit_json(&result)
 }
@@ -4011,10 +4383,12 @@ fn print_du_tree_json(
     cache_dir: &std::path::Path,
 ) -> Result<(), FetchError> {
     let mut total_files: usize = 0;
+    let mut duplicated_bytes: u64 = 0;
     let mut out: Vec<DuRepoJson> = Vec::with_capacity(repos.len());
     // EXPLICIT: accumulates totals alongside entry construction.
     for r in repos {
         total_files = total_files.saturating_add(r.file_count);
+        duplicated_bytes = duplicated_bytes.saturating_add(r.duplicated_bytes);
         let files = r
             .files
             .iter()
@@ -4027,8 +4401,10 @@ fn print_du_tree_json(
         out.push(DuRepoJson {
             // BORROW: explicit .clone() for owned String field
             repo_id: r.repo_id.clone(),
+            repo_type: r.repo_type.label(),
             size: r.total_size,
             shared_bytes: (r.shared_size > 0).then_some(r.shared_size),
+            duplicated_bytes: r.duplicated_bytes,
             file_count: r.file_count,
             has_partial: r.has_partial,
             last_modified: system_time_to_unix(r.last_modified),
@@ -4047,23 +4423,27 @@ fn print_du_tree_json(
             repos.iter().map(|r| (r.total_size, r.shared_size)),
             store,
         ),
+        duplicated_bytes,
         total_files,
         shared_store_bytes: (store > 0).then_some(store),
+        verification: None,
     };
     emit_json(&result)
 }
 
 /// Prints a single repo's per-file disk usage as JSON.
 ///
-/// `disk_bytes` becomes `total_bytes` (bytes on disk, as in `du --json`'s
-/// per-repo `size`); the sum of the listing becomes `listed_bytes`. See
-/// [`run_du_repo`] for why the two differ.
+/// `usage.total_size` becomes `total_bytes` (bytes on disk, as in `du
+/// --json`'s per-repo `size`); the sum of the listing becomes `listed_bytes`.
+/// See [`run_du_repo`] for why the two differ.
 fn print_du_repo_json(
+    repo_type: cache::RepoType,
     repo_id: &str,
     files: &[cache::CacheFileUsage],
     usage: cache::RepoUsage,
     has_partial: bool,
     cache_dir: &std::path::Path,
+    verification: Option<DuplicateVerification>,
 ) -> Result<(), FetchError> {
     let mut listed_bytes: u64 = 0;
     let mut entries: Vec<DuFileJson> = Vec::with_capacity(files.len());
@@ -4090,15 +4470,21 @@ fn print_du_repo_json(
         // BORROW: explicit .to_string()/.to_owned() for owned fields
         cache_dir: cache_dir.display().to_string(),
         repo_id: repo_id.to_owned(),
+        repo_type: repo_type.label(),
         file_count: entries.len(),
         files: entries,
         total_bytes: usage.total_size,
         listed_bytes,
+        duplicated_bytes: usage.duplicated_bytes,
+        orphan_blob_bytes: usage.orphan_blob_bytes,
+        partial_bytes: usage.partial_bytes,
+        bookkeeping_bytes: usage.bookkeeping_bytes,
         shared_bytes: (usage.shared_size > 0).then_some(usage.shared_size),
         has_partial,
         quant_alternatives,
         size_min,
         size_max,
+        verification,
     };
     emit_json(&result)
 }
@@ -4171,8 +4557,17 @@ fn dot_leader(width: usize, to_size_column: usize) -> String {
 /// node enum is needed (cf. `inspect --tree`'s `TreeNode`, which is
 /// arbitrarily deep).
 struct CacheTreeRepo {
-    /// Repository identifier (e.g., `"google/gemma-2-2b-it"`).
+    /// Repository identifier (e.g., `"google/gemma-2-2b-it"`), without the
+    /// type prefix.
     repo_id: String,
+    /// What kind of repository this is.
+    repo_type: cache::RepoType,
+    /// How the repo is addressed on the command line and printed in the
+    /// tree: `repo_id`, behind `datasets/` or `spaces/` for the others.
+    address: String,
+    /// Bytes of the repo that are duplicated copies, from
+    /// [`cache::CachedModelSummary::duplicated_bytes`].
+    duplicated_bytes: u64,
     /// Bytes the repo occupies on disk, from
     /// [`cache::CachedModelSummary::total_size`]: every physical file in
     /// the repo's directory, counted once, plus the shared-store payloads it
@@ -4209,17 +4604,13 @@ struct CacheTreeFile {
 /// One [`CacheTreeRepo`] per cached `models--*` directory; its [`CacheTreeFile`]
 /// leaves come pre-sorted by size descending from [`cache::cache_repo_usage`].
 fn build_cache_tree() -> Result<Vec<CacheTreeRepo>, FetchError> {
-    let mut summaries = cache::cache_summary()?;
-    // Same display-layer filter as `run_du` — see its comment. `du --tree`
-    // is a display-only consumer of `cache_summary()`, not read by `cache
-    // gc`, so filtering here has no effect on eviction reachability.
-    summaries.retain(|s| s.total_size > 0 || s.file_count > 0 || s.has_partial);
-    summaries.sort_by_key(|s| std::cmp::Reverse(s.total_size));
+    // The same listing as `run_du`, with the same display-layer filter.
+    let summaries = du_listing()?;
 
     let mut repos: Vec<CacheTreeRepo> = Vec::with_capacity(summaries.len());
     for s in summaries {
         // BORROW: explicit .as_str() instead of Deref coercion
-        let usage = cache::cache_repo_usage(s.repo_id.as_str())?;
+        let usage = cache::cache_repo_usage_in(s.repo_type, s.repo_id.as_str())?;
         let files: Vec<CacheTreeFile> = usage
             .into_iter()
             .map(|f| CacheTreeFile {
@@ -4228,7 +4619,10 @@ fn build_cache_tree() -> Result<Vec<CacheTreeRepo>, FetchError> {
             })
             .collect();
         repos.push(CacheTreeRepo {
+            address: s.repo_type.address(&s.repo_id),
             repo_id: s.repo_id,
+            repo_type: s.repo_type,
+            duplicated_bytes: s.duplicated_bytes,
             total_size: s.total_size,
             shared_size: s.shared_size,
             file_count: s.file_count,
@@ -4303,7 +4697,7 @@ impl CacheTreeWidths {
         // AGE's 15 is shared with the flat view.
         let natural_repo = repos
             .iter()
-            .map(|r| r.repo_id.len())
+            .map(|r| r.address.len())
             .max()
             .unwrap_or(0)
             .max(10); // floor: a short repo ID's width
@@ -4414,7 +4808,7 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
 
     // `widths.repo >= repo_id.len()` and `widths.size >= size_str.len()` by
     // construction, so the saturating_subs are defensive, not load-bearing.
-    let to_size_column = (widths.repo + 2).saturating_sub(repo.repo_id.len());
+    let to_size_column = (widths.repo + 2).saturating_sub(repo.address.len());
     let leader = dot_leader(
         to_size_column + widths.size.saturating_sub(size_str.len()),
         to_size_column,
@@ -4426,7 +4820,7 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
             .map_or_else(|| "\u{2014}".to_owned(), format_age);
         println!(
             "  {connector}{repo}{leader}{size}  {files:<fw$}  {age_str:<aw$}{partial_marker}",
-            repo = repo.repo_id,
+            repo = repo.address,
             size = size_str,
             files = files_str,
             fw = widths.files,
@@ -4435,7 +4829,7 @@ fn render_repo_node(repo: &CacheTreeRepo, is_last: bool, widths: &CacheTreeWidth
     } else {
         println!(
             "  {connector}{repo}{leader}{size}  {files}{partial_marker}",
-            repo = repo.repo_id,
+            repo = repo.address,
             size = size_str,
             files = files_str,
         );
@@ -4498,6 +4892,11 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
         .fold(0_usize, usize::saturating_add);
     let any_partial = repos.iter().any(|r| r.has_partial);
     let any_quant_alternatives = repos.iter().any(|r| r.gguf_size_range.is_some());
+    let total_dup = repos
+        .iter()
+        .map(|r| r.duplicated_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let dup_repos = repos.iter().filter(|r| r.duplicated_bytes > 0).count();
 
     println!("  {}", "\u{2500}".repeat(widths.rule_width()));
     // A footer, as in the flat view: it takes its own width.
@@ -4509,6 +4908,7 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
         total_files,
         pluralize(total_files, "file", "files"),
     );
+    print_duplicate_footer(total_dup, dup_repos, total_size);
     if any_partial {
         println!("  \u{25cf} = partial downloads");
     }

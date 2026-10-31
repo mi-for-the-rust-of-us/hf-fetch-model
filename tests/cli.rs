@@ -4251,8 +4251,10 @@ fn du_repo_counts_a_blob_and_its_snapshot_copy() {
         "the listing's sum and the bytes on disk, each at its own width, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("a second copy of each (as on Windows), blobs that no snapshot points at"),
-        "with no partial download, the note points at the copies, got:\n{stdout}"
+        stdout.contains(
+            "duplicated copies 3.0 KiB \u{b7} orphan blobs 0 B \u{b7} partial downloads 0 B \u{b7} bookkeeping 0 B"
+        ),
+        "the gap is attributed in figures: the blob's bytes are the copies, got:\n{stdout}"
     );
     assert!(
         stdout.lines().any(|l| l == "    1  3.0 KiB  model.bin"),
@@ -4392,8 +4394,10 @@ fn du_repo_with_a_partial_download_names_it_in_the_note() {
         "the two figures should right-align to the wider one, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("an unfinished download's temp files"),
-        "the note should name the partial download, got:\n{stdout}"
+        stdout.contains(
+            "duplicated copies 1.0 KiB \u{b7} orphan blobs 0 B \u{b7} partial downloads 8.0 KiB \u{b7} bookkeeping 0 B"
+        ),
+        "the figures should name the partial download's bytes, got:\n{stdout}"
     );
     assert!(
         stdout.contains("partial downloads — run `hf-fm status test-org/partial-repo`"),
@@ -4465,7 +4469,7 @@ fn du_repo_with_quant_alternatives_states_its_bytes_on_disk() {
         "the bytes on disk should be stated under the range, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Note: the repo holds more on disk than the files listed above"),
+        stdout.contains("duplicated copies 12.0 KiB \u{b7} orphan blobs 0 B"),
         "the range hides the listing's sum, not the gap, got:\n{stdout}"
     );
 }
@@ -4547,8 +4551,8 @@ fn du_counts_everything_in_the_repo_directory() {
     assert!(success, "du <repo> should succeed: {stderr}");
     assert!(
         stdout.contains("7.1 KiB  total on disk")
-            && stdout.contains("refs/ and hf-fm's header cache"),
-        "the total and the note should cover the whole directory, got:\n{stdout}"
+            && stdout.contains("duplicated copies 3.0 KiB \u{b7} orphan blobs 0 B \u{b7} partial downloads 0 B \u{b7} bookkeeping 1.1 KiB"),
+        "the total and the figures should cover the whole directory, got:\n{stdout}"
     );
 }
 
@@ -4982,5 +4986,351 @@ fn quants_nonexistent_base_json_is_valid_with_empty_artifacts() {
         v.get("artifacts").and_then(Value::as_array).map(Vec::len),
         Some(0),
         "got:\n{stdout}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// du names the duplicated copies and lists dataset repos (v0.12.5)
+// -----------------------------------------------------------------------
+
+/// Stages a dataset repo with one file stored once, in `snapshots/` only, as
+/// the maintainer's `datasets--TheQweaker--rented_boxes` is.
+fn stage_dataset(hf_home: &std::path::Path, repo_folder: &str, filename: &str, bytes: usize) {
+    let snapshot = hf_home
+        .join("hub")
+        .join(repo_folder)
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(&snapshot).expect("create dataset snapshot dir");
+    std::fs::write(snapshot.join(filename), vec![0u8; bytes]).expect("write dataset file");
+}
+
+/// The `repos` entry for `repo_id` of type `repo_type` in `du --json`.
+fn du_json_entry(hf_home: &std::path::Path, repo_id: &str, repo_type: &str) -> Value {
+    let (out, err, ok) = run(hf_fm().env("HF_HOME", hf_home).args(["du", "--json"]));
+    assert!(ok, "du --json should succeed: {err}");
+    parse_json(&out)
+        .get("repos")
+        .and_then(Value::as_array)
+        .expect("repos array")
+        .iter()
+        .find(|r| {
+            r.get("repo_id").and_then(Value::as_str) == Some(repo_id)
+                && r.get("repo_type").and_then(Value::as_str) == Some(repo_type)
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("{repo_type} {repo_id} should be listed"))
+}
+
+#[test]
+fn du_names_the_duplicated_copies_in_a_dup_column_and_a_footer() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--dup-repo",
+        "e1",
+        "model.bin",
+        3072,
+    );
+    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 1024);
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    let header = stdout
+        .lines()
+        .find(|l| l.contains("REPO"))
+        .expect("a header line");
+    assert!(
+        header.contains("SIZE")
+            && header.contains("DUP")
+            && header.find("SIZE") < header.find("DUP"),
+        "the DUP column sits beside SIZE, got:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("test-org/dup-repo") && l.contains("3.0 KiB")),
+        "the copies are attributed to their repo, got:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("datasets/test-org/plain") && l.contains(" - ")),
+        "a repo without copies shows a dash, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("3.0 KiB of 7.0 KiB are duplicated copies (1 repo)"),
+        "the footer states the share of the total, got:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn du_prints_no_dup_column_for_a_cache_of_symlinks() {
+    // The usual Unix layout shares each blob with its pointer: nothing is
+    // duplicated, so the table is exactly what it was before the column.
+    let dir = temp_hf_home();
+    let repo = dir.path().join("hub").join("models--test-org--link-repo");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(repo.join("blobs")).expect("create blobs dir");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    std::fs::write(repo.join("blobs").join("e1"), vec![0u8; 3072]).expect("write blob");
+    std::os::unix::fs::symlink("../../blobs/e1", snapshot.join("model.bin")).expect("symlink");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        !stdout.contains("DUP") && !stdout.contains("duplicated copies"),
+        "a symlinked cache has no duplicates to name, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_sort_dup_orders_by_duplicated_bytes_and_keeps_the_size_rank() {
+    let dir = temp_hf_home();
+    // Biggest by size, no copies: rank 1.
+    stage_dataset(dir.path(), "datasets--test-org--big", "data.bin", 50_000);
+    // Smaller, but with copies: rank 2 and first under --sort dup.
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 8192);
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "--sort", "dup"]));
+    assert!(success, "du --sort dup should succeed: {stderr}");
+    let rows: Vec<&str> = stdout.lines().filter(|l| l.contains("test-org/")).collect();
+    let [first, second] = rows.as_slice() else {
+        panic!(
+            "two repos expected, got:
+{stdout}"
+        );
+    };
+    assert!(
+        first.contains("test-org/twice") && first.trim_start().starts_with('2'),
+        "the repo with copies leads and keeps its size rank, got:
+{stdout}"
+    );
+    assert!(
+        second.contains("datasets/test-org/big") && second.trim_start().starts_with('1'),
+        "the rest follows, got:
+{stdout}"
+    );
+}
+
+#[test]
+fn du_json_reports_duplicated_bytes_and_the_repo_type() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--dup-repo",
+        "e1",
+        "model.bin",
+        3072,
+    );
+    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 1024);
+
+    let model = du_json_entry(dir.path(), "test-org/dup-repo", "model");
+    assert_eq!(
+        model.get("duplicated_bytes").and_then(Value::as_u64),
+        Some(3072)
+    );
+    assert_eq!(model.get("size").and_then(Value::as_u64), Some(6144));
+    let dataset = du_json_entry(dir.path(), "test-org/plain", "dataset");
+    assert_eq!(
+        dataset.get("duplicated_bytes").and_then(Value::as_u64),
+        Some(0)
+    );
+
+    let (out, err, ok) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--json"]));
+    assert!(ok, "du --json should succeed: {err}");
+    let all = parse_json(&out);
+    assert_eq!(
+        all.get("duplicated_bytes").and_then(Value::as_u64),
+        Some(3072)
+    );
+    assert_eq!(
+        all.get("total_bytes").and_then(Value::as_u64),
+        Some(6144 + 1024),
+        "the total includes the dataset repo"
+    );
+    assert_eq!(all.get("repo_count").and_then(Value::as_u64), Some(2));
+}
+
+#[test]
+fn du_repo_json_reports_the_partition_of_the_bytes_on_disk() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--partial-repo",
+        "e1",
+        "config.json",
+        1024,
+    );
+    let repo = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--partial-repo");
+    std::fs::write(repo.join("blobs").join("e2.chunked.part"), vec![0u8; 8192]).expect("temp blob");
+    std::fs::write(repo.join("blobs").join("e3"), vec![0u8; 500]).expect("orphan blob");
+    std::fs::create_dir_all(repo.join("refs")).expect("refs dir");
+    std::fs::write(repo.join("refs").join("main"), [b'a'; 40]).expect("ref");
+
+    let (out, err, ok) =
+        run(hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["du", "test-org/partial-repo", "--json"]));
+    assert!(ok, "du <repo> --json should succeed: {err}");
+    let v = parse_json(&out);
+    let field = |name: &str| v.get(name).and_then(Value::as_u64).expect("u64 field");
+    assert_eq!(field("duplicated_bytes"), 1024);
+    assert_eq!(field("orphan_blob_bytes"), 500);
+    assert_eq!(field("partial_bytes"), 8192);
+    assert_eq!(field("bookkeeping_bytes"), 40);
+    assert_eq!(
+        field("listed_bytes")
+            + field("duplicated_bytes")
+            + field("orphan_blob_bytes")
+            + field("partial_bytes")
+            + field("bookkeeping_bytes"),
+        field("total_bytes"),
+        "the figures and the listing partition the bytes on disk"
+    );
+    assert_eq!(v.get("repo_type").and_then(Value::as_str), Some("model"));
+}
+
+#[test]
+fn du_lists_dataset_repos_and_addresses_them_behind_their_prefix() {
+    let dir = temp_hf_home();
+    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 2048);
+    stage_dataset(dir.path(), "datasets--wikitext", "train.parquet", 4096);
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stdout.contains("datasets/test-org/plain") && stdout.contains("datasets/wikitext"),
+        "datasets are listed behind their Hub prefix, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("6.0 KiB  total (2 repos, 2 files)"),
+        "and counted in the total, got:\n{stdout}"
+    );
+
+    for arg in ["datasets/wikitext", "1"] {
+        let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", arg]));
+        assert!(success, "du {arg} should succeed: {stderr}");
+        assert!(
+            stdout.contains("datasets/wikitext:") && stdout.contains("train.parquet"),
+            "du {arg} drills into the root-level dataset, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_name_resolves_to_a_cached_root_level_model_only() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--gpt2", "e1", "config.json", 1024);
+    let refs = dir.path().join("hub").join("models--gpt2").join("refs");
+    std::fs::create_dir_all(&refs).expect("create refs dir");
+    std::fs::write(
+        refs.join("main"),
+        "fake0000000000000000000000000000000000000",
+    )
+    .expect("write ref");
+    stage_dataset(dir.path(), "datasets--wikitext", "train.parquet", 4096);
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "gpt2"]));
+    assert!(success, "du gpt2 should succeed: {stderr}");
+    assert!(stdout.contains("gpt2:"), "got:\n{stdout}");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "path", "gpt2"]));
+    assert!(success, "cache path gpt2 should succeed: {stderr}");
+    assert!(
+        stdout.trim().contains("models--gpt2"),
+        "the path is the model's, got:\n{stdout}"
+    );
+
+    let (_, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "gpt3"]));
+    assert!(!success, "a typo keeps failing");
+    assert!(
+        stderr.contains("is not a valid repo ID"),
+        "with the old message, got:\n{stderr}"
+    );
+
+    let (_, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "wikitext"]));
+    assert!(!success, "a dataset is not reached by a bare name");
+    assert!(
+        stderr.contains("datasets/wikitext is a cached dataset"),
+        "but the error says how to ask for it, got:\n{stderr}"
+    );
+
+    let (_, stderr, success) =
+        run(hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["cache", "path", "datasets/wikitext"]));
+    assert!(!success, "models-only commands refuse a dataset");
+    assert!(
+        stderr.contains("takes models only"),
+        "and say so, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn du_verify_duplicates_hashes_each_copy_against_its_blob() {
+    // A blob named by the SHA-256 of its content, as the Hub names an LFS
+    // file's: `printf 'hello\n' | sha256sum`.
+    const HELLO_SHA256: &str = "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
+    let dir = temp_hf_home();
+    let repo = dir.path().join("hub").join("models--test-org--lfs-repo");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(repo.join("blobs")).expect("create blobs dir");
+    std::fs::create_dir_all(&snapshot).expect("create snapshot dir");
+    std::fs::write(repo.join("blobs").join(HELLO_SHA256), b"hello\n").expect("write blob");
+    std::fs::write(snapshot.join("model.bin"), b"hello\n").expect("write copy");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "--verify-duplicates"]));
+    assert!(success, "du --verify-duplicates should succeed: {stderr}");
+    assert!(
+        stdout.contains("Verified 1 duplicated copy (6 B): identical to their blob."),
+        "the copy is confirmed, got:\n{stdout}"
+    );
+
+    // The same length with other content is paired by size and refused by the hash.
+    std::fs::write(snapshot.join("model.bin"), b"world\n").expect("overwrite copy");
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "du",
+        "test-org/lfs-repo",
+        "--verify-duplicates",
+    ]));
+    assert!(
+        success,
+        "du <repo> --verify-duplicates should succeed: {stderr}"
+    );
+    assert!(
+        stdout.contains("1 copy (6 B) differ from their blob, so they are not duplicates:"),
+        "the impostor is named, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("verifying test-org/lfs-repo"),
+        "progress on stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn du_tree_lists_dataset_repos_too() {
+    let dir = temp_hf_home();
+    stage_dataset(dir.path(), "datasets--test-org--plain", "data.bin", 2048);
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--tree"]));
+    assert!(success, "du --tree should succeed: {stderr}");
+    assert!(
+        stdout.contains("datasets/test-org/plain") && stdout.contains("data.bin"),
+        "the tree lists the dataset and its file, got:\n{stdout}"
     );
 }
