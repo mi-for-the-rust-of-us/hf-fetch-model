@@ -2743,16 +2743,20 @@ mod tests {
     /// this crate no longer depends on (RUSTSEC-2026-0367 to -0369): one local
     /// file header per entry, the central directory, and the end-of-central-
     /// directory record, every entry `STORED` (uncompressed) and no `ZIP64`.
-    /// The CRC-32 comes from `flate2::Crc`.
+    /// The CRC-32 comes from `flate2::Crc`, so the archive also passes readers
+    /// that verify it; `crate::http_range`'s test helper `stored_zip` writes
+    /// zeros there, which its reader never checks.
     fn make_in_memory_npz(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
         /// MS-DOS date of 1980-01-01, the format's epoch (a zero date is not a valid one).
         const DOS_DATE: u16 = 0x0021;
         /// `ZIP` version 2.0, the lowest that can read a `STORED` entry.
         const VERSION: u16 = 20;
 
+        /// Appends `value` to `buf` in the little-endian byte order `ZIP` uses.
         fn put_u16(buf: &mut Vec<u8>, value: u16) {
             buf.extend_from_slice(&value.to_le_bytes());
         }
+        /// Appends `value` to `buf` in the little-endian byte order `ZIP` uses.
         fn put_u32(buf: &mut Vec<u8>, value: u32) {
             buf.extend_from_slice(&value.to_le_bytes());
         }
@@ -2781,6 +2785,7 @@ mod tests {
             put_u32(&mut archive, size); // uncompressed size
             put_u16(&mut archive, name_len);
             put_u16(&mut archive, 0); // extra-field length
+            // BORROW: explicit .as_bytes() for String → &[u8]
             archive.extend_from_slice(file_name.as_bytes());
             archive.extend_from_slice(&payload);
 
@@ -2802,6 +2807,7 @@ mod tests {
             put_u16(&mut directory, 0); // internal attributes
             put_u32(&mut directory, 0); // external attributes
             put_u32(&mut directory, offset); // local header offset
+            // BORROW: explicit .as_bytes() for String → &[u8]
             directory.extend_from_slice(file_name.as_bytes());
         }
 
