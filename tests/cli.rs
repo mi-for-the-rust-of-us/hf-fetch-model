@@ -5905,3 +5905,165 @@ fn cache_delete_with_target_on_a_dangling_link_points_at_the_flagless_form() {
     ]));
     assert!(success, "the dangling link itself can be removed: {stderr}");
 }
+
+// -----------------------------------------------------------------------
+// Gaps closed before the v0.12.5 release
+// -----------------------------------------------------------------------
+
+#[test]
+fn status_prints_the_repo_an_index_resolved_to_before_asking_the_hub() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--only", "e1", "m.bin", 1024);
+
+    // The Hub is out of reach (a closed local port), so the command fails
+    // after resolving: the resolved ID is on stderr either way, and the
+    // repo was never looked up as a repo named `1`.
+    let (_, stderr, _) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .env("HF_ENDPOINT", "http://127.0.0.1:9")
+        .args(["status", "1"]));
+    assert!(
+        stderr.contains("index 1 is test-org/only"),
+        "the resolved repo is announced, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("repository not found: 1"),
+        "and the index was not taken for a repo ID, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn cache_delete_resolves_an_index_to_a_dataset() {
+    let dir = temp_hf_home();
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--big", "d.bin", 50_000);
+    stage_snapshot_only_repo(dir.path(), "models--test-org--small", "m.bin", 1024);
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "delete", "1", "--yes"]));
+    assert!(success, "deleting by index should succeed: {stderr}");
+    assert!(
+        stdout.contains("index 1 is datasets/test-org/big"),
+        "the index names the dataset, got:\n{stdout}"
+    );
+    assert!(!repo_exists(dir.path(), "datasets--test-org--big"));
+    assert!(repo_exists(dir.path(), "models--test-org--small"));
+}
+
+#[test]
+fn du_tree_shows_duplicates_and_relocated_repos_together() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 8192);
+    if stage_relocated_repo(dir.path(), "models--test-org--moved").is_none() {
+        return;
+    }
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--tree"]));
+    assert!(success, "du --tree should succeed: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("test-org/moved") && l.contains('\u{2192}')),
+        "the relocated branch carries its target, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("12.0 KiB of 24.0 KiB are duplicated copies (2 repos)"),
+        "and the footer names the copies, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn du_verify_duplicates_counts_a_git_named_blob_as_unverifiable() {
+    let dir = temp_hf_home();
+    // `e1` is no SHA-256, as a git-stored file's blob name is none.
+    stage_blob_and_copy(
+        dir.path(),
+        "models--test-org--git",
+        "e1",
+        "config.json",
+        100,
+    );
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "--verify-duplicates"]));
+    assert!(success, "du --verify-duplicates should succeed: {stderr}");
+    assert!(
+        stdout.contains("1 copy (100 B) cannot be checked"),
+        "got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("No duplicated copy was confirmed."),
+        "and nothing is claimed as confirmed, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn cache_delete_of_several_repos_goes_on_after_one_fails_and_then_fails() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--stuck", "e1", "m.bin", 1024);
+    stage_blob_and_copy(dir.path(), "models--test-org--free", "e1", "m.bin", 1024);
+    let stuck_blob = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--stuck")
+        .join("blobs")
+        .join("e1");
+
+    // Make the first repo undeletable: a file held open without sharing on
+    // Windows, a read-only directory on Unix (which root ignores).
+    #[cfg(windows)]
+    let _held = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&stuck_blob)
+            .expect("hold the blob open")
+    };
+    #[cfg(unix)]
+    let _restore = {
+        use std::os::unix::fs::PermissionsExt;
+        let blobs = stuck_blob.parent().expect("blobs dir").to_path_buf();
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o555))
+            .expect("make blobs read-only");
+        if std::fs::remove_file(blobs.join("probe")).is_ok()
+            || std::fs::File::create(blobs.join("probe")).is_ok()
+        {
+            std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).ok();
+            eprintln!("skipped: permissions do not stop this user from deleting");
+            return;
+        }
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        Restore(blobs)
+    };
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/stuck",
+        "test-org/free",
+        "--yes",
+    ]));
+    assert!(!success, "a failed deletion fails the command");
+    assert!(
+        stderr.contains("failed to delete test-org/stuck"),
+        "naming the repo, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("1 repo failed to delete"),
+        "and counting it, got:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Deleted 1 repo."),
+        "the other was still deleted, got:\n{stdout}"
+    );
+    assert!(!repo_exists(dir.path(), "models--test-org--free"));
+    assert!(repo_exists(dir.path(), "models--test-org--stuck"));
+}
