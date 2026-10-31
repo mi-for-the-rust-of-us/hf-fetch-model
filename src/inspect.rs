@@ -2642,7 +2642,6 @@ pub fn fetch_model_config_cached(
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
-    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -2739,22 +2738,88 @@ mod tests {
     /// `anamnesis::inspect_npz_from_reader` — the same entry point
     /// [`super::inspect_npz`] uses in production — instead of hand-constructing
     /// the parsed struct via a literal.
+    ///
+    /// The archive is written by hand rather than by the `zip` crate, which
+    /// this crate no longer depends on (RUSTSEC-2026-0367 to -0369): one local
+    /// file header per entry, the central directory, and the end-of-central-
+    /// directory record, every entry `STORED` (uncompressed) and no `ZIP64`.
+    /// The CRC-32 comes from `flate2::Crc`.
     fn make_in_memory_npz(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
-        let mut buf: Vec<u8> = Vec::new();
-        {
-            let cursor = std::io::Cursor::new(&mut buf);
-            let mut zip = zip::ZipWriter::new(cursor);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            for (name, header, data) in entries {
-                zip.start_file(format!("{name}.npy"), options)
-                    .expect("zip start_file");
-                zip.write_all(&make_npy_v1(header, data))
-                    .expect("zip write_all");
-            }
-            zip.finish().expect("zip finish");
+        /// MS-DOS date of 1980-01-01, the format's epoch (a zero date is not a valid one).
+        const DOS_DATE: u16 = 0x0021;
+        /// `ZIP` version 2.0, the lowest that can read a `STORED` entry.
+        const VERSION: u16 = 20;
+
+        fn put_u16(buf: &mut Vec<u8>, value: u16) {
+            buf.extend_from_slice(&value.to_le_bytes());
         }
-        buf
+        fn put_u32(buf: &mut Vec<u8>, value: u32) {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut archive: Vec<u8> = Vec::new();
+        let mut directory: Vec<u8> = Vec::new();
+        for (name, header, data) in entries {
+            let file_name = format!("{name}.npy");
+            let payload = make_npy_v1(header, data);
+            let mut crc = flate2::Crc::new();
+            crc.update(&payload);
+            let crc = crc.sum();
+            let name_len = u16::try_from(file_name.len()).expect("entry name fits in u16");
+            let size = u32::try_from(payload.len()).expect("entry fits in u32");
+            let offset = u32::try_from(archive.len()).expect("archive fits in u32");
+
+            // Local file header, then the name, then the data.
+            put_u32(&mut archive, 0x0403_4b50);
+            put_u16(&mut archive, VERSION);
+            put_u16(&mut archive, 0); // general-purpose flags
+            put_u16(&mut archive, 0); // method: STORED
+            put_u16(&mut archive, 0); // modification time
+            put_u16(&mut archive, DOS_DATE);
+            put_u32(&mut archive, crc);
+            put_u32(&mut archive, size); // compressed size
+            put_u32(&mut archive, size); // uncompressed size
+            put_u16(&mut archive, name_len);
+            put_u16(&mut archive, 0); // extra-field length
+            archive.extend_from_slice(file_name.as_bytes());
+            archive.extend_from_slice(&payload);
+
+            // The matching central-directory entry, appended after the loop.
+            put_u32(&mut directory, 0x0201_4b50);
+            put_u16(&mut directory, VERSION); // made by
+            put_u16(&mut directory, VERSION); // needed to extract
+            put_u16(&mut directory, 0); // general-purpose flags
+            put_u16(&mut directory, 0); // method: STORED
+            put_u16(&mut directory, 0); // modification time
+            put_u16(&mut directory, DOS_DATE);
+            put_u32(&mut directory, crc);
+            put_u32(&mut directory, size); // compressed size
+            put_u32(&mut directory, size); // uncompressed size
+            put_u16(&mut directory, name_len);
+            put_u16(&mut directory, 0); // extra-field length
+            put_u16(&mut directory, 0); // comment length
+            put_u16(&mut directory, 0); // disk number start
+            put_u16(&mut directory, 0); // internal attributes
+            put_u32(&mut directory, 0); // external attributes
+            put_u32(&mut directory, offset); // local header offset
+            directory.extend_from_slice(file_name.as_bytes());
+        }
+
+        let directory_offset = u32::try_from(archive.len()).expect("archive fits in u32");
+        let directory_size = u32::try_from(directory.len()).expect("directory fits in u32");
+        let count = u16::try_from(entries.len()).expect("entry count fits in u16");
+        archive.extend_from_slice(&directory);
+
+        // End-of-central-directory record.
+        put_u32(&mut archive, 0x0605_4b50);
+        put_u16(&mut archive, 0); // this disk
+        put_u16(&mut archive, 0); // disk holding the directory
+        put_u16(&mut archive, count); // entries on this disk
+        put_u16(&mut archive, count); // entries in total
+        put_u32(&mut archive, directory_size);
+        put_u32(&mut archive, directory_offset);
+        put_u16(&mut archive, 0); // comment length
+        archive
     }
 
     #[test]
