@@ -52,7 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused ("expected org/model") although `du` listed `gpt2` and the Hub serves
   it. A bare name now resolves when it names a cached model (`gpt2`,
   `bert-base-uncased`); a typo keeps today's error, and a name that only a
-  dataset has says to ask for `datasets/<name>`. It applies to every command that
+  dataset has says to ask for `datasets/<name>`. A repo argument is refused if it
+  holds an empty or `.`/`..` segment, a backslash or a colon (on Windows a
+  backslash separates path components, so `gpt2\..\..` would otherwise have named
+  the directory above the cache), and `cache delete` re-checks that what it
+  removes is a direct child of the cache. It applies to every command that
   takes a cached repo: `du`, `cache path`, `cache delete`, `cache verify` and
   `cache clean-partial`. The download commands, which go to the Hub and not to
   the cache, still require `org/model`; that is a separate gap.

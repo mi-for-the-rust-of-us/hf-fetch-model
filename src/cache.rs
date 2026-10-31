@@ -2247,6 +2247,9 @@ pub enum DuplicateOutcome {
     /// The blob is not named by a `SHA256` (a git-stored file is named by its
     /// git object hash), so hashing the copy proves nothing about it.
     Unverifiable,
+    /// The copy could not be read (locked by another process, permissions),
+    /// so nothing is known about it. Other copies are still checked.
+    Unreadable,
 }
 
 /// One duplicated copy and what hashing it showed, from [`verify_duplicates`]
@@ -2286,36 +2289,28 @@ fn is_sha256_hex(name: &str) -> bool {
 /// # Errors
 ///
 /// Returns [`FetchError::Io`] if the cache directory cannot be determined.
-/// Returns [`FetchError::Io`] when a copy cannot be read.
 pub fn verify_duplicates(
     repo_type: RepoType,
     repo_id: &str,
 ) -> Result<Vec<DuplicateCheck>, FetchError> {
     let cache_dir = hf_cache_dir()?;
-    check_duplicates(&crate::cache_layout::repo_dir_for(
+    Ok(check_duplicates(&crate::cache_layout::repo_dir_for(
         &cache_dir, repo_type, repo_id,
-    ))
+    )))
 }
 
 /// [`verify_duplicates`] for the repo directory `repo_dir`.
-fn check_duplicates(repo_dir: &Path) -> Result<Vec<DuplicateCheck>, FetchError> {
+fn check_duplicates(repo_dir: &Path) -> Vec<DuplicateCheck> {
     let mut checks: Vec<DuplicateCheck> = Vec::new();
-    // EXPLICIT: the first unreadable copy stops the run, so this is not a plain `.map()`
+    // EXPLICIT: an unreadable copy is recorded and the loop goes on, so this is not a plain `.map()`
     for pair in walk_repo_files(repo_dir).duplicates {
         // BORROW: explicit .to_string_lossy() for OsStr → str conversion
         let outcome = match pair.blob.file_name().map(|n| n.to_string_lossy()) {
             Some(name) if is_sha256_hex(&name) => {
-                let digest = crate::checksum::sha256_hex_of_file(&pair.copy).map_err(|e| {
-                    FetchError::Io {
-                        // BORROW: explicit .clone() for owned PathBuf
-                        path: pair.copy.clone(),
-                        source: e,
-                    }
-                })?;
-                if digest == name {
-                    DuplicateOutcome::Identical
-                } else {
-                    DuplicateOutcome::Differs
+                match crate::checksum::sha256_hex_of_file(&pair.copy) {
+                    Ok(digest) if digest == name => DuplicateOutcome::Identical,
+                    Ok(_) => DuplicateOutcome::Differs,
+                    Err(_) => DuplicateOutcome::Unreadable,
                 }
             }
             _ => DuplicateOutcome::Unverifiable,
@@ -2327,7 +2322,7 @@ fn check_duplicates(repo_dir: &Path) -> Result<Vec<DuplicateCheck>, FetchError> 
             outcome,
         });
     }
-    Ok(checks)
+    checks
 }
 
 #[cfg(test)]
@@ -3326,7 +3321,7 @@ mod tests {
         let blob = rename_blob_to_its_digest(&blob);
         std::fs::copy(&blob, snap.join("model.bin")).unwrap();
 
-        let checks = check_duplicates(&repo_dir).unwrap();
+        let checks = check_duplicates(&repo_dir);
 
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].outcome, DuplicateOutcome::Identical);
@@ -3341,10 +3336,64 @@ mod tests {
         rename_blob_to_its_digest(&blob);
         std::fs::write(snap.join("model.bin"), vec![b'z'; 1000]).unwrap();
 
-        let checks = check_duplicates(&repo_dir).unwrap();
+        let checks = check_duplicates(&repo_dir);
 
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].outcome, DuplicateOutcome::Differs);
+    }
+
+    /// A copy that cannot be read is reported as such, and the other copies
+    /// of the repo are still checked.
+    #[test]
+    fn verify_reports_an_unreadable_copy_and_still_checks_the_rest() {
+        let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
+        let blob = rename_blob_to_its_digest(&blob);
+        let locked = snap.join("a-locked.bin");
+        std::fs::copy(&blob, &locked).unwrap();
+        // A second blob with its own copy, readable.
+        let other = blob.with_file_name("0".repeat(64));
+        std::fs::write(&other, vec![b'y'; 500]).unwrap();
+        std::fs::copy(&other, snap.join("b-readable.bin")).unwrap();
+
+        // Hold the locked copy open so that reading it fails: exclusively on
+        // Windows, and by permission on Unix.
+        #[cfg(windows)]
+        let _held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked)
+                .unwrap()
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::File::open(&locked).is_ok() {
+                eprintln!("skipped: permissions do not stop this user from reading");
+                return;
+            }
+        }
+
+        let checks = check_duplicates(&repo_dir);
+
+        assert_eq!(checks.len(), 2);
+        let outcome_of = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.copy.ends_with(name))
+                .map(|c| c.outcome)
+        };
+        assert_eq!(
+            outcome_of("a-locked.bin"),
+            Some(DuplicateOutcome::Unreadable)
+        );
+        assert_ne!(
+            outcome_of("b-readable.bin"),
+            Some(DuplicateOutcome::Unreadable),
+            "the other copy is still checked"
+        );
     }
 
     /// A git-stored file's blob is named by its git object hash, which says
@@ -3354,7 +3403,7 @@ mod tests {
         let (_tmp, repo_dir, blob, snap) = repo_with_blob(100);
         std::fs::copy(&blob, snap.join("config.json")).unwrap();
 
-        let checks = check_duplicates(&repo_dir).unwrap();
+        let checks = check_duplicates(&repo_dir);
 
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].outcome, DuplicateOutcome::Unverifiable);

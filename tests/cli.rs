@@ -5798,7 +5798,7 @@ fn cache_delete_with_target_validates_every_target_before_deleting_any() {
     );
     assert!(!success, "a lookalike target is an error");
     assert!(
-        stderr.contains("holds no blobs/ or snapshots/ directory"),
+        stderr.contains("no blobs/ or snapshots/ directory inside"),
         "and says why, got:\n{stderr}"
     );
     assert!(
@@ -5845,4 +5845,63 @@ fn du_sort_dup_orders_the_json_repos_too() {
         .filter_map(|r| r.get("repo_id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     assert_eq!(ids, ["test-org/twice", "test-org/big"]);
+}
+
+// -----------------------------------------------------------------------
+// Second audit: repo arguments cannot climb out of the cache
+// -----------------------------------------------------------------------
+
+#[test]
+fn cache_delete_refuses_a_repo_argument_that_climbs_out_of_the_cache() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--gpt2", "e1", "config.json", 1024);
+    let keep = dir.path().join("keep.txt");
+    std::fs::write(&keep, b"mine").expect("write a file next to the cache");
+
+    // On Windows `\` separates path components, so `gpt2\..\..` names the
+    // directory that holds the cache; it must be refused whatever the platform.
+    for arg in ["gpt2\\..\\..", "gpt2\\blobs", "org/..", "a//b"] {
+        let (_, stderr, success) = run(hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["cache", "delete", arg, "--yes"]));
+        assert!(!success, "{arg:?} must be refused");
+        assert!(
+            stderr.contains("is not a valid repo ID"),
+            "{arg:?}: got:\n{stderr}"
+        );
+    }
+    assert!(keep.exists(), "nothing outside the cache was touched");
+    assert!(repo_exists(dir.path(), "models--gpt2"), "nor the repo");
+}
+
+#[test]
+fn cache_delete_with_target_on_a_dangling_link_points_at_the_flagless_form() {
+    let dir = temp_hf_home();
+    let Some(target) = stage_relocated_repo(dir.path(), "models--test-org--moved") else {
+        return;
+    };
+    std::fs::remove_dir_all(&target).expect("the bytes behind the link go away");
+
+    let (_, stderr, success) = run_with_stdin(
+        hf_fm().env("HF_HOME", dir.path()).args([
+            "cache",
+            "delete",
+            "test-org/moved",
+            "--with-target",
+        ]),
+        "y\n",
+    );
+    assert!(!success, "there is nothing to delete behind the link");
+    assert!(
+        stderr.contains("delete the link without --with-target"),
+        "and the error says what to do, got:\n{stderr}"
+    );
+
+    let (_, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/moved",
+        "--yes",
+    ]));
+    assert!(success, "the dangling link itself can be removed: {stderr}");
 }

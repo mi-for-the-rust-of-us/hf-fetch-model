@@ -3528,6 +3528,18 @@ fn run_status_all(json: bool) -> Result<(), FetchError> {
 /// or the argument is not a valid repo ID, a cached bare name or a numeric
 /// index.
 fn resolve_repo_arg(arg: &str) -> Result<(cache::RepoType, String), FetchError> {
+    // Whatever the argument is, it ends up inside a directory name below the
+    // cache, so one that could leave it is refused before it is used: `..`,
+    // an empty segment, a backslash (a separator on Windows), a drive colon.
+    if arg.parse::<usize>().is_err() {
+        let (_, repo_id) = cache_layout::split_repo_address(arg);
+        if !cache_layout::is_safe_repo_filename(repo_id) {
+            return Err(FetchError::InvalidArgument(format!(
+                "\"{arg}\" is not a valid repo ID (empty or relative segments, backslashes and colons are refused)"
+            )));
+        }
+    }
+
     // Repo ID: contains '/' (e.g., "google/gemma-2-2b-it").
     if arg.contains('/') {
         let (repo_type, repo_id) = cache_layout::split_repo_address(arg);
@@ -3722,6 +3734,10 @@ struct DuplicateVerification {
     identical: usize,
     /// Bytes in the `identical` copies.
     identical_bytes: u64,
+    /// Copies that could not be read, so say nothing either way.
+    unreadable: usize,
+    /// Bytes in the `unreadable` copies.
+    unreadable_bytes: u64,
     /// Copies whose `SHA256` differs from their blob's name: not duplicates.
     differs: usize,
     /// Bytes in the `differs` copies.
@@ -3732,7 +3748,8 @@ struct DuplicateVerification {
     unverifiable_bytes: u64,
     /// Paths of the copies that differ.
     differing: Vec<String>,
-    /// Repos whose copies could not all be read; the others are still counted.
+    /// Repos that could not be scanned at all (the cache directory could not
+    /// be determined); the others are still counted.
     unreadable_repos: Vec<String>,
 }
 
@@ -3768,6 +3785,10 @@ fn verify_repo_duplicates(repos: &[(cache::RepoType, &str, u64)]) -> DuplicateVe
                     result.identical += 1;
                     result.identical_bytes = result.identical_bytes.saturating_add(check.size);
                 }
+                cache::DuplicateOutcome::Unreadable => {
+                    result.unreadable += 1;
+                    result.unreadable_bytes = result.unreadable_bytes.saturating_add(check.size);
+                }
                 cache::DuplicateOutcome::Differs => {
                     result.differs += 1;
                     result.differs_bytes = result.differs_bytes.saturating_add(check.size);
@@ -3788,16 +3809,28 @@ fn verify_repo_duplicates(repos: &[(cache::RepoType, &str, u64)]) -> DuplicateVe
 
 /// Prints what [`verify_repo_duplicates`] found.
 fn print_duplicate_verification(v: &DuplicateVerification) {
-    if v.identical + v.differs + v.unverifiable + v.unreadable_repos.len() == 0 {
+    if v.identical + v.differs + v.unverifiable + v.unreadable + v.unreadable_repos.len() == 0 {
         println!("\n  No duplicated copies to verify.");
         return;
     }
-    println!(
-        "\n  Verified {} duplicated {} ({}): identical to their blob.",
-        v.identical,
-        pluralize(v.identical, "copy", "copies"),
-        format_size(v.identical_bytes),
-    );
+    if v.identical > 0 {
+        println!(
+            "\n  Verified {} duplicated {} ({}): identical to their blob.",
+            v.identical,
+            pluralize(v.identical, "copy", "copies"),
+            format_size(v.identical_bytes),
+        );
+    } else {
+        println!("\n  No duplicated copy was confirmed.");
+    }
+    if v.unreadable > 0 {
+        println!(
+            "  {} {} ({}) could not be read, so verification is incomplete.",
+            v.unreadable,
+            pluralize(v.unreadable, "copy", "copies"),
+            format_size(v.unreadable_bytes),
+        );
+    }
     if v.differs > 0 {
         println!(
             "  {} {} ({}) differ from their blob, so they are not duplicates:",
@@ -3810,10 +3843,7 @@ fn print_duplicate_verification(v: &DuplicateVerification) {
         }
     }
     if !v.unreadable_repos.is_empty() {
-        println!(
-            "  Could not read every copy of: {}.",
-            v.unreadable_repos.join(", ")
-        );
+        println!("  Could not scan: {}.", v.unreadable_repos.join(", "));
     }
     if v.unverifiable > 0 {
         println!(
@@ -5302,10 +5332,12 @@ fn remove_cache_link(link: &Path) -> Result<(), FetchError> {
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::InvalidArgument`] when the repo is not cached, or
-/// when `with_target` is set and the link does not resolve to a directory
-/// named like the repo's cache folder. Returns [`FetchError::Io`] on
-/// filesystem failure during removal.
+/// Returns [`FetchError::InvalidArgument`] when the repo ID could name a path
+/// outside the cache.
+/// Returns [`FetchError::InvalidArgument`] when the repo is not cached.
+/// Returns [`FetchError::InvalidArgument`] when `with_target` is set and the
+/// link does not resolve to a directory that [`checked_link_target`] accepts.
+/// Returns [`FetchError::Io`] on filesystem failure during removal.
 fn delete_repo_dir(
     repo_type: cache::RepoType,
     repo_id: &str,
@@ -5314,6 +5346,16 @@ fn delete_repo_dir(
     let cache_dir = cache::hf_cache_dir()?;
     let repo_dir = hf_fetch_model::cache_layout::repo_dir_for(&cache_dir, repo_type, repo_id);
     let address = repo_type.address(repo_id);
+
+    // Defence in depth: whatever the caller resolved, the directory removed is
+    // a direct child of the cache, never a path that climbs out of it.
+    if !cache_layout::is_safe_repo_filename(repo_id)
+        || repo_dir.parent() != Some(cache_dir.as_path())
+    {
+        return Err(FetchError::InvalidArgument(format!(
+            "{address} is not a valid repo ID (refusing to delete outside the cache)"
+        )));
+    }
 
     // Not `exists()`, which follows a link: a link whose target is gone is
     // still a cache entry, and one that can be removed.
@@ -5363,20 +5405,22 @@ fn delete_repo_dir(
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Io`] when the link does not resolve (its target has
-/// gone). Returns [`FetchError::InvalidArgument`] when the target is not named
-/// like the repo's cache folder. Returns [`FetchError::InvalidArgument`] when
-/// it holds neither a `blobs/` nor a `snapshots/` directory.
+/// Returns [`FetchError::InvalidArgument`] when the link does not resolve
+/// (its target has gone).
+/// Returns [`FetchError::InvalidArgument`] when the target is not named like
+/// the repo's cache folder.
+/// Returns [`FetchError::InvalidArgument`] when it holds neither a `blobs/`
+/// nor a `snapshots/` directory.
 fn checked_link_target(
     repo_type: cache::RepoType,
     repo_id: &str,
     repo_dir: &Path,
 ) -> Result<PathBuf, FetchError> {
     let address = repo_type.address(repo_id);
-    let target = std::fs::canonicalize(repo_dir).map_err(|e| FetchError::Io {
-        // BORROW: explicit .to_path_buf() for owned PathBuf
-        path: repo_dir.to_path_buf(),
-        source: e,
+    let target = std::fs::canonicalize(repo_dir).map_err(|e| {
+        FetchError::InvalidArgument(format!(
+            "{address} links to a target that cannot be read ({e}); delete the link without --with-target"
+        ))
     })?;
     let folder = hf_fetch_model::cache_layout::repo_folder_name_for(repo_type, repo_id);
     // BORROW: explicit .as_str() instead of Deref coercion
@@ -5390,7 +5434,7 @@ fn checked_link_target(
         && !hf_fetch_model::cache_layout::snapshots_dir(&target).is_dir()
     {
         return Err(FetchError::InvalidArgument(format!(
-            "{address} links to {} (which holds no blobs/ or snapshots/ directory); refusing to delete it",
+            "{address} links to {} (no blobs/ or snapshots/ directory inside); refusing to delete it",
             target.display()
         )));
     }
