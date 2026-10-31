@@ -5998,6 +5998,16 @@ fn du_verify_duplicates_counts_a_git_named_blob_as_unverifiable() {
     );
 }
 
+#[cfg(unix)]
+struct Restore(std::path::PathBuf);
+#[cfg(unix)]
+impl Drop for Restore {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 #[test]
 fn cache_delete_of_several_repos_goes_on_after_one_fails_and_then_fails() {
     let dir = temp_hf_home();
@@ -6033,13 +6043,6 @@ fn cache_delete_of_several_repos_goes_on_after_one_fails_and_then_fails() {
             std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).ok();
             eprintln!("skipped: permissions do not stop this user from deleting");
             return;
-        }
-        struct Restore(std::path::PathBuf);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-            }
         }
         Restore(blobs)
     };
