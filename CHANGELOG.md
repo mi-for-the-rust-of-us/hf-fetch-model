@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`du --verify-duplicates`** hashes every duplicated copy and compares it with
   its blob's name, which for an LFS file is the SHA-256 of its content. It is
   slow by design (every copy is read once), reports each repo on stderr as it
-  starts, and says which copies differ (paired by length, not duplicates) and
+  starts (a repo with an unreadable copy is warned about and the rest still
+  counted), and says which copies differ (paired by length, not duplicates) and
   how many cannot be checked (git-stored files, whose blob is named by a git
   hash). On `bartowski/Mistral-7B-Instruct-v0.3-GGUF` it confirms the report's
   `sha256sum` of `Mistral-7B-Instruct-v0.3-IQ1_S.gguf`.
@@ -77,8 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saying where they are and that it frees none of them here. It used to refuse
   ("cache entry is a symlink; refusing to delete"), leaving such a repo to be
   removed by hand. `--with-target` deletes the bytes too: only from a directory
-  named like the repo's cache folder (`models--org--name`), and always after a
-  prompt that `--yes` does not answer. A link whose target has gone can now be
+  named like the repo's cache folder (`models--org--name`) that holds a `blobs/`
+  or `snapshots/` directory, checked for every argument before any is deleted,
+  and always after a prompt that `--yes` does not answer. A link whose target has gone can now be
   removed. `cache gc` skips relocated repos, with a note: evicting one frees
   nothing on the cache's volume.
 - **`cache gc` prints the duplicated bytes beside its proposal**, the figure

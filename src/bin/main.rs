@@ -3732,25 +3732,37 @@ struct DuplicateVerification {
     unverifiable_bytes: u64,
     /// Paths of the copies that differ.
     differing: Vec<String>,
+    /// Repos whose copies could not all be read; the others are still counted.
+    unreadable_repos: Vec<String>,
 }
 
 /// Hashes the duplicated copies of every repo in `repos`, reporting each
 /// repo on stderr as it starts (a repo of tens of GiB takes minutes).
 ///
-/// # Errors
-///
-/// Returns [`FetchError::Io`] if a copy cannot be read.
-fn verify_repo_duplicates(
-    repos: &[(cache::RepoType, &str, u64)],
-) -> Result<DuplicateVerification, FetchError> {
+/// A repo with a copy that cannot be read is warned about and listed in
+/// `unreadable_repos`; the others are still counted.
+fn verify_repo_duplicates(repos: &[(cache::RepoType, &str, u64)]) -> DuplicateVerification {
     let mut result = DuplicateVerification::default();
+    // EXPLICIT: accumulates the tallies across repos while reporting each one
     for &(repo_type, repo_id, duplicated_bytes) in repos {
         eprintln!(
             "  verifying {} ({} to hash)...",
             repo_type.address(repo_id),
             format_size(duplicated_bytes)
         );
-        for check in cache::verify_duplicates(repo_type, repo_id)? {
+        let checks = match cache::verify_duplicates(repo_type, repo_id) {
+            Ok(checks) => checks,
+            Err(e) => {
+                // One unreadable copy must not discard the repos already hashed.
+                eprintln!(
+                    "  warning: could not verify {}: {e}",
+                    repo_type.address(repo_id)
+                );
+                result.unreadable_repos.push(repo_type.address(repo_id));
+                continue;
+            }
+        };
+        for check in checks {
             match check.outcome {
                 cache::DuplicateOutcome::Identical => {
                     result.identical += 1;
@@ -3759,6 +3771,7 @@ fn verify_repo_duplicates(
                 cache::DuplicateOutcome::Differs => {
                     result.differs += 1;
                     result.differs_bytes = result.differs_bytes.saturating_add(check.size);
+                    // BORROW: explicit .to_string() for Path → String
                     result.differing.push(check.copy.display().to_string());
                 }
                 // EXPLICIT: any outcome added later counts as unverified, like `Unverifiable`
@@ -3770,11 +3783,15 @@ fn verify_repo_duplicates(
             }
         }
     }
-    Ok(result)
+    result
 }
 
 /// Prints what [`verify_repo_duplicates`] found.
 fn print_duplicate_verification(v: &DuplicateVerification) {
+    if v.identical + v.differs + v.unverifiable + v.unreadable_repos.len() == 0 {
+        println!("\n  No duplicated copies to verify.");
+        return;
+    }
     println!(
         "\n  Verified {} duplicated {} ({}): identical to their blob.",
         v.identical,
@@ -3791,6 +3808,12 @@ fn print_duplicate_verification(v: &DuplicateVerification) {
         for path in &v.differing {
             println!("    {path}");
         }
+    }
+    if !v.unreadable_repos.is_empty() {
+        println!(
+            "  Could not read every copy of: {}.",
+            v.unreadable_repos.join(", ")
+        );
     }
     if v.unverifiable > 0 {
         println!(
@@ -3844,6 +3867,7 @@ fn volume_totals<'a>(
     let home = cache::volume_label(&std::fs::canonicalize(cache_dir).ok()?)?;
     let mut by_volume: BTreeMap<String, u64> = BTreeMap::new();
     by_volume.insert(home.clone(), store); // BORROW: explicit .clone() for owned String key
+    // EXPLICIT: accumulates each volume's running total
     for (total, shared, relocated_to) in repos {
         let volume = relocated_to
             .and_then(|target| target.canonicalize().ok())
@@ -3923,7 +3947,7 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
             .filter(|s| s.duplicated_bytes > 0)
             .map(|s| (s.repo_type, s.repo_id.as_str(), s.duplicated_bytes))
             .collect();
-        Some(verify_repo_duplicates(&to_hash)?)
+        Some(verify_repo_duplicates(&to_hash))
     } else {
         None
     };
@@ -3937,7 +3961,12 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
     );
 
     if json {
-        return print_du_json(&summaries, store, &cache_dir, verification, volumes);
+        // `--sort dup` orders the JSON `repos` too, by the same key.
+        let mut ordered: Vec<&cache::CachedModelSummary> = summaries.iter().collect();
+        if matches!(sort, DuSort::Dup) {
+            ordered.sort_by_key(|s| std::cmp::Reverse(s.duplicated_bytes));
+        }
+        return print_du_json(&ordered, store, &cache_dir, verification, volumes);
     }
 
     println!("Cache: {}\n", cache_dir.display());
@@ -3979,6 +4008,7 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
         .iter()
         .map(|(_, s)| {
             if s.duplicated_bytes == 0 {
+                // BORROW: explicit .to_owned() for &str → owned String
                 "-".to_owned()
             } else {
                 format_size(s.duplicated_bytes)
@@ -4135,7 +4165,7 @@ fn run_du_repo(
             repo_type,
             repo_id,
             usage.duplicated_bytes,
-        )])?)
+        )]))
     } else {
         None
     };
@@ -4496,7 +4526,7 @@ struct DuRepoDetailJson {
 
 /// Prints the `du` all-repos summary as JSON (flat — no per-file leaves).
 fn print_du_json(
-    summaries: &[cache::CachedModelSummary],
+    summaries: &[&cache::CachedModelSummary],
     store: u64,
     cache_dir: &std::path::Path,
     verification: Option<DuplicateVerification>,
@@ -4506,7 +4536,7 @@ fn print_du_json(
     let mut duplicated_bytes: u64 = 0;
     let mut repos: Vec<DuRepoJson> = Vec::with_capacity(summaries.len());
     // EXPLICIT: accumulates totals alongside entry construction.
-    for s in summaries {
+    for &s in summaries {
         total_files = total_files.saturating_add(s.file_count);
         duplicated_bytes = duplicated_bytes.saturating_add(s.duplicated_bytes);
         repos.push(DuRepoJson {
@@ -4516,6 +4546,7 @@ fn print_du_json(
             size: s.total_size,
             shared_bytes: (s.shared_size > 0).then_some(s.shared_size),
             duplicated_bytes: s.duplicated_bytes,
+            // BORROW: explicit .to_string() for Path → String
             relocated_to: s.relocated_to.as_ref().map(|t| t.display().to_string()),
             file_count: s.file_count,
             has_partial: s.has_partial,
@@ -4573,6 +4604,7 @@ fn print_du_tree_json(
             size: r.total_size,
             shared_bytes: (r.shared_size > 0).then_some(r.shared_size),
             duplicated_bytes: r.duplicated_bytes,
+            // BORROW: explicit .to_string() for Path → String
             relocated_to: r.relocated_to.as_ref().map(|t| t.display().to_string()),
             file_count: r.file_count,
             has_partial: r.has_partial,
@@ -4653,6 +4685,7 @@ fn print_du_repo_json(
         total_bytes: usage.total_size,
         listed_bytes,
         duplicated_bytes: usage.duplicated_bytes,
+        // BORROW: explicit .to_string() for Path → String
         relocated_to: cache::repo_relocated_to(repo_type, repo_id)?
             .map(|t| t.display().to_string()),
         orphan_blob_bytes: usage.orphan_blob_bytes,
@@ -5306,26 +5339,62 @@ fn delete_repo_dir(
 
     // A link: `remove_dir_all` on Unix would follow it and delete the target.
     if with_target {
-        let target = std::fs::canonicalize(&repo_dir).map_err(|e| FetchError::Io {
-            // BORROW: explicit .clone() for owned PathBuf
-            path: repo_dir.clone(),
-            source: e,
-        })?;
-        let folder = hf_fetch_model::cache_layout::repo_folder_name_for(repo_type, repo_id);
-        if target.file_name().and_then(std::ffi::OsStr::to_str) != Some(folder.as_str()) {
-            return Err(FetchError::InvalidArgument(format!(
-                "{address} links to {} (not a directory named {folder}); refusing to delete it",
-                target.display()
-            )));
-        }
-        // `canonicalize` has resolved every link on the way, so this is the
-        // real directory, and `remove_dir_all` does not follow links inside it.
+        // Checked again here, not only when the arguments were resolved: the
+        // cache can change between the two.
+        let target = checked_link_target(repo_type, repo_id, &repo_dir)?;
         std::fs::remove_dir_all(&target).map_err(|e| FetchError::Io {
             path: target,
             source: e,
         })?;
     }
     remove_cache_link(&repo_dir)
+}
+
+/// The real directory a relocated repo's cache link resolves to, once it has
+/// passed the checks `--with-target` needs before anything behind the link is
+/// deleted.
+///
+/// The target must be a directory named like the repo's cache folder
+/// (`models--org--name`) that looks like a cache repo, holding a `blobs/` or
+/// a `snapshots/` directory: a backup or a project folder that happens to be
+/// named alike is not removed. `canonicalize` has resolved every link on the
+/// way, so the result is the real directory, and `remove_dir_all` does not
+/// follow links inside it.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] when the link does not resolve (its target has
+/// gone). Returns [`FetchError::InvalidArgument`] when the target is not named
+/// like the repo's cache folder. Returns [`FetchError::InvalidArgument`] when
+/// it holds neither a `blobs/` nor a `snapshots/` directory.
+fn checked_link_target(
+    repo_type: cache::RepoType,
+    repo_id: &str,
+    repo_dir: &Path,
+) -> Result<PathBuf, FetchError> {
+    let address = repo_type.address(repo_id);
+    let target = std::fs::canonicalize(repo_dir).map_err(|e| FetchError::Io {
+        // BORROW: explicit .to_path_buf() for owned PathBuf
+        path: repo_dir.to_path_buf(),
+        source: e,
+    })?;
+    let folder = hf_fetch_model::cache_layout::repo_folder_name_for(repo_type, repo_id);
+    // BORROW: explicit .as_str() instead of Deref coercion
+    if target.file_name().and_then(std::ffi::OsStr::to_str) != Some(folder.as_str()) {
+        return Err(FetchError::InvalidArgument(format!(
+            "{address} links to {} (not a directory named {folder}); refusing to delete it",
+            target.display()
+        )));
+    }
+    if !hf_fetch_model::cache_layout::blobs_dir(&target).is_dir()
+        && !hf_fetch_model::cache_layout::snapshots_dir(&target).is_dir()
+    {
+        return Err(FetchError::InvalidArgument(format!(
+            "{address} links to {} (which holds no blobs/ or snapshots/ directory); refusing to delete it",
+            target.display()
+        )));
+    }
+    Ok(target)
 }
 
 /// One repo that `cache delete` has resolved from an argument and checked.
@@ -5347,6 +5416,7 @@ struct DeleteTarget {
 impl DeleteTarget {
     /// How the repo is printed and addressed.
     fn address(&self) -> String {
+        // BORROW: explicit .as_str() instead of Deref coercion
         self.repo_type.address(self.repo_id.as_str())
     }
 
@@ -5354,7 +5424,7 @@ impl DeleteTarget {
     /// `huggingface_hub`'s shared blob store go, the payloads they point to
     /// stay; and a relocated repo's bytes are not in the cache, so deleting
     /// only its link frees none of them.
-    fn freed(&self) -> u64 {
+    const fn freed(&self) -> u64 {
         if self.link_only {
             return 0;
         }
@@ -5386,6 +5456,7 @@ fn resolve_delete_targets(
     // The listing behind an index is computed once, however many are given.
     let mut listing: Option<Vec<cache::CachedModelSummary>> = None;
 
+    // EXPLICIT: carries the lazily-built listing and the de-duplicated targets across arguments
     for arg in args {
         // BORROW: explicit .as_str() instead of Deref coercion
         let (repo_type, repo_id) = match arg.as_str().parse::<usize>() {
@@ -5423,6 +5494,11 @@ fn resolve_delete_targets(
         // Targeted scan, not the full cache.
         let usage = cache::repo_usage_in(repo_type, repo_id.as_str())?;
         let relocated_to = cache::relocated_target(&repo_dir);
+        if with_target && relocated_to.is_some() {
+            // So one mislabelled target aborts the call before any is deleted,
+            // and `--dry-run` refuses what the real run would.
+            checked_link_target(repo_type, repo_id.as_str(), &repo_dir)?;
+        }
         let link_only = relocated_to.is_some() && !with_target;
         targets.push(DeleteTarget {
             repo_type,
@@ -5548,6 +5624,7 @@ fn run_cache_delete(
 
     let mut freed: u64 = 0;
     let mut failures: usize = 0;
+    // EXPLICIT: a failed deletion must not stop the rest; tallies what was freed and what failed
     for t in &targets {
         // BORROW: explicit .as_str() instead of Deref coercion
         match delete_repo_dir(t.repo_type, t.repo_id.as_str(), with_target) {

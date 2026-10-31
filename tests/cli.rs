@@ -5765,3 +5765,84 @@ fn status_resolves_a_du_index_and_rejects_one_out_of_range() {
         "like `du 5`, not a Hub lookup of a repo named 5, got:\n{stderr}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Audit follow-ups: --with-target is validated before anything is deleted
+// -----------------------------------------------------------------------
+
+#[test]
+fn cache_delete_with_target_validates_every_target_before_deleting_any() {
+    let dir = temp_hf_home();
+    // A well-formed relocated repo, and a second one whose target is a
+    // directory that merely carries the right name.
+    let Some(good) = stage_relocated_repo(dir.path(), "models--test-org--moved") else {
+        return;
+    };
+    let bad_target = dir.path().join("elsewhere").join("models--test-org--other");
+    std::fs::create_dir_all(&bad_target).expect("create the lookalike target");
+    std::fs::write(bad_target.join("notes.txt"), b"not a cache repo").expect("write a file");
+    let bad_link = dir.path().join("hub").join("models--test-org--other");
+    if !try_dir_link(&bad_target, &bad_link) {
+        return;
+    }
+
+    let (_, stderr, success) = run_with_stdin(
+        hf_fm().env("HF_HOME", dir.path()).args([
+            "cache",
+            "delete",
+            "test-org/moved",
+            "test-org/other",
+            "--with-target",
+        ]),
+        "y\n",
+    );
+    assert!(!success, "a lookalike target is an error");
+    assert!(
+        stderr.contains("holds no blobs/ or snapshots/ directory"),
+        "and says why, got:\n{stderr}"
+    );
+    assert!(
+        good.join("blobs").join("e1").exists(),
+        "the valid repo before it was not deleted either"
+    );
+    assert!(bad_target.join("notes.txt").exists(), "nor the lookalike");
+}
+
+#[test]
+fn cache_delete_with_target_dry_run_refuses_what_the_real_run_would() {
+    let dir = temp_hf_home();
+    let Some(target) = stage_relocated_repo(dir.path(), "precious-data") else {
+        return;
+    };
+
+    let (_, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "delete",
+        "test-org/moved",
+        "--with-target",
+        "--dry-run",
+    ]));
+    assert!(!success, "the dry run refuses a mislabelled target too");
+    assert!(stderr.contains("refusing to delete it"), "got:\n{stderr}");
+    assert!(target.join("blobs").join("e1").exists());
+}
+
+#[test]
+fn du_sort_dup_orders_the_json_repos_too() {
+    let dir = temp_hf_home();
+    stage_snapshot_only_repo(dir.path(), "datasets--test-org--big", "data.bin", 50_000);
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 8192);
+
+    let (out, err, ok) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "--sort", "dup", "--json"]));
+    assert!(ok, "du --sort dup --json should succeed: {err}");
+    let ids: Vec<String> = parse_json(&out)
+        .get("repos")
+        .and_then(Value::as_array)
+        .expect("repos array")
+        .iter()
+        .filter_map(|r| r.get("repo_id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    assert_eq!(ids, ["test-org/twice", "test-org/big"]);
+}

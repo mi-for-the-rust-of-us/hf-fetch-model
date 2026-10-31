@@ -1721,6 +1721,7 @@ fn pair_duplicates(
         orphan_bytes: 0,
         pairs: Vec::new(),
     };
+    // EXPLICIT: each blob consumes a copy from `by_len`, so the pairing carries state
     for blob in blobs.into_iter().filter(|b| !b.partial && b.len > 0) {
         let pointed_at = blob.id.is_some_and(|id| entry_ids.contains(&id))
             || blob
@@ -2284,8 +2285,8 @@ fn is_sha256_hex(name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::Io`] if the cache directory cannot be determined, or
-/// when a copy cannot be read.
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+/// Returns [`FetchError::Io`] when a copy cannot be read.
 pub fn verify_duplicates(
     repo_type: RepoType,
     repo_id: &str,
@@ -2299,6 +2300,7 @@ pub fn verify_duplicates(
 /// [`verify_duplicates`] for the repo directory `repo_dir`.
 fn check_duplicates(repo_dir: &Path) -> Result<Vec<DuplicateCheck>, FetchError> {
     let mut checks: Vec<DuplicateCheck> = Vec::new();
+    // EXPLICIT: the first unreadable copy stops the run, so this is not a plain `.map()`
     for pair in walk_repo_files(repo_dir).duplicates {
         // BORROW: explicit .to_string_lossy() for OsStr → str conversion
         let outcome = match pair.blob.file_name().map(|n| n.to_string_lossy()) {
