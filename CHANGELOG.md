@@ -84,7 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed by hand. `--with-target` deletes the bytes too: only from a directory
   named like the repo's cache folder (`models--org--name`) that holds a `blobs/`
   or `snapshots/` directory, checked for every argument before any is deleted,
-  and always after a prompt that `--yes` does not answer. A link whose target has gone can now be
+  and always after a prompt that `--yes` does not answer. It is not atomic (bytes, then link: a failure
+  between them leaves the link pointing at a partly emptied directory, which a rerun
+  finishes or the flag-less form clears), and it follows a link chain to its end, removing only the
+  outermost link. A link whose target has gone can now be
   removed. `cache gc` skips relocated repos, with a note: evicting one frees
   nothing on the cache's volume.
 - **`cache gc` prints the duplicated bytes beside its proposal**, the figure

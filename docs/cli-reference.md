@@ -533,6 +533,8 @@ Takes one or more repos, by ID or by `du` index; a dataset or Space is `datasets
 | `--dry-run` | Print what would be deleted and what it frees, without deleting or prompting | off |
 | `--with-target` | For a repo moved to another disk behind a link, delete the bytes at the link's target too. By default only the link is removed and the bytes stay, which the output says and reports as freeing nothing here. The target must be a directory named like the repo's cache folder (`models--org--name`) that holds a `blobs/` or `snapshots/` directory, it is checked for every argument before any is deleted (`--dry-run` included), and `--yes` does not skip the prompt | off |
 
+Two limits of `--with-target`. **It is not atomic.** It deletes the bytes at the target and then the link, so a failure in between (a file held open by another process, a permission error, a full unplug) can leave the link pointing at a partly emptied directory. Run the same command again: if the directory still holds `blobs/` or `snapshots/` it finishes the job; if not, or if the target is gone, it is refused with a message saying so. Then `cache delete <repo>` without the flag removes the link, and whatever is left at the target is removed by hand. **Only the last link of a chain is followed.** A link that points at another link resolves to the real directory at the end, and that directory is what `--with-target` deletes; only the outermost link is removed, and a middle one is left dangling. Keep a relocated repo's link pointing straight at its directory, as `mklink /J` or `ln -s` to the real path does.
+
 ```sh
 # Evict every repo last touched more than 30 days ago
 hf-fm cache gc --older-than 30
