@@ -135,7 +135,7 @@ Without `--force`, `cargo install` short-circuits whenever **any** version of th
 
 ### Does hf-fm pin its TLS dependencies? How do I pick up a security fix as a library user?
 
-Starting with v0.12.4 (the release after v0.12.3), `Cargo.toml` requires `rustls` 0.23.46 and `rustls-webpki` 0.103.16 directly, with default features off, so they add no code and no feature: they only set a floor that no dependency graph containing hf-fm can resolve below. That matters because Cargo never reads a dependency's `Cargo.lock`, so a library such as `candle-mi` can only be protected by a requirement, never by hf-fm's lockfile. A `cargo install` without `--locked` resolves fresh versions (the floors bound them from below); with `--locked` it uses the lockfile published with the crate. If your own lockfile is older than the floors, move it:
+Since v0.12.4, `Cargo.toml` requires `rustls` 0.23.46 and `rustls-webpki` 0.103.16 directly, with default features off, so they add no code and no feature: they only set a floor that no dependency graph containing hf-fm can resolve below. That matters because Cargo never reads a dependency's `Cargo.lock`, so a library such as `candle-mi` can only be protected by a requirement, never by hf-fm's lockfile. A `cargo install` without `--locked` resolves fresh versions (the floors bound them from below); with `--locked` it uses the lockfile published with the crate. If your own lockfile is older than the floors, move it:
 
 ```
 cargo update -p rustls -p rustls-webpki

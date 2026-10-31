@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.4] — TLS stack floors and advisory clean-up
+
 ### Security
 
 - **Floors on the TLS stack: `rustls` 0.23.46 and `rustls-webpki` 0.103.16.**

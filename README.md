@@ -8,6 +8,8 @@
 
 A Rust library and CLI for downloading and inspecting HuggingFace models. Multi-connection parallel downloads, file filtering, checksum verification, retry — plus remote tensor-header inspection (`.safetensors`, NumPy `.npz`, `.gguf`, PyTorch `.pth`) and structural comparison between models, all without downloading weight data.
 
+> 🆕 **`0.12.4` puts a floor under hf-fm's TLS stack, so a library user can no longer resolve a certificate verifier that accepts distrusted intermediates.** RUSTSEC-2026-0382 (`rustls-webpki` below 0.103.16) reaches every connection hf-fm makes, and `rustls` 0.23.46 alone still allowed it. `Cargo.toml` now requires both, with no code behind either, because Cargo never reads a dependency's lockfile and a lockfile only protects the binary. The same release drops the `zip` dev-dependency (three more advisories), moves `hypomnesis` to 0.2.15 so `--check-gpu` reports a broken NVIDIA driver by its cause instead of as "no GPU", and no longer names `DXGI` in its Linux no-GPU message. See the [CHANGELOG](CHANGELOG.md).
+
 ## Table of contents
 
 - [Install](#install)
