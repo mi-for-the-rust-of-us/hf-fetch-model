@@ -73,7 +73,25 @@ indicatif = { version = "0.18", optional = true }
 flate2 = "1"
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json", "stream"] }
-serde = { version = "1", features = ["derive"] }
+# Security floors, not dependencies in the usual sense: no source file names
+# `rustls` or `rustls-webpki`, and `default-features = false` enables nothing
+# beyond what `reqwest` already selects (Cargo unifies the two entries). Their
+# only effect is that no dependency graph containing hf-fm can resolve below
+# these versions. A lockfile cannot do that for a library consumer, because
+# Cargo never reads a dependency's `Cargo.lock`; only a requirement reaches
+# candle-mi and anyone else depending on this crate. Each goes when
+# `reqwest`'s own requirement is at least as high.
+#
+# `rustls` 0.23.46 fixes RUSTSEC-2026-0346 to -0349 (secrets in `Debug`
+# output, ECH data leak, Brotli certificate allocation, ServerHello
+# downgrade). It does NOT raise `rustls-webpki`, which it still accepts from
+# 0.103.14, hence the second entry.
+rustls = { version = "0.23.46", default-features = false }
+# `rustls-webpki` 0.103.16 fixes RUSTSEC-2026-0382 (certificate verification
+# may accept distrusted intermediates), which reaches every connection hf-fm
+# makes.
+rustls-webpki = { version = "0.103.16", default-features = false }
+serde ={ version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
