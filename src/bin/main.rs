@@ -6420,7 +6420,7 @@ fn run_cache_gc(
         let n = plan.skipped_relocated.len();
         eprintln!(
             "note: {n} relocated {} skipped (the bytes are behind a link, not in this cache); \
-             `hf-fm cache delete` removes one",
+             `hf-fm cache delete` removes only its link",
             pluralize(n, "repo", "repos")
         );
     }

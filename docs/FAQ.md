@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-10-12, hf-fm v0.12.3 (growing read-ahead: GGUF costs, which models cannot be inspected remotely; reading tensor metadata from Rust; .pth on the range substrate; raising the range budgets) -->
+<!-- Last updated: 2026-10-31, hf-fm v0.12.5 (duplicated copies and repos moved behind a link, in the cache section; before that, v0.12.3: growing read-ahead: GGUF costs, which models cannot be inspected remotely; reading tensor metadata from Rust; .pth on the range substrate; raising the range budgets) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
