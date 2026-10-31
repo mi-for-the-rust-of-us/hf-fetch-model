@@ -227,6 +227,17 @@
 //! `huggingface_hub` ([`cache::PartialFile::is_in_use`] tells whether one is
 //! still being written).
 //!
+//! Since v0.12.5 the walk behind those sizes also says what the bytes are:
+//! [`cache::RepoUsage`] splits a repo's footprint into the duplicated copies
+//! `hf-hub` leaves on Windows (a snapshot file stored again beside its blob),
+//! orphan blobs, partial downloads and bookkeeping, and
+//! [`cache::verify_duplicates`] hashes the copies against their blobs.
+//! [`cache::cache_summary_all`] lists datasets and Spaces beside the models
+//! (each marked by [`cache::RepoType`]), where [`cache::cache_summary`] keeps to
+//! models so that eviction and status never reach a dataset;
+//! [`cache::relocated_target`] and [`cache::volume_label`] say where a repo
+//! moved to another disk behind a link now lives.
+//!
 //! For long verifications (multi-GiB safetensors files), drive
 //! [`cache::verify_cache_with_progress`] with an [`Fn`] callback that receives
 //! [`cache::VerifyEvent`]s so a CLI or GUI can render a spinner or progress

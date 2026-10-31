@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`du` names the duplicated copies.** Since v0.12.2 every repo-level figure is
+  bytes on disk, which put the second copy that `hf-hub` leaves on Windows
+  (a snapshot file stored again beside its blob) inside the totals without
+  saying so. On the maintainer's cache that was 154.16 GiB of 763.22 GiB, in 21
+  repos, and no command reported it. `du` now has a `DUP` column beside `SIZE`,
+  a footer (`154.16 GiB of 763.22 GiB are duplicated copies (21 repos)`) and
+  `--sort dup`. The column appears only when some repo has copies, so a cache of
+  symlinks (the usual Linux and macOS layout) prints exactly as before; under
+  `--sort dup` the `#` stays each repo's rank by size, which is what `du <N>`
+  takes. A blob counts as duplicated when a snapshot file of the same length
+  that is neither a link nor the blob itself exists in the same repo, each blob
+  pairing with one file; a blob that a symlink or hard link points at is not.
+  No size floor: the figure matches the maintainer's independent scan (which
+  used one above 1 MB) to 0.01 GiB.
+- **`du --verify-duplicates`** hashes every duplicated copy and compares it with
+  its blob's name, which for an LFS file is the SHA-256 of its content. It is
+  slow by design (every copy is read once), reports each repo on stderr as it
+  starts, and says which copies differ (paired by length, not duplicates) and
+  how many cannot be checked (git-stored files, whose blob is named by a git
+  hash). On `bartowski/Mistral-7B-Instruct-v0.3-GGUF` it confirms the report's
+  `sha256sum` of `Mistral-7B-Instruct-v0.3-IQ1_S.gguf`.
+- **`du <repo>` attributes the gap in figures.** Where a repo holds more on disk
+  than it lists, the three-way note ("a second copy of each, blobs that no
+  snapshot points at, or bookkeeping") becomes the numbers it was naming:
+  `duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B ·
+  bookkeeping 140 B`. With the listed bytes they add up to `total on disk`; the
+  fourth figure, partial downloads, is a branch the old note handled in a
+  sentence of its own. Where they do not add up (symlinked entries sharing one
+  blob across revisions, so the listing exceeds the disk), the old note stays.
+- **`du` lists `datasets--` and `spaces--` repos**, so its total is the cache's
+  (a cache holding 34.55 GiB of datasets had read 34.55 GiB short). They are
+  addressed as `datasets/<org>/<name>` and `spaces/<org>/<name>`, the Hub's URL
+  prefix, because a model and a dataset can share an `org/name`; the prefix is
+  printed in the `REPO` column, so what you read is what you type. A `#` index
+  works for them. `cache delete` accepts them; the other `cache` commands are
+  for models and say so. `--json` gains `repo_type` per repo. `cache gc` still
+  selects among models only, and its preview says how many dataset and Space
+  repos, and how many bytes, it leaves out.
+- **Root-level repos are addressable.** `du gpt2` and `cache path gpt2` were
+  refused ("expected org/model") although `du` listed `gpt2` and the Hub serves
+  it. A bare name now resolves when it names a cached model (`gpt2`,
+  `bert-base-uncased`); a typo keeps today's error, and a name that only a
+  dataset has says to ask for `datasets/<name>`. It applies to every command that
+  takes a cached repo: `du`, `cache path`, `cache delete`, `cache verify` and
+  `cache clean-partial`. The download commands, which go to the Hub and not to
+  the cache, still require `org/model`; that is a separate gap.
+- **`status` takes a `du` index**, as `du` and `cache path` do, instead of asking
+  the Hub for a repo named `60`. The resolved ID goes to stderr.
+- **`cache delete` takes several repos, and `--dry-run`.** Every argument is
+  resolved first, then the repos are deleted, so one bad argument removes
+  nothing; the list is de-duplicated (an index and an ID can name one repo).
+  Every numeric index prints the repo it resolved to, with `--yes` too, which
+  has no prompt to carry the safeguard: indexes are those of the last `du`, and
+  they shift after each deletion. `--dry-run` prints what would go and what it
+  frees without deleting or prompting. A deletion that fails does not stop the
+  others; the command fails at the end if any did.
+- **Relocated repos.** A repo moved to another disk and linked back (a junction
+  on Windows, a symlink elsewhere) is marked in `du` with an arrow and its
+  target, reported as `relocated_to` in `--json`, and shown in `du <repo>`.
+  When the cache's bytes sit on more than one volume the footer says how many
+  are on each (`By volume: C: 762.71 GiB · D: 525.44 MiB`; `volume_bytes` in
+  `--json`). Every existing figure is unchanged: a relocated repo is still cache
+  usage, and the volume line answers the other question, what frees the cache's
+  own disk.
+- **`cache delete` on a relocated repo removes the link and keeps the bytes**,
+  saying where they are and that it frees none of them here. It used to refuse
+  ("cache entry is a symlink; refusing to delete"), leaving such a repo to be
+  removed by hand. `--with-target` deletes the bytes too: only from a directory
+  named like the repo's cache folder (`models--org--name`), and always after a
+  prompt that `--yes` does not answer. A link whose target has gone can now be
+  removed. `cache gc` skips relocated repos, with a note: evicting one frees
+  nothing on the cache's volume.
+- **`cache gc` prints the duplicated bytes beside its proposal**, the figure
+  `du`'s footer prints for the same cache, so a budget-driven eviction is not
+  chosen blind: it deletes whole models to recover space that deduplication
+  would recover without losing any. `gc` does not deduplicate.
+- **Library:** `cache::cache_summary_all` (models, datasets and Spaces),
+  `cache::verify_duplicates`, `cache::repo_usage_in`, `cache::cache_repo_usage_in`,
+  `cache::repo_has_partial_in`, `cache::relocated_target`,
+  `cache::repo_relocated_to` and `cache::volume_label`; `cache::RepoType` and, in
+  `cache_layout`, `repo_folder_name_for`, `repo_dir_for`, `parse_repo_folder_name`
+  and `split_repo_address`. `cache::RepoUsage` gains `duplicated_bytes`,
+  `orphan_blob_bytes`, `partial_bytes` and `bookkeeping_bytes`.
+
+### Changed
+
+- **`du`'s total and `--json` values change** (`repo_count`, `total_bytes`,
+  `total_files`, `repos[]`), because dataset and Space repos are now in them, as
+  `du --json`'s values did in v0.12.2. `--json` also gains `duplicated_bytes`,
+  `repo_type`, and for `du <repo>` the four figures above; no existing key
+  changes meaning. A number that tracked `du`'s total for a model-only cache is
+  now that of the whole cache.
+- **`CachedModelSummary` gains `repo_type`, `duplicated_bytes` and
+  `relocated_to`**, and has no `#[non_exhaustive]`, so code that builds one by
+  hand needs the new fields, as in v0.12.2 (none of hf-fm's consumers does).
+  `RepoUsage` is `#[non_exhaustive]` and gains its fields without a break.
+  `cache_summary()` is unchanged: it lists models only, so `gc`, `status` and
+  `clean-partial` cannot reach a dataset or let one resolve to the model of the
+  same name.
+- **The command line parses and runs on a 16 MiB worker thread.** The `clap`
+  derive's command builder keeps every subcommand's arguments in one frame, and
+  in a debug build on Windows it had come within two flags of the main thread's
+  1 MiB: adding `du`'s two new flags overflowed the stack before `--version`
+  could print. Release builds were not affected, but their margin is not
+  something to depend on.
+
+### Fixed
+
+- **`du <N>` could name a different repo than the `#` printed.** The index was
+  resolved against a list that, unlike `du`'s, kept zero-byte repos. `du`,
+  `du --tree` and every index-taking command now share one listing.
+- **Documentation:** `cache delete` and `cache gc` no longer leave the
+  by-hand-hard-link trap unsaid. On Windows `du` cannot yet tell a hard-linked
+  pointer from a copy, so a user who hard-links the copies with a script frees
+  the bytes on the volume while `du` keeps reporting them and a later `cache
+  delete` keeps promising to free them twice. Do not do that before the reclaim
+  (v0.12.6, [#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21))
+  lands: the copies are reported now, and reclaimed there.
+
 ## [0.12.4] — TLS stack floors and advisory clean-up
 
 ### Security

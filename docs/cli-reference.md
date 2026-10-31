@@ -47,9 +47,9 @@ cargo install hf-fetch-model --features cli
 | `discover` | Find new model families on the Hub not yet cached locally |
 | `info <REPO_ID>` | Show model card metadata and README text |
 | `download-file <REPO_ID> <FILENAME>` | Download a single file (or glob pattern) and print its cache path |
-| `du [REPO_ID\|N]` | Show cache disk usage — per-repo breakdown (by name or `#` index), or cache-wide summary |
+| `du [REPO_ID\|N]` | Show cache disk usage — per-repo breakdown (by name or `#` index), or cache-wide summary of models, datasets and Spaces, with the duplicated copies named |
 | `cache clean-partial [REPO_ID\|N]` | Remove interrupted downloads' temp files (`.chunked.part`, and `hf-hub` / `huggingface_hub`'s `.incomplete`) |
-| `cache delete <REPO_ID\|N>` | Delete a cached model (entire `models--org--name/` directory) |
+| `cache delete <REPO_ID\|N>...` | Delete cached repos (each `models--org--name/` directory): several per call, `--dry-run` to preview, a repo moved behind a link loses the link only |
 | `cache path <REPO_ID\|N>` | Print the snapshot directory path for scripting |
 | `cache verify <REPO_ID\|N>` | Re-verify SHA256 digests of cached files against HuggingFace LFS metadata |
 | `inspect <REPO_ID> [FILENAME]` | Inspect `.safetensors` / `.npz` / `.gguf` / `.pth` headers (remote or cached) — tensor names, shapes, dtypes; auto-detects PEFT adapter config |
@@ -58,7 +58,7 @@ cargo install hf-fetch-model --features cli
 | `peek <REPO_ID> <FILENAME>` | Print a small file's content — `config.yaml`, `README.md`, `.gz` sidecars — without downloading. No tensor formats (use `inspect`); no anamnesis dispatch |
 | `quants <REPO_ID>` | Aggregate a base model's quant sibling repos into one sorted table; `--fits <SIZE> [--reserve <SIZE>]` adds an offload-aware VRAM fit plan |
 | `search <QUERY>` | Search the HuggingFace Hub for models (by downloads) |
-| `status [REPO_ID]` | Show download status — per-repo detail, or cache-wide summary |
+| `status [REPO_ID\|N]` | Show download status — per-repo detail (by name or `du` index), or cache-wide summary |
 
 `<ARG>` = required, `[ARG]` = optional.
 
@@ -419,6 +419,17 @@ hf-fm du --tree
 
 # Tree view with last-modified column on each repo branch
 hf-fm du --tree --age
+
+# Put the repos with the most duplicated copies (Windows) first
+hf-fm du --sort dup
+
+# Hash every duplicated copy against its blob (slow: reads each copy once)
+hf-fm du --verify-duplicates
+hf-fm du microsoft/Phi-3.5-mini-instruct --verify-duplicates
+
+# A root-level repo by its bare name, a dataset behind its Hub prefix
+hf-fm du gpt2
+hf-fm du datasets/wikitext
 ```
 
 ## Du flags
@@ -426,8 +437,16 @@ hf-fm du --tree --age
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--age` | Show a last-modified age column (e.g., `2 days ago`, `3 months ago`) | off |
-| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,size,shared_bytes?,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,total_files,repo_count,shared_store_bytes?}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max`, with the same meaning as in `list-files --json`, are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down `{cache_dir,repo_id,files[{filename,size}],total_bytes,listed_bytes,shared_bytes?,file_count,has_partial,quant_alternatives,size_min,size_max}` with the same quant-range fields. A repo's `size` and `total_bytes`, and the flat view's top-level `total_bytes`, are **bytes on disk**: everything in the repo's directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars), each physical file counted once, plus the payloads the repo links to in `huggingface_hub`'s shared blob store (see below), so the flat view's `size` equals `du <REPO_ID> --json`'s `total_bytes` for the same repo. Per-file `size`, and so `size_min`/`size_max`, is each file's own size, and `listed_bytes` (since v0.12.2) is the sum of `files[].size`. It is smaller than `total_bytes` where snapshot entries are copies of their blobs, which they always are for files `hf-hub` writes on Windows, and larger where symlinked entries share one blob, as across several cached revisions. Before v0.12.2, `total_bytes` was that sum ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)). | off |
+| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,repo_type,size,shared_bytes?,duplicated_bytes,relocated_to?,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,duplicated_bytes,total_files,repo_count,shared_store_bytes?,volume_bytes?,verification?}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max`, with the same meaning as in `list-files --json`, are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down `{cache_dir,repo_id,repo_type,files[{filename,size}],total_bytes,listed_bytes,duplicated_bytes,orphan_blob_bytes,partial_bytes,bookkeeping_bytes,relocated_to?,shared_bytes?,file_count,has_partial,quant_alternatives,size_min,size_max}` with the same quant-range fields. A repo's `size` and `total_bytes`, and the flat view's top-level `total_bytes`, are **bytes on disk**: everything in the repo's directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars), each physical file counted once, plus the payloads the repo links to in `huggingface_hub`'s shared blob store (see below), so the flat view's `size` equals `du <REPO_ID> --json`'s `total_bytes` for the same repo. Per-file `size`, and so `size_min`/`size_max`, is each file's own size, and `listed_bytes` (since v0.12.2) is the sum of `files[].size`. It is smaller than `total_bytes` where snapshot entries are copies of their blobs, which they always are for files `hf-hub` writes on Windows, and larger where symlinked entries share one blob, as across several cached revisions. Before v0.12.2, `total_bytes` was that sum ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)). | off |
+| `--sort KEY` | Order the summary by `size` (the default) or `dup`, the bytes stored twice as duplicated copies. The `#` column stays each repo's rank by size, which is what `du <N>` takes. Conflicts with a repo argument and with `--tree`. | `size` |
+| `--verify-duplicates` | Hash every duplicated copy and compare it with its blob's name (the SHA-256 of an LFS file's content). Reads each copy once, so it takes minutes on tens of GiB, and reports each repo on stderr as it starts. Copies that differ are listed; git-stored files, whose blob is named by a git hash, are counted as unverifiable. In `--json`, a `verification` object. Conflicts with `--tree`. | off |
 | `--tree` | Hierarchical tree view: repos as branches, files as leaves, using box-drawing connectors. Composes with `--age` and `--json`; conflicts with the positional repo argument (the per-repo view is already covered by `du <REPO_ID>`). | off |
+
+Since v0.12.5 `du` lists every repo the cache holds: models, datasets and Spaces, so its total is the cache's. A dataset or Space is addressed behind its Hub prefix (`datasets/<org>/<name>`, `spaces/<org>/<name>`), which the `REPO` column prints, and a `#` index works for any of them; a bare name (`gpt2`) resolves when it names a cached model. `repo_type` in `--json` is `model`, `dataset` or `space`.
+
+**Duplicated copies.** Where a snapshot file is stored again beside its blob (what `hf-hub` leaves on Windows, which never tries a symlink), `du` adds a `DUP` column beside `SIZE` and a footer, `154.16 GiB of 763.22 GiB are duplicated copies (21 repos)`. The column appears only when some repo has copies, so a cache of symlinks prints as it always did. A blob counts when a snapshot file of the same length that is neither a link nor the blob itself exists in the same repo, each blob pairing with one file; a blob that a symlink or hard link points at does not. `du <REPO_ID>` ends with the gap in figures, `duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B`, which with the listed bytes add up to `total on disk` (where the listing is the larger, as for symlinked entries sharing one blob across revisions, it keeps the note that names the possibilities). Do not hard-link the copies by hand: on Windows `du` cannot yet tell a hard-linked pointer from a copy, so the volume would free the bytes while `du` kept reporting them.
+
+**Relocated repos.** A repo whose cache entry is a symlink or a Windows junction to a directory elsewhere (moved to another disk) is marked with `→` and its target, reported as `relocated_to` in `--json`, and named in `du <REPO_ID>`. Every figure still counts it; when the bytes sit on more than one volume the footer adds `By volume: C: 762.71 GiB · D: 525.44 MiB` (`volume_bytes` in `--json`).
 
 A repo with an in-progress or interrupted download carries a `●` at the end of its row in the `du` listing, explained by a `● = partial downloads` line under the total. Its size includes the download's temp files: hf-fm's `.chunked.part` temp blobs at the full length they are preallocated to (on Windows that is what they occupy, while filesystems that keep the unwritten part sparse, such as ext4, allocate less until the download finishes), and the `.incomplete` files of `hf-hub` / `huggingface_hub` at what they hold so far (marked since v0.12.2). Run `hf-fm status <REPO_ID>` for the per-file progress.
 
@@ -495,13 +514,24 @@ hf-fm cache delete 3
 
 # Skip confirmation prompt
 hf-fm cache delete 3 --yes
+
+# Several at once: every argument is resolved first, so one bad one removes nothing
+hf-fm cache delete EleutherAI/pythia-1.4b 7 datasets/wikitext --dry-run
+
+# A repo moved behind a link: remove the link only (default), or the bytes too
+hf-fm cache delete gpt2
+hf-fm cache delete gpt2 --with-target
 ```
 
 ## Cache delete flags
 
+Takes one or more repos, by ID or by `du` index; a dataset or Space is `datasets/<org>/<name>` or `spaces/<org>/<name>`. The arguments are resolved and checked first, then de-duplicated (an index and an ID can name one repo), then deleted: one uncached or unknown argument removes nothing. A numeric index is the `#` of the last `du` and shifts after each deletion, so every index prints the repo it resolved to, `--yes` or not. A deletion that fails does not stop the others; the command fails at the end if any did.
+
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--yes` | Skip confirmation prompt | off |
+| `--dry-run` | Print what would be deleted and what it frees, without deleting or prompting | off |
+| `--with-target` | For a repo moved to another disk behind a link, delete the bytes at the link's target too. By default only the link is removed and the bytes stay, which the output says and reports as freeing nothing here. The target must be a directory named like the repo's cache folder (`models--org--name`), and `--yes` does not skip the prompt | off |
 
 ```sh
 # Evict every repo last touched more than 30 days ago
@@ -524,6 +554,8 @@ hf-fm cache gc --older-than 30 --yes
 ```
 
 ## Cache gc flags
+
+`gc` selects among models only. Its preview ends with the cache's duplicated bytes, the figure `du`'s footer prints (a budget-driven eviction deletes whole models to recover space that deduplication would recover without losing any; `gc` does not deduplicate), and says how many dataset and Space repos it leaves out. A relocated repo (moved behind a link) is skipped with a note, since evicting one frees nothing on the cache's own disk.
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -669,6 +701,8 @@ These flags apply to the default download command (`hf-fm <REPO_ID>`). `download
 | `--tag` | Filter cached repos by a HuggingFace tag (case-insensitive). Tags are fetched at query time via the HF model_info API, bounded to 8 concurrent requests. Per-repo fetch failures silently drop the row from the filter result. Empty families are pruned from the output. | — |
 
 ## Status flags
+
+`status` takes a repo ID or, since v0.12.5, a `du` index (`hf-fm status 60`); the resolved ID goes to stderr, so `--json` stays clean.
 
 | Flag | Description | Default |
 |------|-------------|---------|

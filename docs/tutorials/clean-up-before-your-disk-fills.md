@@ -2,9 +2,9 @@
 
 *See what the HuggingFace cache holds, decide what to keep, and reclaim the rest — with a dry-run before anything is deleted.*
 
-*~1,650 words · about 7 min read*
+*~2,430 words · about 10 min read*
 
-<!-- Last updated: 2026-10-10, hf-fm v0.12.2 -->
+<!-- Last updated: 2026-10-31, hf-fm v0.12.5 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -27,6 +27,14 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    real cache. The du ● marker block those sessions produced was dropped
    rather than kept with a pre-fix size. The reader's numbers WILL differ;
    the column shapes and legends must not.
+
+   v0.12.5 (2026-10-31) recaptured, from the same machine's cache after a
+   cleanup (763 GiB, 72 repos, 21 holding duplicated copies; the 2026-10-10
+   figures above describe the state before it), every du and gc block, the
+   du <repo> drill-down, and the cache delete / DUP / --verify-duplicates
+   additions. The status / delete-prompt / verify / path blocks are older
+   and unchanged. The 2026-10-10 narrative numbers (816 GiB, 75 repos) were
+   replaced, not mixed with the new ones.
 3. Safety: every destructive command appears with --dry-run, or with its
    confirmation prompt visible and answered `n`. Never paste an output
    that shows an actual deletion the reader did not see previewed first.
@@ -79,17 +87,22 @@ hf-fm du
 ```
 Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
 
-    #                      SIZE  REPO                                                        FILES
-    1                159.05 GiB  mntss/clt-gemma-2-2b-2.5M                                      53
-    2                 78.92 GiB  bluelightai/clt-qwen3-1.7b-base-20k                            88
-    3                 46.09 GiB  bluelightai/clt-qwen3-0.6b-base-20k                            88
-    4                 32.39 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                   87
-    5                 32.26 GiB  mntss/transcoder-Llama-3.2-1B                                  17
-    …
-   74                   2.4 KiB  chanind/sae-gemma-2-2b-standard                                 1
-   75                     607 B  EleutherAI/pythia-70m                                           1
-  ────────────────────────────────────────────────────────────────────────────────────────────────
-  816.32 GiB  total (75 repos, 944 files)
+    #                      SIZE         DUP  REPO                                                     FILES
+    1                159.05 GiB           -  mntss/clt-gemma-2-2b-2.5M                                   53
+    2                 78.92 GiB   38.30 GiB  bluelightai/clt-qwen3-1.7b-base-20k                         88
+    3                 46.09 GiB   22.42 GiB  bluelightai/clt-qwen3-0.6b-base-20k                         88
+    4                 34.54 GiB           -  datasets/TheQweaker/rented_boxes                          1952  ●
+    5                 32.39 GiB   15.60 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                87
+…
+   71                     607 B           -  EleutherAI/pythia-70m                                        1
+   72                     141 B           -  sentence-transformers/all-MiniLM-L6-v2                       0
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  763.22 GiB  total (72 repos, 2839 files)
+  By volume: C: 762.71 GiB · D: 525.44 MiB
+  154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
+  Note: a duplicated copy is a snapshot file stored again beside its blob, which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; `--verify-duplicates` hashes the copies to confirm them. Reclaiming them is tracked in https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21.
+  ● = partial downloads
+  → = relocated: the repo's directory is a link to where its bytes are
   Note: a size range means that repo's cached `.gguf` files are mutually exclusive quant alternatives rather than shards of one file — you likely only need one of them (see `du <repo>` for the exact file sizes). The total above still reflects real bytes on disk across every cached file.
 ```
 
@@ -100,23 +113,30 @@ hf-fm cache gc --older-than 180 --dry-run
 ```
 Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
 
+note: 1 relocated repo skipped (the bytes are behind a link, not in this cache); `hf-fm cache delete` removes one
 Will remove:
-  Qwen/Qwen2.5-Coder-7B-Instruct                                14.19 GiB  8 months ago
-  google/codegemma-7b-it                                        15.92 GiB  8 months ago
-  codellama/CodeLlama-7b-hf                                     12.55 GiB  8 months ago
+  Qwen/Qwen2.5-Coder-7B-Instruct                       14.19 GiB  9 months ago
+  google/codegemma-7b-it                               15.92 GiB  9 months ago
+  codellama/CodeLlama-7b-hf                            12.55 GiB  8 months ago
   …
-  mntss/clt-gemma-2-2b-2.5M                                    159.05 GiB  7 months ago
+  mntss/clt-gemma-2-2b-2.5M                           159.05 GiB  8 months ago
   …
-  TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF                         1.16 GiB  6 months ago
+  google/gemma-4-E2B-it                                19.12 GiB  6 months ago
 
-Cache: 816.32 GiB → 416.16 GiB (free 400.15 GiB)
+Skipped (relocated behind a link; evicting them frees nothing here):
+  gpt2  525.44 MiB
+
+Cache: 728.67 GiB → 282.79 GiB (free 445.88 GiB)
+  154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
+  gc selects whole repos by age and budget and does not deduplicate: removing models to recover space that deduplication would recover without losing any is what this figure warns against. `hf-fm du` names the copies per repo.
+Note: 3 dataset or Space repos (34.55 GiB) not counted above; gc evicts models only.
 ```
 
-That preview says: everything untouched for six months, removed in one stroke, frees 400.15 GiB, about half the cache. Pick the threshold to fit your own cache: on this one, 90 days would have taken 789.77 GiB, nearly all of it, since most of it has sat idle for three months or more. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
+That preview says: every model untouched for six months, removed in one stroke, frees 445.88 GiB of the 728.67 GiB of models, about three fifths. Pick the threshold to fit your own cache: on this one, 90 days would have taken 702.54 GiB, nearly all of it, since most of it has sat idle for three months or more. Read the lines under `Cache:` before you trust the figure. On Windows the cache holds a second copy of many files (154.16 GiB here, which `du` names, below), and eviction removes whole models: it would delete models to recover space that deduplication would recover without losing any. And `gc` selects among models only, so the 34.55 GiB of datasets that `du` lists are not in its 728.67 GiB; the last line says so. The `note:` above the list is a repo, `gpt2`, that was moved to another disk behind a link: evicting it would free nothing here, so it is skipped. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
 
 ## Seeing: the `du` family
 
-`du` is one command with progressive flags. The `#` column is not decoration: every index it prints is accepted wherever a repo ID is (`du 17`, `cache delete 17`, `cache verify 17`), so you never type `models--microsoft--Phi-3.5-mini-instruct` or even `microsoft/Phi-3.5-mini-instruct` by hand. A `●` after a row's file count flags a repo with an interrupted download, and a `● = partial downloads` line under the total explains it. Nothing in the listing above is mid-download, so neither appears there; the next section interrupts a download on purpose. While a repo carries the marker, its size includes the in-flight shards at the full size each one is preallocated to, which on Windows is what they occupy on disk, but its file count leaves them out until they finish. `status`, below, is what shows their true progress.
+`du` is one command with progressive flags. The `#` column is not decoration: every index it prints is accepted wherever a repo ID is (`du 15`, `cache delete 15`, `cache verify 15`), so you never type `models--microsoft--Phi-3.5-mini-instruct` or even `microsoft/Phi-3.5-mini-instruct` by hand. A `●` after a row's file count flags a repo with an interrupted download, and a `● = partial downloads` line under the total explains it; row 4 above carries one, a dataset whose download never finished, and the next section interrupts a model download on purpose. Since v0.12.5 `du` lists datasets and Spaces too, so its total is the cache's: row 4 is `datasets/TheQweaker/rented_boxes`, 34.54 GiB that the listing used to leave out, addressed behind the Hub's `datasets/` prefix (`du 4` works as well). The `DUP` column is explained below. While a repo carries the marker, its size includes the in-flight shards at the full size each one is preallocated to, which on Windows is what they occupy on disk, but its file count leaves them out until they finish. `status`, below, is what shows their true progress.
 
 `--age` adds the question GC will ask — *when did I last touch this?*
 
@@ -125,21 +145,59 @@ hf-fm du --age
 ```
 
 ```
-    #                      SIZE  REPO                                                        FILES  AGE
-    1                159.05 GiB  mntss/clt-gemma-2-2b-2.5M                                      53  7 months ago
-    2                 78.92 GiB  bluelightai/clt-qwen3-1.7b-base-20k                            88  4 months ago
-    3                 46.09 GiB  bluelightai/clt-qwen3-0.6b-base-20k                            88  4 months ago
-    4                 32.39 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                   87  4 months ago
-    5                 32.26 GiB  mntss/transcoder-Llama-3.2-1B                                  17  5 months ago
+    #                      SIZE         DUP  REPO                                                     FILES  AGE            
+    1                159.05 GiB           -  mntss/clt-gemma-2-2b-2.5M                                   53  8 months ago   
+    2                 78.92 GiB   38.30 GiB  bluelightai/clt-qwen3-1.7b-base-20k                         88  5 months ago   
+    3                 46.09 GiB   22.42 GiB  bluelightai/clt-qwen3-0.6b-base-20k                         88  5 months ago   
+    4                 34.54 GiB           -  datasets/TheQweaker/rented_boxes                          1952  2 days ago       ●
+    5                 32.39 GiB   15.60 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                87  5 months ago   
+…
+```
+
+Row 1 is the classic case this tutorial exists for: a 159 GiB set of cross-layer transcoders, fetched eight months ago and untouched since. Row 2 is half its size and three months younger, so the six-month sweep above keeps it.
+
+**The `DUP` column** is new in v0.12.5, and on Windows it can be the biggest saving in the cache. It appears only when some repo holds duplicated copies: a file stored once as its blob and again as a full copy in `snapshots/`, which is how `hf-hub` writes where it cannot make a symlink. Row 1 has none (a dash): its 159 GiB are in `snapshots/` alone. Row 2 has 38.30 GiB, half its size, stored twice. `--sort dup` puts the repos with the most copies first, and `#` stays each repo's rank by size, so `du <N>` still names what you see:
+
+```sh
+hf-fm du --sort dup
+```
+
+```
+    #                      SIZE         DUP  REPO                                                     FILES
+    2                 78.92 GiB   38.30 GiB  bluelightai/clt-qwen3-1.7b-base-20k                         88
+    3                 46.09 GiB   22.42 GiB  bluelightai/clt-qwen3-0.6b-base-20k                         88
+    6                 32.26 GiB   16.13 GiB  mntss/transcoder-Llama-3.2-1B                               17
+    5                 32.39 GiB   15.60 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                87
     …
 ```
 
-Row 1 is the classic case this tutorial exists for: a 159 GiB set of cross-layer transcoders, fetched seven months ago and untouched since. Row 2 is half its size and three months younger, so the six-month sweep above keeps it.
+The footer under the total adds up the column, `154.16 GiB of 763.22 GiB are duplicated copies (21 repos)`: a fifth of this cache, which no amount of sorting by `SIZE` shows. Detection is by length (a snapshot file the same length as a blob in the same repo, that is not a link to it), so `--verify-duplicates` settles it by hashing each copy against its blob's name, which for an LFS file is the SHA-256 of its content. It reads every copy once, so scope it to a repo:
+
+```sh
+hf-fm du google/gemma-scope-2b-pt-res --verify-duplicates
+```
+
+```
+  google/gemma-scope-2b-pt-res:
+
+    #        SIZE  FILE
+    1  288.13 MiB  layer_0/width_16k/average_l0_105/params.npz
+    2   72.04 MiB  embedding/width_4k/average_l0_44/params.npz
+  ────────────────────────────────────────────────────────────
+  360.18 MiB  listed above (2 files)
+  432.22 MiB  total on disk
+
+  duplicated copies 72.04 MiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 40 B
+
+  Verified 1 duplicated copy (72.04 MiB): identical to their blob.
+```
+
+(That repo's 288 MiB file has no copy; the 72 MiB file is the duplicate, and `Verified` shows it holds its blob's bytes.) **Do not hard-link the copies by hand to reclaim them.** On Windows `du` cannot yet tell a hard-linked pointer from a copy, so the volume would free the bytes while `du` kept reporting them, and `cache delete` would keep promising to free them twice. Reclaiming them safely is the planned `cache dedupe` ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)).
 
 Drill into one repo by its index:
 
 ```sh
-hf-fm du 17
+hf-fm du 15
 ```
 
 ```
@@ -148,17 +206,16 @@ hf-fm du 17
     #       SIZE  FILE
     1   4.63 GiB  model-00001-of-00002.safetensors
     2   2.49 GiB  model-00002-of-00002.safetensors
-    3   1.76 MiB  tokenizer.json
     …
    20      195 B  generation_config.json
   ────────────────────────────────────────────────
    7.12 GiB  listed above (20 files)
   14.24 GiB  total on disk
 
-  Note: the repo holds more on disk than the files listed above: a second copy of each (as on Windows), blobs that no snapshot points at, or bookkeeping such as refs/ and hf-fm's header cache.
+  duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B
 ```
 
-The two totals differ, and not by rounding. The files as listed add up to 7.12 GiB, but the repo occupies 14.24 GiB, because each file is stored twice: as its blob in `blobs/`, and as a full copy under `snapshots/` where Linux and macOS would put a symlink. That is how hf-fm's downloads usually land on Windows, where creating a symlink needs Developer Mode or an elevated shell. The listing shows what the model is made of; `total on disk` is what deleting it frees, and it is the figure the whole-cache `du`, `cache gc` and `cache delete` all use. Where the two agree, as they do with symlinked entries on Linux and macOS, `du` prints a single `total` line.
+The two totals differ, and not by rounding. The files as listed add up to 7.12 GiB, but the repo occupies 14.24 GiB, because each file is stored twice: as its blob in `blobs/`, and as a full copy under `snapshots/` where Linux and macOS would put a symlink. That is how hf-fm's downloads usually land on Windows, where creating a symlink needs Developer Mode or an elevated shell. The last line says it in numbers: all 7.12 GiB of the difference is duplicated copies (the same 7.12 GiB as in row 15's `DUP`), and the rest, 140 B, is bookkeeping (`refs/` and hf-fm's header cache). Together with the listed bytes the four figures add up to `total on disk`; a repo with an interrupted download adds a `partial downloads` figure, and a blob that nothing points at an `orphan blobs` one. The listing shows what the model is made of; `total on disk` is what deleting it frees, and it is the figure the whole-cache `du`, `cache gc` and `cache delete` all use. Where the two agree, as they do with symlinked entries on Linux and macOS, `du` prints a single `total` line.
 
 And `du --tree` renders the whole cache as one structural view — repos as branches, files as leaves sorted by size — which is where pathological layouts jump out (here, per-layer decoder shards stepping down from 10.97 GiB):
 
@@ -261,6 +318,34 @@ hf-fm cache delete julien-c/dummy-unknown
 
 It removes the repo's entire `models--…` directory — blobs, refs, snapshots — so nothing is left half-alive. Pass `--yes` to skip the prompt in scripts.
 
+**Several at once, and a dry run.** Since v0.12.5 `cache delete` takes any number of repos, and `--dry-run` says what would go and what it frees without deleting or prompting. Every argument is resolved before anything is removed, so one that does not exist deletes nothing, and the list is de-duplicated (an index and an ID can name the same repo):
+
+```sh
+hf-fm cache delete julien-c/dummy-unknown EleutherAI/pythia-70m --dry-run
+```
+
+```
+  julien-c/dummy-unknown  (276.7 KiB, 8 files)
+  EleutherAI/pythia-70m  (607 B, 1 file)
+  Dry run: would delete 2 repos, freeing 277.2 KiB. Nothing was deleted.
+```
+
+Mind the indexes. They are the `#` of the last `du`, and they shift after each deletion, so a list of indexes read off one `du` and deleted one call at a time would remove the wrong repos from the second call on. In one call they are all resolved against the same listing, and each prints the repo it stands for, `--yes` or not (`index 3 is org/name`). A dataset or Space is deleted behind its prefix: `cache delete datasets/org/name`.
+
+**A repo moved to another disk.** To free `C:` without a second cache, a repo can be copied to another disk and a junction (or symlink) left at its old path; `du` follows it and marks the row `→ D:\hf-cache\models--gpt2`, and the footer says what each disk holds (`By volume: C: 762.71 GiB · D: 525.44 MiB`). Deleting such a repo removes the link and leaves the bytes, and says so:
+
+```sh
+hf-fm cache delete gpt2 --dry-run
+```
+
+```
+  gpt2  (525.44 MiB, 7 files)  → D:\hf-cache\models--gpt2
+  Only the link is removed: its 525.44 MiB stay at D:\hf-cache\models--gpt2. `--with-target` deletes them too.
+  Dry run: would delete 1 repo, freeing 0 B. Nothing was deleted.
+```
+
+`--with-target` deletes the bytes behind the link as well, only from a directory named like the repo's cache folder, and it always asks: `--yes` does not answer it.
+
 **Leftover partials:** suppose you had *abandoned* that interrupted Llama download instead of resuming it. `cache clean-partial` sweeps the leftover `.chunked.part` files (and their resume sidecars) across the whole cache, with the same `--dry-run` / prompt / `--yes` controls. Run the dry run first:
 
 ```sh
@@ -287,18 +372,25 @@ hf-fm cache gc --max-size 400GiB --except bluelightai/clt-qwen3-1.7b-base-20k --
 ```
 Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
 
+note: 1 relocated repo skipped (the bytes are behind a link, not in this cache); `hf-fm cache delete` removes one
 Will remove:
-  Qwen/Qwen2.5-Coder-7B-Instruct                                14.19 GiB  8 months ago
-  google/codegemma-7b-it                                        15.92 GiB  8 months ago
+  Qwen/Qwen2.5-Coder-7B-Instruct           14.19 GiB  9 months ago
+  google/codegemma-7b-it                   15.92 GiB  9 months ago
   …
-  mntss/clt-gemma-2-2b-2.5M                                    159.05 GiB  7 months ago
+  mntss/clt-gemma-2-2b-2.5M               159.05 GiB  8 months ago
   …
-  mntss/transcoder-Llama-3.2-1B                                 32.26 GiB  5 months ago
+  nvidia/Llama-3.1-8B-Instruct-FP8         12.98 GiB  7 months ago
+
+Skipped (relocated behind a link; evicting them frees nothing here):
+  gpt2  525.44 MiB
 
 Protected by --except:
   bluelightai/clt-qwen3-1.7b-base-20k
 
-Cache: 816.32 GiB → 383.67 GiB (free 432.65 GiB)
+Cache: 728.67 GiB → 390.12 GiB (free 338.55 GiB)
+  154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
+  gc selects whole repos by age and budget and does not deduplicate: removing models to recover space that deduplication would recover without losing any is what this figure warns against. `hf-fm du` names the copies per repo.
+Note: 3 dataset or Space repos (34.55 GiB) not counted above; gc evicts models only.
 ```
 
 Two caveats worth knowing before you trust GC. "Last accessed" is approximated by the newest modification time among the repo's snapshot files (or, for a repo that has none, such as one you only inspected with `--cache-headers`, among its other files) — the HF cache layout does not record true access times, so a repo you *read* daily but never re-download looks old; protect it with `--except`. And repos with a partial download modified within the last hour are skipped automatically, so GC never races an `hf-fm` download running in another shell.
@@ -346,10 +438,11 @@ cd (hf-fm cache path google/gemma-2-2b-it)         # PowerShell
 
 | Question | Command |
 |----------|---------|
-| Where are the bytes? | `du`, `du --age`, `du --tree` |
+| Where are the bytes? | `du`, `du --age`, `du --tree` (models, datasets and Spaces) |
+| What is stored twice (Windows)? | `du --sort dup`, `du <N>`, `du --verify-duplicates` |
 | What's inside repo #N? | `du <N>` |
 | Is this repo healthy? | `status <repo>`, `cache verify <repo\|N>` |
-| Remove one repo | `cache delete <repo\|N>` |
+| Remove repos | `cache delete <repo\|N>...` (`--dry-run`; a repo behind a link loses the link, `--with-target` the bytes) |
 | Remove interrupted-download leftovers | `cache clean-partial` |
 | Reclaim space in bulk | `cache gc --older-than D` / `--max-size S` (+ `--except`, always `--dry-run` first) |
 | Hand the path to another tool | `cache path <repo>` |

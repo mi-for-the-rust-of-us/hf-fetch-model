@@ -5,10 +5,12 @@
 //!
 //! [`hf_cache_dir()`] locates the local HF cache. [`list_cached_families()`]
 //! scans downloaded models and groups them by `model_type`.
-//! [`cache_summary()`] provides per-repo totals of bytes on disk,
-//! [`cache_repo_usage()`] returns a single repo's per-file sizes, and
-//! [`verify_cache()`] re-checks `SHA256` digests of cached files against
-//! `HuggingFace` LFS metadata.
+//! [`cache_summary()`] provides per-repo totals of bytes on disk (for models;
+//! [`cache_summary_all()`] adds datasets and Spaces),
+//! [`cache_repo_usage()`] returns a single repo's per-file sizes,
+//! [`verify_duplicates()`] hashes the snapshot files that duplicate their
+//! blobs, and [`verify_cache()`] re-checks `SHA256` digests of cached files
+//! against `HuggingFace` LFS metadata.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};

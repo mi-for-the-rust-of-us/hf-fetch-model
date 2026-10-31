@@ -60,7 +60,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 |---------|-------------|
 | `hf-fm <REPO_ID>` *(default)* | Download a model (multi-connection, auto-tuned) |
 | `hf-fm cache clean-partial` | Remove interrupted downloads' temp files: hf-fm's `.chunked.part`, and the `.incomplete` files `hf-hub` / `huggingface_hub` leave (a download still running is skipped) |
-| `hf-fm cache delete <REPO_ID\|N>` | Delete a cached model |
+| `hf-fm cache delete <REPO_ID\|N>...` | Delete cached repos: several per call, `--dry-run` to preview; a repo moved to another disk behind a link loses the link only |
 | `hf-fm cache gc --older-than/--max-size` | Garbage-collect cached models by age and/or size budget |
 | `hf-fm cache path <REPO_ID\|N>` | Print snapshot directory path (for scripting) |
 | `hf-fm cache verify <REPO_ID\|N>` | Re-verify SHA256 digests of cached files against HF LFS metadata |
@@ -68,7 +68,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 | `hf-fm diff-config <REPO_A> <REPO_B>` | Compare `config.json` architecture fields between two models |
 | `hf-fm discover` | Find new model families on the Hub |
 | `hf-fm download-file <REPO_ID> <FILE>` | Download a single file (or glob pattern) |
-| `hf-fm du [REPO_ID\|N]` | Show cache disk usage (by name or `#` index) |
+| `hf-fm du [REPO_ID\|N]` | Show cache disk usage (by name or `#` index): models, datasets and Spaces, with the duplicated copies named |
 | `hf-fm inspect <REPO_ID> [FILE]` | Inspect tensor headers (names, shapes, dtypes) without downloading weights — safetensors/NPZ/GGUF/PTH remote or cached; add `--check-gpu [--context N]` for a GPU-fit verdict (with KV-cache budgeting), `--pick` to choose the file interactively, or `--cache-headers` to keep parsed remote headers on disk for the next run |
 | `hf-fm list-families` | List model families in local cache |
 | `hf-fm list-files <REPO_ID>` | List remote files (sizes, SHA256) without downloading |
@@ -305,7 +305,7 @@ Cache: /home/user/.cache/huggingface/hub
   2.02 MiB  listed above (4 files)
   2.73 GiB  total on disk
 
-  Note: the repo holds more on disk than the files listed above: an unfinished download's temp files, and on Windows typically a second copy of each listed file.
+  duplicated copies 0 B · orphan blobs 0 B · partial downloads 2.73 GiB · bookkeeping 40 B
 
   ● partial downloads — run `hf-fm status EleutherAI/pythia-1.4b` for details
 
@@ -347,6 +347,55 @@ Cache: /home/user/.cache/huggingface/hub
 $ hf-fm cache path google/gemma-2-2b-it
 /home/user/.cache/huggingface/hub/models--google--gemma-2-2b-it/snapshots/299a8560bedf22ed1c72a8a11e7dce4a7f9f51f8
 ```
+
+### Duplicated copies, datasets, and repos moved to another disk
+
+On Windows `hf-hub` never tries a symlink, so every file is stored twice: as its blob and as a full copy in `snapshots/`. `du` counts both (they occupy the disk) and, since 0.12.5, names the second copy: a `DUP` column beside `SIZE` (only when some repo has copies, so the Linux and macOS output above is unchanged), and a footer. The listing also covers datasets and Spaces, so its total is the cache's, and a repo moved to another disk behind a junction or symlink is marked with its target and the footer splits the bytes by volume. From a 763 GiB Windows cache:
+
+```
+$ hf-fm du
+Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
+
+    #                      SIZE         DUP  REPO                                                     FILES
+    1                159.05 GiB           -  mntss/clt-gemma-2-2b-2.5M                                   53
+    2                 78.92 GiB   38.30 GiB  bluelightai/clt-qwen3-1.7b-base-20k                         88
+    3                 46.09 GiB   22.42 GiB  bluelightai/clt-qwen3-0.6b-base-20k                         88
+    4                 34.54 GiB           -  datasets/TheQweaker/rented_boxes                          1952  ●
+    5                 32.39 GiB   15.60 GiB  bluelightai-dev/clt-Qwen3-0.6B-Base-16k-test                87
+…
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  763.22 GiB  total (72 repos, 2839 files)
+  By volume: C: 762.71 GiB · D: 525.44 MiB
+  154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
+  Note: a duplicated copy is a snapshot file stored again beside its blob, which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; `--verify-duplicates` hashes the copies to confirm them. Reclaiming them is tracked in https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21.
+  ● = partial downloads
+  → = relocated: the repo's directory is a link to where its bytes are
+
+$ hf-fm du microsoft/Phi-3.5-mini-instruct
+…
+   20      195 B  generation_config.json
+  ────────────────────────────────────────────────
+   7.12 GiB  listed above (20 files)
+  14.24 GiB  total on disk
+
+  duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B
+```
+
+`du --sort dup` puts the repos with the most copies first (`#` stays each repo's rank by size, which `du <N>` takes), and `du --verify-duplicates` hashes every copy against its blob's name to confirm it. A dataset or Space is addressed behind its Hub prefix, `hf-fm du datasets/wikitext`; a root-level repo by its bare name, `hf-fm du gpt2`. `cache delete` takes several repos and a `--dry-run`, and on a repo behind a link removes the link only (`--with-target` deletes the bytes too):
+
+```
+$ hf-fm cache delete julien-c/dummy-unknown EleutherAI/pythia-70m --dry-run
+  julien-c/dummy-unknown  (276.7 KiB, 8 files)
+  EleutherAI/pythia-70m  (607 B, 1 file)
+  Dry run: would delete 2 repos, freeing 277.2 KiB. Nothing was deleted.
+
+$ hf-fm cache delete gpt2 --dry-run
+  gpt2  (525.44 MiB, 7 files)  → D:\hf-cache\models--gpt2
+  Only the link is removed: its 525.44 MiB stay at D:\hf-cache\models--gpt2. `--with-target` deletes them too.
+  Dry run: would delete 1 repo, freeing 0 B. Nothing was deleted.
+```
+
+Do not hard-link the copies by hand to reclaim them: `du` cannot yet tell a hard-linked pointer from a copy on Windows, so the volume would free the bytes while `du` kept reporting them. Reclaiming them is the planned `cache dedupe` ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)). The [cache tutorial](docs/tutorials/clean-up-before-your-disk-fills.md) walks through all of it.
 
 ## Library quick start
 
