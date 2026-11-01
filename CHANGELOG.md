@@ -20,19 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`up to`, since the plan pairs by length), prompts once unless `--yes`, then
   compares every copy with its blob byte for byte before replacing it, and
   reports what it reclaimed, the bytes it read and how fast, and every file it
-  left alone with the reason. `--dry-run` previews without reading anything.
+  left alone with the reason. `--dry-run` previews without reading any file.
   `--verify` also hashes each copy against the SHA-256 its blob is named by and
   leaves a pair alone if they disagree; a git-stored file's blob, named by a git
-  hash, is linked and counted as unchecked. A repo with a partial download or
-  a held download lock is skipped whole, with a pointer to `cache
-  clean-partial`. The reclaimed figure can exceed `DUP` where two cached
-  revisions copy one blob: `DUP` counts the blob once, and dedupe frees both
-  copies. The preview can exceed both where snapshot files share a length with
-  fewer blobs than files: a file with no blob of its own is compared, left
-  alone ("no blob of its length holds the same bytes"), and compared again by
-  a later run, which then says "Nothing reclaimed".
-- **`du`, `du <repo>` and `cache gc --dry-run` point to `cache dedupe`** where a
-  model repo holds duplicated copies. The footer's link to issue #21 is gone;
+  hash, is linked and counted as unchecked.
+  - A repo with a partial download, or a download lock another process holds,
+    is skipped whole, checked again before each file. The skip line points to
+    `cache clean-partial` for a partial download, and says to run again later
+    for a held lock.
+  - A file another process has open is left alone as "in use by another
+    process, or read-only". On Windows that includes a file opened without
+    delete-sharing (how Python and most programs outside Rust open one), whose
+    replacement Windows answers with "access denied".
+  - The reclaimed figure can exceed `DUP` where two cached revisions copy one
+    blob: `DUP` counts the blob once, and dedupe frees both copies. A copy that
+    is itself hard-linked under several names is counted once, when its last
+    name goes. The preview can exceed both where snapshot files share a length
+    with fewer blobs than files: a file with no blob of its own is compared,
+    left alone ("no blob of its length holds the same bytes"), and compared
+    again by a later run, which then says "Nothing reclaimed".
+  - A temporary link that an interrupted run left in `snapshots/`
+    (`<name>.hf-fm-link.<pid>.tmp`) is listed by the next run and removed.
+- **`du`, `du <repo>` and the `cache gc` preview point to `cache dedupe`** where
+  a model repo holds duplicated copies. The footer's link to issue #21 is gone;
   copies in dataset and Space repos get no pointer, since the command takes
   models only.
 - **`cache::plan_dedupe` and `cache::apply_dedupe`**
@@ -45,11 +55,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   temporary name and renamed over the copy, so the file is never missing), and
   returns a `DedupeReport`: what it linked and reclaimed, and each file it
   skipped with its reason (`DedupeSkipReason`: the blob is a symlink into
-  `huggingface_hub`'s shared store, the bytes differ, the file is in use, the
-  volume cannot hard-link, a download is in progress, or, with `verify`, the
-  bytes do not hash to the blob's name). A repo with a partial download or a
-  held download lock is left alone, checked again when the plan is applied.
-  The report and plan types are `#[non_exhaustive]`.
+  `huggingface_hub`'s shared store, the bytes differ, the file is in use or
+  read-only, the volume cannot hard-link, a download is in progress, or, with
+  `verify`, the bytes do not hash to the blob's name). A repo with a partial
+  download or a held download lock is left alone, checked again before each
+  file. The plan and report types are `#[must_use]` and `#[non_exhaustive]`.
+
+### Changed
+
+- **A download on Windows no longer leaves an LFS file stored twice.** Where a
+  symlink is refused (no Developer Mode, no elevation), the chunked path now
+  makes a hard link to the blob, and falls back to a copy when that fails too,
+  which in practice means a volume that cannot hard-link (FAT32, exFAT).
+  `hf-hub`'s own path still writes a copy; after the download, the copy is
+  replaced with a hard link to `blobs/<sha256>` when the listing names the
+  file's SHA-256 and the two are byte-equal: never by name or length alone, so
+  a blob of that name holding other bytes is not trusted. The step runs after
+  the download is logged and outside the download timeouts, so
+  it never turns a finished download into a timeout nor counts toward its
+  throughput, and only for files the call fetched, never for cache hits.
+  Non-LFS files (named by a git hash) may stay copies, for `cache dedupe`. On a
+  fresh `julien-c/dummy-unknown`, the `hf-hub` path now leaves 2.2 KiB of
+  copies instead of 276.5 KiB, and the chunked path none. The on-disk layout of
+  new Windows downloads is therefore a hard link where it was a copy; `hf-hub`,
+  `huggingface_hub` and candle-mi read it as before. Hard-linked names share
+  their bytes: editing one in place changes the other, as a symlink always did
+  on Unix. One copy can still appear: when a new revision's download fetches
+  an etag an older revision already holds, the chunked path renames a new blob
+  into place, and the older revision's pointer keeps the old file, now a copy,
+  until the next `cache dedupe`.
+- **The docs reclaim the copies instead of warning against it.** The cache
+  tutorial gains a `cache dedupe` walkthrough captured from a `--release` build
+  of `main` on the maintainer's cache (the dry run, the run of that very
+  preview, and `du` after it: 763.22 GiB down to 609.07 GiB), the README a
+  reclaim example and a command-table row, the CLI reference a *Cache dedupe
+  flags* section, and the FAQ an entry on getting the space back. The v0.12.5
+  warning against hard-linking the copies by hand is gone from the README, the
+  tutorial, the FAQ and the CLI reference, since a hand-made hard link is now
+  counted once, and the statements that Windows downloads hold every file twice
+  (`upstream-differences.md`, `configuration.md`, the tutorial's two totals)
+  now say until when. The v0.12.5 `du` and `gc` captures still show the cache
+  before the reclaim; only their pointer lines were updated to v0.12.6's text.
+- **New Windows-only dependency: `winapi-util` 0.1.11** (`Unlicense OR MIT`),
+  for the file identity below. `std` exposes it only behind the unstable
+  `windows_by_handle` feature, and this crate forbids `unsafe`. It was already
+  in `Cargo.lock`, so no package is added; other platforms' builds are
+  unchanged.
 
 ### Fixed
 
@@ -65,42 +116,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file another process holds exclusively is still identified): on the
   maintainer's cache (72 repos, 2,839 files, 763 GiB) `du` takes 980 ms instead
   of 700 ms, warm, with identical output.
-
-### Changed
-
-- **A download on Windows no longer stores an LFS file twice.** Where a
-  symlink is refused (no Developer Mode, no elevation), the chunked path now
-  makes a hard link to the blob, and falls back to a copy only on a volume that
-  cannot hard-link (FAT32, exFAT). After `hf-hub`'s own path, which always
-  copies, the pointer is linked to `blobs/<sha256>` when the listing names the
-  file's SHA-256 and the two are byte-equal: never by name or length alone, so
-  a blob of that name holding other bytes is not trusted. Non-LFS files (named
-  by a git hash) may stay copies, for `cache dedupe`. On a fresh
-  `julien-c/dummy-unknown`, the `hf-hub` path now leaves 2.2 KiB of copies
-  instead of 276.5 KiB, and the chunked path none. The on-disk layout of new
-  Windows downloads is therefore a hard link where it was a copy; `hf-hub`,
-  `huggingface_hub` and candle-mi read it as before. Hard-linked names share
-  their bytes: editing one in place changes the other, as a symlink always did
-  on Unix. A re-download of the same etag by the chunked path renames a new
-  blob into place and leaves the old pointer's file as a copy, until the next
-  `cache dedupe`.
-- **The docs reclaim the copies instead of warning against it.** The cache
-  tutorial gains a `cache dedupe` walkthrough captured from the release binary
-  on the maintainer's cache (the dry run, the run of that very preview, and
-  `du` after it: 763.22 GiB down to 609.07 GiB), the README a reclaim example
-  and a command-table row, the CLI reference a *Cache dedupe flags* section,
-  and the FAQ an entry on getting the space back. The v0.12.5 warning against
-  hard-linking the copies by hand is gone from the README, the tutorial, the
-  FAQ and the CLI reference, since a hand-made hard link is now counted once,
-  and the statements that Windows downloads hold every file twice
-  (`upstream-differences.md`, `configuration.md`, the tutorial's two totals)
-  now say until when. The v0.12.5 `du` and `gc` captures still show the cache
-  before the reclaim; only their pointer lines were updated to v0.12.6's text.
-- **New Windows-only dependency: `winapi-util` 0.1.11** (`Unlicense OR MIT`),
-  for the file identity above. `std` exposes it only behind the unstable
-  `windows_by_handle` feature, and this crate forbids `unsafe`. It was already
-  in `Cargo.lock`, so no package is added; other platforms' builds are
-  unchanged.
 
 ## [0.12.5] — `du` names the duplicates and lists dataset repos
 

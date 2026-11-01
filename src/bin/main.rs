@@ -771,9 +771,10 @@ enum CacheCommands {
     /// Reclaim the duplicated copies: replace each snapshot file that holds
     /// the same bytes as its blob with a hard link to that blob.
     ///
-    /// On Windows `hf-hub` stores every file twice, as its blob and as a full
-    /// copy in `snapshots/` (`du`'s `DUP` column); this keeps every model and
-    /// frees the copies. Each copy is compared with its blob byte for byte
+    /// On Windows, files downloaded before v0.12.6 (and files the listing
+    /// gives no SHA-256 for) are stored twice, as their blob and as a full copy
+    /// in `snapshots/` (`du`'s `DUP` column); this keeps every model and frees
+    /// the copies. Each copy is compared with its blob byte for byte
     /// before it is replaced, so the preview says "up to" and the result says
     /// what was reclaimed. With no repo, every cached model; models only. A
     /// numeric index is the `#` of the last `du`, and the repo each index
@@ -786,7 +787,7 @@ enum CacheCommands {
         #[arg(long)]
         yes: bool,
 
-        /// Print what could be reclaimed, without comparing, linking or prompting.
+        /// Print what could be reclaimed, without reading any file, linking or prompting.
         #[arg(long)]
         dry_run: bool,
 
@@ -4218,8 +4219,9 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
 /// directory, counted once. That is the figure the whole-cache `du`
 /// sorts by and reports as this repo's `size` in `--json` (its text view
 /// shows a range instead for quant alternatives), and what `cache delete`
-/// frees. Where snapshot entries are copies of their blobs (always for files
-/// `hf-hub` writes on Windows) the repo holds the bytes twice, so the total
+/// frees. Where snapshot entries are copies of their blobs (files `hf-hub`
+/// wrote on Windows before v0.12.6 and that `cache dedupe` has not reclaimed)
+/// the repo holds the bytes twice, so the total
 /// exceeds the sum of the listing. Where they are symlinks shared by several
 /// cached revisions, it is the other way round; [`du_repo_gap_note`] says
 /// which. Until v0.12.2 the total was that sum, which is how
@@ -5784,8 +5786,12 @@ fn run_cache_delete(
 /// # Errors
 ///
 /// Returns [`FetchError::InvalidArgument`] when an argument does not resolve
-/// (see [`resolve_repo_arg`]), names a dataset or Space, or names a repo that
-/// is not cached, and [`FetchError::Io`] when the cache cannot be read.
+/// (see [`resolve_repo_arg`]).
+/// Returns [`FetchError::InvalidArgument`] when an argument names a dataset or
+/// a Space.
+/// Returns [`FetchError::InvalidArgument`] when an argument names a repo that
+/// is not cached.
+/// Returns [`FetchError::Io`] when the cache directory cannot be read.
 fn resolve_dedupe_targets(args: &[String]) -> Result<Vec<String>, FetchError> {
     if args.is_empty() {
         return Ok(cache::cache_summary()?
@@ -5873,9 +5879,10 @@ fn snapshot_relative(path: &Path, repo_dir: &Path) -> String {
 ///
 /// # Errors
 ///
-/// Returns the errors of [`resolve_dedupe_targets`], and
-/// [`FetchError::InvalidArgument`] or [`FetchError::Io`] from
-/// [`cache::plan_dedupe`].
+/// Returns [`FetchError::InvalidArgument`] when an argument does not name a
+/// cached model (see [`resolve_dedupe_targets`]).
+/// Returns [`FetchError::Io`] when the cache directory cannot be determined
+/// or read.
 // EXPLICIT: sequential pipeline (resolve, plan, preview, prompt, apply, report); splitting it hides the flow
 #[allow(clippy::too_many_lines)]
 fn run_cache_dedupe(
@@ -5898,9 +5905,12 @@ fn run_cache_dedupe(
         .map(|repo_id| cache::plan_dedupe(repo_id.as_str()))
         .collect::<Result<_, _>>()?;
 
-    // The preview: one row per repo with something to reclaim.
-    let active: Vec<&cache::DedupePlan> =
-        plans.iter().filter(|p| !p.candidates.is_empty()).collect();
+    // The preview: one row per repo with something to reclaim, or a leftover
+    // of an interrupted run to remove.
+    let active: Vec<&cache::DedupePlan> = plans
+        .iter()
+        .filter(|p| !p.candidates.is_empty() || !p.leftovers.is_empty())
+        .collect();
     let size_cells: Vec<String> = active
         .iter()
         .map(|p| format_size(p.reclaimable_bytes()))
@@ -5908,21 +5918,38 @@ fn run_cache_dedupe(
     let sw = size_cells.iter().map(String::len).max().unwrap_or(0);
     for (plan, size) in active.iter().zip(&size_cells) {
         let n = plan.candidates.len();
+        let leftovers = match plan.leftovers.len() {
+            0 => String::new(),
+            m => format!(
+                ", and {m} temporary {} an interrupted run left, to remove",
+                pluralize(m, "link", "links")
+            ),
+        };
         println!(
-            "  up to {size:>sw$}  {}  ({n} {})",
+            "  up to {size:>sw$}  {}  ({n} {}{leftovers})",
             plan.repo_id,
             pluralize(n, "file", "files")
         );
     }
     // What is left alone before anything is read: repos with a download in
     // progress, and copies whose blob is a symlink into the shared store.
+    let mut blocked: usize = 0;
     for plan in &plans {
         if plan.download_in_progress {
-            println!(
-                "  skipped {}: a download into the repo is in progress or was interrupted; \
-                 finish it, or run `hf-fm cache clean-partial {}`",
-                plan.repo_id, plan.repo_id
-            );
+            blocked += 1;
+            // BORROW: explicit .as_str() instead of Deref coercion
+            let advice = if cache::repo_has_partial(plan.repo_id.as_str())? {
+                format!(
+                    "a download into the repo is in progress or was interrupted; finish it, \
+                     or run `hf-fm cache clean-partial {}`",
+                    plan.repo_id
+                )
+            } else {
+                // BORROW: explicit .to_owned() for &str → owned String
+                "another process is downloading into the repo; run this again when it is done"
+                    .to_owned()
+            };
+            println!("  skipped {}: {advice}", plan.repo_id);
         }
         for skip in &plan.skipped {
             println!(
@@ -5940,8 +5967,12 @@ fn run_cache_dedupe(
         .map(|p| p.reclaimable_bytes())
         .fold(0_u64, u64::saturating_add);
     let file_count: usize = active.iter().map(|p| p.candidates.len()).sum();
-    if file_count == 0 {
-        println!("  Nothing to reclaim: no snapshot file is a separate copy of a blob.");
+    if active.is_empty() {
+        if blocked > 0 {
+            println!("  Nothing else to reclaim.");
+        } else {
+            println!("  Nothing to reclaim: no snapshot file is a separate copy of a blob.");
+        }
         return Ok(());
     }
     println!(
@@ -5969,6 +6000,7 @@ fn run_cache_dedupe(
     let mut already_linked: usize = 0;
     let mut unverified: usize = 0;
     let mut bytes_read: u64 = 0;
+    let mut leftovers_removed: usize = 0;
     let mut skipped: Vec<(&cache::DedupePlan, cache::DedupeSkip)> = Vec::new();
     // EXPLICIT: applies each plan in turn, reporting it on stderr, and tallies the reports
     for (plan, size) in active.iter().zip(&size_cells) {
@@ -5979,15 +6011,25 @@ fn run_cache_dedupe(
         already_linked += report.already_linked;
         unverified += report.unverified;
         bytes_read = bytes_read.saturating_add(report.bytes_read);
+        leftovers_removed += report.leftovers_removed;
         skipped.extend(report.skipped.into_iter().map(|skip| (*plan, skip)));
     }
     let elapsed = start.elapsed();
 
-    if linked == 0 {
+    if leftovers_removed > 0 {
+        println!(
+            "\n  Removed {leftovers_removed} temporary {} an interrupted run left (each a \
+             second name of its blob, so no bytes were freed).",
+            pluralize(leftovers_removed, "link", "links")
+        );
+    }
+    // With only leftovers to remove, no file was compared and there is
+    // nothing more to say.
+    if file_count > 0 && linked == 0 {
         // A file with no blob of its own but the length of one stays a
         // candidate, so a later run can find nothing to link.
         println!("\n  Nothing reclaimed: no candidate held the same bytes as a blob.");
-    } else {
+    } else if file_count > 0 {
         println!(
             "\n  Reclaimed {}: {linked} {}.",
             format_size(reclaimed),

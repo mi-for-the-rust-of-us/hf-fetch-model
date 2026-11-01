@@ -1479,6 +1479,39 @@ fn physical_id(path: &Path, meta: &std::fs::Metadata) -> Option<FileId> {
     Some((info.volume_serial_number(), info.file_index(), meta.len()))
 }
 
+/// How many directory entries name the file at `path` (its hard-link count),
+/// whose metadata is `meta`; `None` where it cannot be read.
+///
+/// Not an identity (a count above 1 can come from a name that is not the
+/// blob), but what `cache dedupe` needs to know whether replacing one name
+/// frees the file's bytes: only when it is the last. On Unix it is
+/// `st_nlink`, from `meta`; on Windows it is read as [`physical_id`] reads
+/// the identity (new in v0.12.6).
+#[cfg(unix)]
+// Always `Some` here, as `physical_id`'s Unix arm is, and for the same
+// reason: the signature is shared with the Windows arm, which can fail.
+#[allow(clippy::unnecessary_wraps)]
+fn link_count(_path: &Path, meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.nlink())
+}
+
+/// Windows arm of [`link_count`]; see its docs.
+#[cfg(windows)]
+fn link_count(path: &Path, _meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().access_mode(0).open(path).ok()?;
+    winapi_util::file::information(&file)
+        .ok()
+        .map(|info| info.number_of_links())
+}
+
+/// Counterpart of [`link_count`] for platforms with no link count.
+#[cfg(not(any(unix, windows)))]
+fn link_count(_path: &Path, _meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
 /// Whether `a` and `b` name one physical file, following symlinks: a symlink
 /// to a file and the file, or two hard links. `false` when either cannot be
 /// read or the platform has no identity. For other modules' tests.
@@ -3302,12 +3335,24 @@ mod tests {
 
     /// The length is part of the identity, so two files that report one
     /// volume and index (a 64-bit index can repeat on `ReFS`) but differ in
-    /// length are still two files.
+    /// length are still two files. One file whose length changes stands in
+    /// for them here: its volume and index stay, and its identity does not.
     #[test]
     fn a_file_id_includes_the_length() {
         let (_tmp, _repo_dir, blob, _snap) = repo_with_blob(100);
-        let id = physical_id(&blob, &std::fs::metadata(&blob).unwrap()).unwrap();
-        assert_eq!(id.2, 100);
+        let id = || physical_id(&blob, &std::fs::metadata(&blob).unwrap()).unwrap();
+        let before = id();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_len(200)
+            .unwrap();
+        let after = id();
+
+        assert_eq!((before.0, before.1), (after.0, after.1), "the same file");
+        assert_eq!((before.2, after.2), (100, 200));
+        assert_ne!(before, after, "but not the same identity");
     }
 
     /// A blob nothing points at and nothing copies is an orphan, whatever its

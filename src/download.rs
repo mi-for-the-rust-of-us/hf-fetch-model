@@ -356,6 +356,18 @@ pub async fn download_all_files_map(
                 // EXPLICIT: no overall budget — per-file timeout governs alone
                 None => download_fut.await,
             };
+            // Outside the deadline above: see `finish_fetch`.
+            let result = match result {
+                Ok(fetched) => Ok(finish_fetch(
+                    fetched,
+                    &file,
+                    &task_meta,
+                    &task_cache_dir,
+                    task_repo_id.as_str(),
+                )
+                .await),
+                Err(e) => Err(e),
+            };
             drop(permit);
             (file, result)
         });
@@ -607,7 +619,9 @@ pub(crate) async fn download_file_by_name(
     // so `--timeout-total-secs 3` was silently ignored on a long single file.
     let result = bound_by_total_timeout(download_fut, settings.timeout_total, filename).await;
 
-    let path = result?;
+    // Outside the budget above: see `finish_fetch`.
+    // BORROW: explicit .as_str() for String → &str conversion
+    let path = finish_fetch(result?, &file, &metadata_map, &cache_dir, repo_id.as_str()).await;
 
     // Report progress for the completed file.
     if let Some(ref cb) = on_progress {
@@ -633,11 +647,11 @@ pub(crate) async fn download_file_by_name(
 ///
 /// Returns [`FetchError::Timeout`] if the budget elapses before the download
 /// completes, or whatever error the download itself produced.
-async fn bound_by_total_timeout(
-    download_fut: impl std::future::Future<Output = Result<PathBuf, FetchError>>,
+async fn bound_by_total_timeout<T>(
+    download_fut: impl std::future::Future<Output = Result<T, FetchError>>,
     timeout_total: Option<Duration>,
     filename: &str,
-) -> Result<PathBuf, FetchError> {
+) -> Result<T, FetchError> {
     match timeout_total {
         Some(limit) => tokio::time::timeout(limit, download_fut)
             .await
@@ -714,6 +728,9 @@ fn build_shared_state(
 /// 2. Chooses chunked (multi-connection) or single-connection download
 /// 3. Falls back to direct HTTP GET on HTTP 416 Range Not Satisfiable
 /// 4. Logs the result with timing and throughput
+///
+/// The callers then pass the result to [`finish_fetch`], outside their
+/// timeouts.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_download(
     repo: &ModelRepo,
@@ -729,12 +746,15 @@ async fn dispatch_download(
     settings: &DownloadSettings,
     on_progress: Option<ProgressCallback>,
     files_remaining: usize,
-) -> Result<PathBuf, FetchError> {
+) -> Result<Fetched, FetchError> {
     // Check local cache first — skip the network entirely if the file exists.
     if let Some(cached) =
         resolve_cached_file(cache_dir, repo_folder, revision, file.filename.as_str())
     {
-        return Ok(cached);
+        return Ok(Fetched {
+            path: cached,
+            fresh: false,
+        });
     }
 
     let file_size = metadata_map
@@ -827,22 +847,47 @@ async fn dispatch_download(
         result
     };
 
-    // Prevention (v0.12.6, issue #21): `hf-hub` never tries a symlink on
-    // Windows, so the pointer it just wrote is a full copy of its blob. Where
-    // the listing names the file's SHA-256, link it to `blobs/<sha256>`.
-    // Best-effort: the download has succeeded either way. A pointer the
-    // chunked path already linked is recognised by identity, without a read.
+    log_download_result(file.filename.as_str(), &result, file_size, start.elapsed());
+    result.map(|path| Fetched { path, fresh: true })
+}
+
+/// What [`dispatch_download`] produced.
+struct Fetched {
+    /// The file's path in the snapshot.
+    path: PathBuf,
+    /// Whether this call fetched it from the network, rather than finding it
+    /// already in the cache.
+    fresh: bool,
+}
+
+/// Completes a file [`dispatch_download`] produced, and returns its path.
+///
+/// Prevention (v0.12.6, issue #21): `hf-hub` never tries a symlink on
+/// Windows, so the pointer it has just written is a full copy of its blob.
+/// For a file fetched by this call whose SHA-256 the listing names, the
+/// pointer is linked to `blobs/<sha256>` when the two are byte-equal. The
+/// callers run this after their timeouts and after the download is logged,
+/// so the comparison neither turns a finished download into a timeout nor
+/// counts toward its throughput. A file found in the cache is left alone:
+/// relinking old copies on every run would re-read them, which is
+/// `cache dedupe`'s job. A pointer the chunked path already linked is
+/// recognised by identity, without a read.
+async fn finish_fetch(
+    fetched: Fetched,
+    file: &RepoFile,
+    metadata_map: &HashMap<String, RepoFile>,
+    cache_dir: &std::path::Path,
+    repo_id: &str,
+) -> PathBuf {
     // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
-    if let Ok(pointer) = &result
+    if fetched.fresh
         && let Some(sha256) = metadata_map
             .get(file.filename.as_str())
             .and_then(|m| m.sha256.as_deref())
     {
-        link_pointer_to_blob(cache_dir, repo_id, sha256, pointer).await;
+        link_pointer_to_blob(cache_dir, repo_id, sha256, &fetched.path).await;
     }
-
-    log_download_result(file.filename.as_str(), &result, file_size, start.elapsed());
-    result
+    fetched.path
 }
 
 /// Replaces a freshly downloaded pointer that is a copy of its blob with a
@@ -1464,6 +1509,45 @@ mod tests {
             link_pointer_to_blob_blocking(tmp.path(), "org/model", "../blobs/x", &other).unwrap(),
             None
         );
+    }
+
+    /// The step both download paths run after their timeouts: a file this
+    /// call fetched is linked to its blob, and one found in the cache is left
+    /// as it is, however it is stored.
+    #[tokio::test]
+    async fn finish_fetch_links_a_fresh_pointer_and_leaves_a_cached_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = crate::cache_layout::repo_dir(tmp.path(), "org/model");
+        let sha = "9a3f7c1e0b2d4f6a8c0e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a";
+        let blob = crate::cache_layout::blob_path(&repo_dir, sha);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, vec![b'x'; 1024]).unwrap();
+        let file = RepoFile {
+            filename: "model.bin".to_owned(),
+            size: Some(1024),
+            sha256: Some(sha.to_owned()),
+        };
+        let metadata_map: HashMap<String, RepoFile> =
+            std::iter::once(("model.bin".to_owned(), file.clone())).collect();
+
+        for (commit, fresh) in [("c0ffee", true), ("c0ffe2", false)] {
+            let pointer = crate::cache_layout::pointer_path(&repo_dir, commit, "model.bin");
+            std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+            std::fs::copy(&blob, &pointer).unwrap();
+            let fetched = Fetched {
+                path: pointer.clone(),
+                fresh,
+            };
+
+            let path = finish_fetch(fetched, &file, &metadata_map, tmp.path(), "org/model").await;
+
+            assert_eq!(path, pointer);
+            assert_eq!(
+                crate::cache::same_physical_file(&pointer, &blob),
+                fresh,
+                "fresh: {fresh}"
+            );
+        }
     }
 
     /// Builds a fake hf-hub-style cache layout under `root`:

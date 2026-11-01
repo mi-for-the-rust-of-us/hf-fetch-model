@@ -751,7 +751,8 @@ async fn finalize_chunked_download(
             source: e,
         })?;
 
-    // Create pointer symlink (or copy on Windows).
+    // Create the pointer: a symlink, or on Windows without symlink rights a
+    // hard link, or a copy where neither can be made.
     symlink_or_copy(blob_path, pointer_path).map_err(|e| FetchError::Io {
         path: pointer_path.to_path_buf(),
         source: e,
@@ -1143,9 +1144,13 @@ fn make_relative(src: &Path, dst: &Path) -> PathBuf {
 /// On Windows a symlink needs `SeCreateSymbolicLinkPrivilege` (Developer Mode
 /// or an elevated shell). Without it, a hard link to the blob (new in
 /// v0.12.6, issue #21) gives the same single physical file and needs no
-/// privilege; a copy is the last resort, on a volume that cannot hard-link
-/// (FAT32, exFAT). `dst` does not exist here, so `std::fs::hard_link` creates
-/// it directly; replacing an existing pointer is `cache::link_over`'s job.
+/// privilege. A copy is the last resort, whenever the hard link fails for any
+/// reason other than `dst` having appeared meanwhile: in practice a volume
+/// that cannot hard-link (FAT32, exFAT). `dst` does not exist here, so
+/// `std::fs::hard_link` creates it directly; replacing a pointer that already
+/// exists is the job of `link_over` in the `cache::dedupe` module, which the
+/// download path reaches after the download, through
+/// `cache::link_copy_to_blob`.
 /// Either way the blob stays in `blobs/<etag>` for cross-revision
 /// deduplication.
 ///

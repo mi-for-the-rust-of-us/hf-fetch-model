@@ -6239,7 +6239,13 @@ fn cache_dedupe_refuses_a_dataset_and_an_uncached_repo_before_anything_changes()
     stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 3072);
     stage_blob_and_copy(dir.path(), "datasets--test-org--d", "e2", "d.bin", 2048);
 
-    for bad in ["datasets/test-org/d", "test-org/absent"] {
+    for (bad, why) in [
+        (
+            "datasets/test-org/d",
+            "is a dataset (this command takes models only)",
+        ),
+        ("test-org/absent", "test-org/absent is not cached"),
+    ] {
         let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
             "cache",
             "dedupe",
@@ -6249,14 +6255,88 @@ fn cache_dedupe_refuses_a_dataset_and_an_uncached_repo_before_anything_changes()
         ]));
         assert!(!success, "{bad} must be refused, got:\n{stdout}");
         assert!(
-            stderr.contains("models only") || stderr.contains("is not cached"),
-            "and say why, got:\n{stderr}"
+            stderr.contains(why),
+            "{bad}: expected {why:?}, got:\n{stderr}"
         );
     }
     assert_eq!(
         du_json_size_and_dup(dir.path(), "test-org/twice"),
         (6144, 3072),
         "a bad argument aborts before the good one is touched"
+    );
+}
+
+/// A temporary link an interrupted run left beside a pointer is the only
+/// thing to do: the preview names it, the run removes it and says that it
+/// freed nothing, and the blob stays.
+#[test]
+fn cache_dedupe_removes_a_temporary_link_an_interrupted_run_left() {
+    let dir = temp_hf_home();
+    let repo = dir.path().join("hub").join("models--test-org--crashed");
+    let blob = repo.join("blobs").join("e1");
+    let snapshot = repo
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::write(&blob, vec![7_u8; 2048]).unwrap();
+    std::fs::hard_link(&blob, snapshot.join("m.bin")).unwrap();
+    let leftover = snapshot.join("m.bin.hf-fm-link.4242.tmp");
+    std::fs::hard_link(&blob, &leftover).unwrap();
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "--yes"]));
+    assert!(success, "dedupe should succeed: {stderr}");
+    assert!(
+        stdout.contains("(0 files, and 1 temporary link an interrupted run left, to remove)")
+            && stdout.contains(
+                "Removed 1 temporary link an interrupted run left (each a second name of its \
+                 blob, so no bytes were freed)."
+            ),
+        "the leftover is named and removed, got:\n{stdout}"
+    );
+    assert!(!leftover.exists(), "the leftover is gone");
+    assert!(blob.is_file() && snapshot.join("m.bin").is_file());
+}
+
+/// A repo whose download lock another process holds, with no partial file:
+/// skipped with the advice to wait, not to clean partials, and the summary
+/// does not claim the cache holds no copies.
+#[test]
+fn cache_dedupe_waits_for_a_download_whose_lock_is_held() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--busy", "e1", "m.bin", 3072);
+    let lock_path = dir
+        .path()
+        .join("hub")
+        .join(".locks")
+        .join("models--test-org--busy")
+        .join("e9.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock = std::fs::File::create(&lock_path).unwrap();
+    lock.lock().unwrap();
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "--yes"]));
+    lock.unlock().unwrap();
+    assert!(success, "dedupe should succeed: {stderr}");
+    assert!(
+        stdout.contains(
+            "skipped test-org/busy: another process is downloading into the repo; \
+             run this again when it is done"
+        ) && !stdout.contains("clean-partial"),
+        "the advice fits a running download, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Nothing else to reclaim.")
+            && !stdout.contains("no snapshot file is a separate copy"),
+        "and the summary does not contradict the skip, got:\n{stdout}"
+    );
+    assert_eq!(
+        du_json_size_and_dup(dir.path(), "test-org/busy"),
+        (6144, 3072)
     );
 }
 
@@ -6284,7 +6364,10 @@ fn cache_dedupe_leaves_a_repo_with_a_partial_download_alone() {
         ) && stdout.contains("hf-fm cache clean-partial test-org/busy"),
         "the repo is skipped with the way out, got:\n{stdout}"
     );
-    assert!(stdout.contains("Nothing to reclaim"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("Nothing else to reclaim."),
+        "the summary does not contradict the skip, got:\n{stdout}"
+    );
 }
 
 #[test]

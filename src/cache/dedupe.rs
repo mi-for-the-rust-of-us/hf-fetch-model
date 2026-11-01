@@ -5,8 +5,11 @@
 //! each snapshot file that is a full copy of its blob is replaced by a hard
 //! link to that blob, so its bytes exist once.
 //!
-//! On Windows `hf-hub` never tries a symlink, so every file it writes is held
-//! twice, as `blobs/<etag>` and as a copy at `snapshots/<commit>/<name>`.
+//! On Windows `hf-hub` never tries a symlink, so a file it writes lands
+//! twice, as `blobs/<etag>` and as a copy at `snapshots/<commit>/<name>`:
+//! every such file in a cache filled before v0.12.6, and since then the files
+//! the download path cannot link afterwards (those the listing gives no
+//! SHA-256 for).
 //! [`plan_dedupe`] pairs each copy with the blobs of its length and reads no
 //! file, so its figure is an upper bound. [`apply_dedupe`] compares the bytes
 //! and links the pairs that are equal, reporting what it reclaimed and what
@@ -29,6 +32,7 @@ use crate::error::FetchError;
 /// What [`plan_dedupe`] found in one cached model repo, for [`apply_dedupe`]
 /// to act on.
 #[derive(Debug, Clone)]
+#[must_use]
 #[non_exhaustive]
 pub struct DedupePlan {
     /// The repository identifier (e.g., `"org/model"`).
@@ -43,8 +47,13 @@ pub struct DedupePlan {
     /// Whether a download into the repo is in progress or was interrupted: a
     /// partial download's temp file in `blobs/`, or a download lock that
     /// another process holds. `candidates` is then empty, and
-    /// [`apply_dedupe`] checks again before touching anything.
+    /// [`apply_dedupe`] checks again before each file.
     pub download_in_progress: bool,
+    /// Temporary links an interrupted run left in `snapshots/` (named
+    /// `<name>.hf-fm-link.<pid>.tmp`, each a hard link to one of the repo's
+    /// blobs, so they hold no bytes of their own). [`apply_dedupe`] removes
+    /// them; a file of that name that is not a link to a blob is never listed.
+    pub leftovers: Vec<PathBuf>,
 }
 
 impl DedupePlan {
@@ -54,6 +63,8 @@ impl DedupePlan {
     /// It counts each copy, so a blob that two cached revisions both copy
     /// counts twice, and both copies are reclaimed; `du`'s `DUP` figure
     /// counts that blob once. The two are equal where each blob has one copy.
+    /// A copy that is itself hard-linked under several names counts once per
+    /// name here, but its bytes are reclaimed once, when its last name goes.
     #[must_use]
     pub fn reclaimable_bytes(&self) -> u64 {
         self.candidates
@@ -106,7 +117,8 @@ pub enum DedupeSkipReason {
     /// `SHA256` the blob is named by: both are corrupt (`--verify` only).
     /// Linking would lose nothing, but they are reported, not linked.
     HashMismatch,
-    /// Another process has the file open or mapped.
+    /// Another process has the file open or mapped, or (on Windows, where
+    /// both answer "access denied" to the replacement) the file is read-only.
     InUse,
     /// The volume cannot hard-link (FAT32, exFAT), or the file and its blob
     /// are on different volumes.
@@ -129,7 +141,7 @@ impl std::fmt::Display for DedupeSkipReason {
             Self::HashMismatch => f.write_str(
                 "it equals its blob, but neither hashes to the SHA-256 the blob is named by",
             ),
-            Self::InUse => f.write_str("in use by another process"),
+            Self::InUse => f.write_str("in use by another process, or read-only"),
             Self::NoHardLinks => f.write_str("the volume cannot hard-link it to its blob"),
             Self::Other(message) => f.write_str(message),
         }
@@ -138,12 +150,17 @@ impl std::fmt::Display for DedupeSkipReason {
 
 /// What [`apply_dedupe`] did to one repo.
 #[derive(Debug, Clone, Default)]
+#[must_use]
 #[non_exhaustive]
 pub struct DedupeReport {
     /// Snapshot files replaced by a hard link to their blob.
     pub linked: usize,
-    /// Bytes those files held as copies: what the volume's free space grows
-    /// by, to within one cluster per file.
+    /// Bytes those files held as copies, counting a copy that was itself
+    /// hard-linked under several names once: what the volume's free space
+    /// grows by, to within one cluster per file. A copy another process still
+    /// has open or mapped while it is replaced (one opened with
+    /// delete-sharing, as Rust's `std` opens files) frees its bytes only when
+    /// that process closes it.
     pub reclaimed_bytes: u64,
     /// Candidates that were already one file with their blob when applied
     /// (the plan was stale): nothing to do.
@@ -157,6 +174,9 @@ pub struct DedupeReport {
     /// Candidates left alone, each with its reason. The plan's own
     /// [`DedupePlan::skipped`] entries are not repeated here.
     pub skipped: Vec<DedupeSkip>,
+    /// Temporary links left by an interrupted run that were removed (see
+    /// [`DedupePlan::leftovers`]).
+    pub leftovers_removed: usize,
 }
 
 /// Plans the deduplication of one cached model repo (new in v0.12.6).
@@ -200,32 +220,42 @@ pub fn plan_dedupe(repo_id: &str) -> Result<DedupePlan, FetchError> {
 /// leaves the pointer missing: a link is made under a temporary name and
 /// renamed over it.
 ///
-/// Nothing is touched when a download into the repo is in progress, checked
-/// again here because the plan may be old. A file that cannot be replaced is
-/// skipped with its reason, and the others go on.
-#[must_use]
+/// Nothing is touched while a download into the repo is in progress, checked
+/// again before each file because the plan may be old and a download may
+/// start during the run; the files left are skipped with that reason. A file
+/// that cannot be replaced is skipped with its reason, and the others go on.
+/// Temporary links an interrupted run left behind
+/// ([`DedupePlan::leftovers`]) are removed first, each checked again to be a
+/// link to one of the repo's blobs.
 pub fn apply_dedupe(plan: &DedupePlan, verify: bool) -> DedupeReport {
     let mut report = DedupeReport::default();
-    if download_in_progress(&plan.repo_dir) {
-        report.skipped = plan
-            .candidates
-            .iter()
-            .map(|c| DedupeSkip {
-                // BORROW: explicit .clone() for owned PathBuf
-                path: c.copy.clone(),
-                len: c.len,
-                reason: DedupeSkipReason::DownloadInProgress,
-            })
-            .collect();
-        return report;
+    if !plan.leftovers.is_empty() && !download_in_progress(&plan.repo_dir) {
+        let blob_ids = read_blobs(&crate::cache_layout::blobs_dir(&plan.repo_dir)).ids();
+        for leftover in &plan.leftovers {
+            let still_a_link = std::fs::symlink_metadata(leftover)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .and_then(|meta| physical_id(leftover, &meta))
+                .is_some_and(|id| blob_ids.contains(&id));
+            if still_a_link && std::fs::remove_file(leftover).is_ok() {
+                report.leftovers_removed += 1;
+            }
+        }
     }
     let mut buffers = CompareBuffers::new();
     // EXPLICIT: tallies each candidate's outcome into the report as it goes
     for candidate in &plan.candidates {
-        match dedupe_one(candidate, verify, &mut buffers, &mut report.bytes_read) {
-            Outcome::Linked { unverified } => {
+        let outcome = if download_in_progress(&plan.repo_dir) {
+            Outcome::Skipped(DedupeSkipReason::DownloadInProgress)
+        } else {
+            dedupe_one(candidate, verify, &mut buffers, &mut report.bytes_read)
+        };
+        match outcome {
+            Outcome::Linked { unverified, freed } => {
                 report.linked += 1;
-                report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(candidate.len);
+                if freed {
+                    report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(candidate.len);
+                }
                 if unverified {
                     report.unverified += 1;
                 }
@@ -252,12 +282,14 @@ fn plan_in(repo_dir: &Path, repo_id: &str) -> DedupePlan {
         candidates: Vec::new(),
         skipped: Vec::new(),
         download_in_progress: download_in_progress(repo_dir),
+        leftovers: Vec::new(),
     };
     if plan.download_in_progress {
         return plan;
     }
 
     let blobs = read_blobs(&crate::cache_layout::blobs_dir(repo_dir));
+    let blob_ids = blobs.ids();
     let mut files: Vec<PathBuf> = Vec::new();
     collect_files(&crate::cache_layout::snapshots_dir(repo_dir), &mut files);
     files.sort();
@@ -271,9 +303,17 @@ fn plan_in(repo_dir: &Path, repo_id: &str) -> DedupePlan {
         if !meta.is_file() || meta.len() == 0 {
             continue;
         }
+        let id = physical_id(&path, &meta);
+        // A temporary link an interrupted run left behind: one more name of a
+        // blob, listed so that it is removed rather than linked again.
+        if path.file_name().is_some_and(is_temp_link_name)
+            && id.is_some_and(|id| blob_ids.contains(&id))
+        {
+            plan.leftovers.push(path);
+            continue;
+        }
         let len = meta.len();
         if let Some(same_len) = blobs.by_len.get(&len) {
-            let id = physical_id(&path, &meta);
             // Already one file with a blob: a hard link made earlier.
             if id.is_some() && same_len.iter().any(|b| b.id == id) {
                 continue;
@@ -311,6 +351,17 @@ struct BlobsByLen {
     by_len: HashMap<u64, Vec<BlobEntry>>,
     /// Lengths of the files that blob symlinks resolve to.
     linked_lens: HashSet<u64>,
+}
+
+impl BlobsByLen {
+    /// The identities of the regular blobs, where they can be read.
+    fn ids(&self) -> HashSet<FileId> {
+        self.by_len
+            .values()
+            .flatten()
+            .filter_map(|b| b.id)
+            .collect()
+    }
 }
 
 /// Reads the blobs directly under `blobs_dir`: regular files by length, and
@@ -376,9 +427,16 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
 /// `.chunked.part`, which takes no lock, or an `.incomplete`), or one of its
 /// download locks held by another process.
 ///
-/// `hf-hub` holds the lock across the moment it removes a pointer and copies
-/// the blob over it, which leaves no temp file behind, so the lock is what
-/// covers it.
+/// The lock covers less than it might seem. `hf-hub` 1.0 holds it across the
+/// moment it removes a pointer and copies the blob over it only for a fresh
+/// download outside the Xet path; on the Xet path, when the blob is already
+/// there, and in its snapshot cache mode, it rewrites the pointer with no
+/// lock held. What makes such a race harmless is not this check but the
+/// filesystem: on Windows, copying a blob onto a hard link of itself fails
+/// and leaves the blob intact (a test keeps that true), so the racing
+/// `hf-hub` call errors and no bytes are lost; on Unix `hf-hub` symlinks
+/// instead of copying. This check keeps the run out of the way of the
+/// downloads it can see.
 fn download_in_progress(repo_dir: &Path) -> bool {
     if super::scan_partials(&crate::cache_layout::blobs_dir(repo_dir)).0 {
         return true;
@@ -400,11 +458,13 @@ fn download_in_progress(repo_dir: &Path) -> bool {
 /// What happened to one candidate.
 // EXHAUSTIVE: internal outcome; this module owns and matches all variants
 enum Outcome {
-    /// Replaced by a hard link; `unverified` when `--verify` could not hash
-    /// its blob's name.
+    /// Replaced by a hard link.
     Linked {
         /// Whether the blob's name is not a `SHA256` under `--verify`.
         unverified: bool,
+        /// Whether the copy's bytes were freed: `false` when another name
+        /// still held them (the copy was itself hard-linked elsewhere).
+        freed: bool,
     },
     /// Already one file with its blob.
     AlreadyLinked,
@@ -468,8 +528,12 @@ fn dedupe_one(
                         unverified = true;
                     }
                 }
+                // The copy's bytes are freed only when this is its last name:
+                // a copy hard-linked elsewhere keeps them under the other one.
+                let freed =
+                    super::link_count(&candidate.copy, &copy_meta).is_none_or(|links| links <= 1);
                 return match link_over(&candidate.copy, blob) {
-                    Ok(LinkOutcome::Linked) => Outcome::Linked { unverified },
+                    Ok(LinkOutcome::Linked) => Outcome::Linked { unverified, freed },
                     Ok(LinkOutcome::AlreadyLinked) => Outcome::AlreadyLinked,
                     Err(e) => Outcome::Skipped(skip_reason(&e)),
                 };
@@ -478,6 +542,9 @@ fn dedupe_one(
             Err(e) => last_error = Some(e),
         }
     }
+    // A blob that could not be read may be the one the copy equals, so its
+    // error (in use, most often) is the reason given, not `Differs`, which
+    // would claim that no blob holds the same bytes: a later run may succeed.
     Outcome::Skipped(last_error.map_or(DedupeSkipReason::Differs, |e| skip_reason(&e)))
 }
 
@@ -574,18 +641,24 @@ pub(crate) enum LinkOutcome {
 /// their identities again immediately before linking, so a stale plan, or a
 /// pointer already linked to the blob, is [`LinkOutcome::AlreadyLinked`] and
 /// nothing more. The link is created beside the pointer under a temporary
-/// name and renamed over it, so the pointer is never missing. A rename onto
-/// another name of the same file is a no-op on Unix that leaves the temporary
-/// name, so that name is removed whenever it still exists afterwards, as it
-/// is when the rename fails.
+/// name that carries this process's ID (`<name>.hf-fm-link.<pid>.tmp`, so two
+/// processes linking one pointer never share it) and renamed over the
+/// pointer, so the pointer is never missing. A rename onto another name of
+/// the same file succeeds on Unix without doing anything and leaves the
+/// temporary name: the pointer was already linked, by a race since the check
+/// above, and it is reported as such. The temporary name is removed whenever
+/// it still exists afterwards, as it does when the rename fails.
 ///
 /// # Errors
 ///
 /// Returns the `std::io::Error` of the first step that fails: reading either
 /// file's metadata, creating the link (a volume without hard links, the
 /// temporary name already taken by a file that is not this blob), or the
-/// rename (a pointer another process holds open).
-pub(crate) fn link_over(pointer: &Path, blob: &Path) -> std::io::Result<LinkOutcome> {
+/// rename. On Windows a rename refused with "access denied" (a pointer
+/// another process opened without delete-sharing, as most programs outside
+/// Rust open files, or a read-only one) is returned as
+/// [`std::io::ErrorKind::ResourceBusy`], the kind it means here.
+fn link_over(pointer: &Path, blob: &Path) -> std::io::Result<LinkOutcome> {
     let blob_meta = std::fs::metadata(blob)?;
     let blob_id = physical_id(blob, &blob_meta);
     let pointer_meta = std::fs::metadata(pointer)?;
@@ -599,12 +672,16 @@ pub(crate) fn link_over(pointer: &Path, blob: &Path) -> std::io::Result<LinkOutc
             format!("pointer {} has no file name", pointer.display()),
         ));
     };
+    // BORROW: explicit .to_os_string() for &OsStr → owned OsString to append to
     let mut temp_name = name.to_os_string();
-    temp_name.push(TEMP_LINK_SUFFIX);
+    temp_name.push(format!(
+        "{TEMP_LINK_MARKER}{}{TEMP_LINK_END}",
+        std::process::id()
+    ));
     let temp = pointer.with_file_name(temp_name);
-    // A leftover of an interrupted run is a link to this very blob, and is
-    // replaced; anything else at that name is not ours, and `hard_link` then
-    // fails with `AlreadyExists`.
+    // A leftover of an interrupted run of this process ID is a link to this
+    // very blob, and is replaced; anything else at that name is not ours, and
+    // `hard_link` then fails with `AlreadyExists`.
     if blob_id.is_some()
         && let Ok(meta) = std::fs::metadata(&temp)
         && physical_id(&temp, &meta) == blob_id
@@ -613,11 +690,49 @@ pub(crate) fn link_over(pointer: &Path, blob: &Path) -> std::io::Result<LinkOutc
     }
 
     std::fs::hard_link(blob, &temp)?;
-    let renamed = std::fs::rename(&temp, pointer);
-    if std::fs::symlink_metadata(&temp).is_ok() {
+    let renamed = std::fs::rename(&temp, pointer).map_err(rename_error);
+    let temp_left = std::fs::symlink_metadata(&temp).is_ok();
+    if temp_left {
         let _ = std::fs::remove_file(&temp);
     }
-    renamed.map(|()| LinkOutcome::Linked)
+    renamed?;
+    if temp_left {
+        Ok(LinkOutcome::AlreadyLinked)
+    } else {
+        Ok(LinkOutcome::Linked)
+    }
+}
+
+/// The error a refused rename of a temporary link over a pointer stands for.
+///
+/// On Windows, `std::fs::rename` answers "access denied" (`ERROR_ACCESS_DENIED`)
+/// when the pointer is open in another process without delete-sharing, which
+/// is how Python and most non-Rust programs open files, when it is mapped
+/// through such a handle, or when it is read-only. `std` maps that code to
+/// `PermissionDenied`; here it means the file is in use, so it becomes
+/// `ResourceBusy`, keeping the system's message. Other errors pass through.
+fn rename_error(e: std::io::Error) -> std::io::Error {
+    #[cfg(windows)]
+    {
+        if e.raw_os_error() == Some(win_error::ACCESS_DENIED) {
+            return std::io::Error::new(std::io::ErrorKind::ResourceBusy, e);
+        }
+    }
+    e
+}
+
+/// Whether `name` is a temporary link name [`link_over`] creates:
+/// `<name>.hf-fm-link.<pid>.tmp`.
+fn is_temp_link_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.rsplit_once(TEMP_LINK_MARKER)
+            .is_some_and(|(stem, rest)| {
+                !stem.is_empty()
+                    && rest.strip_suffix(TEMP_LINK_END).is_some_and(|pid| {
+                        !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+                    })
+            })
+    })
 }
 
 /// Links the pointer `hf-hub` just wrote as a copy to its blob, when the two
@@ -661,15 +776,22 @@ pub(crate) fn link_copy_to_blob(
     link_over(pointer, blob).map(Some)
 }
 
-/// Suffix of the temporary name [`link_over`] creates a link under, beside
-/// the pointer it replaces.
-const TEMP_LINK_SUFFIX: &str = ".hf-fm-link.tmp";
+/// What follows a pointer's name in the temporary name [`link_over`] creates
+/// beside it, before the process ID.
+const TEMP_LINK_MARKER: &str = ".hf-fm-link.";
 
-/// Windows system error codes `std` maps to no specific `ErrorKind`.
+/// What ends the temporary name [`link_over`] creates, after the process ID.
+const TEMP_LINK_END: &str = ".tmp";
+
+/// Windows system error codes `std` maps to no specific `ErrorKind`, or (for
+/// `ACCESS_DENIED`) to one that means something else here.
 #[cfg(windows)]
 mod win_error {
     /// `ERROR_INVALID_FUNCTION`: what FAT32 and exFAT answer to a hard link.
     pub(super) const INVALID_FUNCTION: i32 = 1;
+    /// `ERROR_ACCESS_DENIED`: what a rename over a file in use or read-only
+    /// answers (see `rename_error`).
+    pub(super) const ACCESS_DENIED: i32 = 5;
     /// `ERROR_SHARING_VIOLATION`: another process opened the file without
     /// sharing it.
     pub(super) const SHARING_VIOLATION: i32 = 32;
@@ -764,7 +886,7 @@ mod tests {
         collect_files(dir, &mut files);
         files
             .into_iter()
-            .filter(|p| p.to_string_lossy().ends_with(TEMP_LINK_SUFFIX))
+            .filter(|p| p.file_name().is_some_and(is_temp_link_name))
             .collect()
     }
 
@@ -923,7 +1045,10 @@ mod tests {
     fn link_over_replaces_only_its_own_leftover() {
         let (_tmp, _repo_dir, blob, snap) = repo("deadbeef", &[b'x'; 100]);
         let copy = snap.join("model.bin");
-        let temp = snap.join(format!("model.bin{TEMP_LINK_SUFFIX}"));
+        let temp = snap.join(format!(
+            "model.bin{TEMP_LINK_MARKER}{}{TEMP_LINK_END}",
+            std::process::id()
+        ));
         std::fs::copy(&blob, &copy).unwrap();
         std::fs::hard_link(&blob, &temp).unwrap();
         assert_eq!(link_over(&copy, &blob).unwrap(), LinkOutcome::Linked);
@@ -931,7 +1056,10 @@ mod tests {
         assert_eq!(id(&copy), id(&blob));
 
         let copy2 = snap.join("other.bin");
-        let temp2 = snap.join(format!("other.bin{TEMP_LINK_SUFFIX}"));
+        let temp2 = snap.join(format!(
+            "other.bin{TEMP_LINK_MARKER}{}{TEMP_LINK_END}",
+            std::process::id()
+        ));
         std::fs::copy(&blob, &copy2).unwrap();
         std::fs::write(&temp2, b"not ours").unwrap();
         let err = link_over(&copy2, &blob).unwrap_err();
@@ -1155,6 +1283,118 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    /// The usual "in use" on Windows: a copy another process opened without
+    /// delete-sharing, as Python and most programs outside Rust open files.
+    /// The comparison reads it fine; the rename over it is refused with
+    /// "access denied", which is reported as in use, not as an opaque error.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_open_without_delete_sharing_is_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ_WRITE: u32 = 1 | 2;
+        let (_tmp, repo_dir, blob, snap) = repo("deadbeef", &[b'x'; 1000]);
+        let copy = snap.join("model.bin");
+        std::fs::copy(&blob, &copy).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&copy)
+            .unwrap();
+
+        let report = apply_dedupe(&plan_in(&repo_dir, "org/model"), false);
+
+        assert_eq!(report.linked, 0);
+        assert_eq!(report.skipped[0].reason, DedupeSkipReason::InUse);
+        assert_eq!(report.bytes_read, 2000, "the comparison itself succeeded");
+        let leftovers = temp_names(&snap);
+        assert!(leftovers.is_empty(), "temporary names left: {leftovers:?}");
+        drop(held);
+        assert_eq!(
+            apply_dedupe(&plan_in(&repo_dir, "org/model"), false).linked,
+            1
+        );
+    }
+
+    /// When a blob cannot be read and the others differ, the reason given is
+    /// the error: the unread blob may be the one the copy equals, so a later
+    /// run can succeed, and "no blob holds the same bytes" would be untrue.
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_blob_is_reported_rather_than_differs() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_tmp, repo_dir, blob, snap) = repo("aaaa", &[b'x'; 500]);
+        std::fs::write(blob.with_file_name("bbbb"), [b'y'; 500]).unwrap();
+        std::fs::copy(&blob, snap.join("model.bin")).unwrap();
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&blob)
+            .unwrap();
+
+        let report = apply_dedupe(&plan_in(&repo_dir, "org/model"), false);
+
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].reason, DedupeSkipReason::InUse);
+    }
+
+    /// A temporary link an interrupted run left in `snapshots/` is listed by
+    /// the plan, not linked again, and removed by the run; a file of a
+    /// similar name that is not a link to a blob is left alone.
+    #[test]
+    fn a_leftover_temporary_link_is_removed() {
+        let (_tmp, repo_dir, blob, snap) = repo("deadbeef", &[b'x'; 1000]);
+        let leftover = snap.join("model.bin.hf-fm-link.4242.tmp");
+        std::fs::hard_link(&blob, &leftover).unwrap();
+        let lookalike = snap.join("notes.hf-fm-link.4242.tmp");
+        std::fs::write(&lookalike, b"someone's own file").unwrap();
+
+        let plan = plan_in(&repo_dir, "org/model");
+        assert_eq!(plan.leftovers, vec![leftover.clone()]);
+        assert!(plan.candidates.is_empty(), "{:?}", plan.candidates);
+
+        let report = apply_dedupe(&plan, false);
+        assert_eq!(report.leftovers_removed, 1);
+        assert!(!leftover.exists());
+        assert!(blob.is_file(), "the blob stays");
+        assert_eq!(std::fs::read(&lookalike).unwrap(), b"someone's own file");
+    }
+
+    #[test]
+    fn temp_link_names_are_recognised_exactly() {
+        use std::ffi::OsStr;
+        for name in ["model.bin.hf-fm-link.4242.tmp", "a.hf-fm-link.1.tmp"] {
+            assert!(is_temp_link_name(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "model.bin",
+            ".hf-fm-link.4242.tmp",
+            "model.bin.hf-fm-link.tmp",
+            "model.bin.hf-fm-link.42x.tmp",
+            "model.bin.hf-fm-link.4242.tmp.bak",
+        ] {
+            assert!(!is_temp_link_name(OsStr::new(name)), "{name}");
+        }
+    }
+
+    /// A copy that is itself hard-linked under two names holds its bytes
+    /// once: both names are linked to the blob, and the bytes are counted as
+    /// reclaimed once, when the last name goes.
+    #[test]
+    fn a_copy_with_two_names_is_reclaimed_once() {
+        let (_tmp, repo_dir, blob, snap) = repo("deadbeef", &[b'x'; 1000]);
+        let first = snap.join("a.bin");
+        std::fs::copy(&blob, &first).unwrap();
+        std::fs::hard_link(&first, snap.join("b.bin")).unwrap();
+
+        let plan = plan_in(&repo_dir, "org/model");
+        assert_eq!(plan.reclaimable_bytes(), 2000, "the plan counts each name");
+        let report = apply_dedupe(&plan, false);
+
+        assert_eq!(report.linked, 2);
+        assert_eq!(report.reclaimed_bytes, 1000, "the bytes existed once");
+        assert_eq!(super::super::walk_repo_files(&repo_dir).total_size, 1000);
     }
 
     #[test]
