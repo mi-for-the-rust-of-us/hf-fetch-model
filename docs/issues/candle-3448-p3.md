@@ -1,16 +1,16 @@
-# candle #3448 — reply 3 (draft)
+# candle #3448 — reply 3 (Posted)
 
 - **Target issue:** https://github.com/huggingface/candle/issues/3448
-- **Status:** Posted (2026-04-16)
-- **Context:** Follow-up to @AlpineVibrations' reported shape mismatch on `model.language_model.layers.15.mlp.gate_proj.weight` (expected `[6144, 1536]`, got `[12288, 1536]`). Posted because [p2](candle-3448-p2.md) had been sitting for 3 days with no reply, and subsequent investigation revealed its diagnosis was oversimplified.
+- **Status:** Posted 2026-04-19 06:57 UTC as [this comment](https://github.com/huggingface/candle/issues/3448#issuecomment-4275381957) (this line said 2026-04-16, and the title "draft", until 2026-11-01). The body below was then replaced with the posted text; the archived draft differed in wording only (dashes, one emoji, "unblocks" softened to "should unblock").
+- **Context:** Follow-up to @AlpineVibrations' reported shape mismatch on `model.language_model.layers.15.mlp.gate_proj.weight` (expected `[6144, 1536]`, got `[12288, 1536]`). Posted because [p2](candle-3448-p2.md) had been sitting for nearly four days with no reply, and subsequent investigation revealed its diagnosis was oversimplified.
 - **Verified against:** [transformers `modeling_gemma4.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) — the layer-15 boundary in the user's error matches the `first_kv_shared_layer_idx = 35 - 20 = 15` calculation exactly.
-- **Outcome:** _TBD — pending reply._
+- **Outcome:** @AlpineVibrations replied on 2026-04-21: "I tried that and it's still the same error as I reported above. I only added what you specified and it didn't seam to fix it." Answered by [p5](candle-3448-p5.md) (posted); the draft [p4](candle-3448-p4.md) was not used.
 
 ---
 
-Following up: it's not hardcoded — but candle's gemma4 implementation is missing **two config fields** entirely.
+**Following up:** it's not hardcoded; but candle's gemma4 implementation is missing **two config fields** entirely.
 
-## Root cause (verified against [transformers' `modeling_gemma4.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py))
+### Root cause (verified against [transformers' `modeling_gemma4.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py))
 
 The reference Python implementation does:
 
@@ -28,18 +28,18 @@ For `gemma-4-E2B-it`:
 - Layers 15..34 (last 20) use **2 × intermediate_size = 12288**
 - Layers 0..14 (first 15) use **intermediate_size = 6144**
 
-The boundary at index 15 explains your error exactly — layer 15 is the first KV-shared (double-wide) layer, which is why you hit the shape mismatch there. 🎯
+The boundary at index 15 exactly explains your error: layer 15 is the first KV-shared (double-wide) layer, which is why you hit the shape mismatch there.
 
-## What candle is missing
+### What candle is missing
 
 candle's [`Gemma4TextConfig`](https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/gemma4/config.rs) is missing two fields:
 
 - `num_kv_shared_layers: usize`
 - `use_double_wide_mlp: bool`
 
-And [`DecoderLayer::new()` in `gemma4/text.rs`](https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/gemma4/text.rs) passes a fixed `cfg.intermediate_size` to every MLP (no per-layer branching), so every layer gets 6144 — the weight file's 12288 for the last 20 layers fails to load.
+And [`DecoderLayer::new()` in `gemma4/text.rs`](https://github.com/huggingface/candle/blob/main/candle-transformers/src/models/gemma4/text.rs) passes a fixed `cfg.intermediate_size` to every MLP (no per-layer branching), so every layer gets 6144, and the weight file's 12288 for the last 20 layers fails to load.
 
-## The fix
+## Proposed fix
 
 ```rust
 // config.rs — in Gemma4TextConfig
@@ -65,4 +65,4 @@ let mlp = MLP::new(
 )?;
 ```
 
-This is a candle model-code bug in `candle-transformers/src/models/gemma4/`, not an example bug — fixing it unblocks every Gemma 4 variant (E2B, E4B, etc.) not just the specific example.
+This is a candle model-code bug in `candle-transformers/src/models/gemma4/`, not an example bug; fixing it should unblock every Gemma 4 variant (E2B, E4B, etc.) not just the specific example...

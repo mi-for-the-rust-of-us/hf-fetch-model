@@ -1,9 +1,9 @@
-# candle #3448 — reply 4 (draft)
+# candle #3448 — reply 4 (Draft, never posted)
 
 - **Target issue:** https://github.com/huggingface/candle/issues/3448
-- **Status:** Draft (not yet posted)
-- **Context:** @AlpineVibrations tried the fix proposed in [p3](candle-3448-p3.md) and reported "still the same error as I reported above. I only added what you specified and it didn't seem to fix it." The exact-same-error signal (layer 15, expected [6144,1536], got [12288,1536]) strongly suggests the double-wide branch never activated. Without his diff we can't tell why — most likely config field wasn't parsed, or wasn't used at the MLP call site.
-- **Purpose:** Lowest-friction next step — ask for his diff + give him one debug print that will diagnose the issue regardless. Doesn't require cloning candle ourselves.
+- **Status:** Never posted. Superseded by [p5](candle-3448-p5.md), posted 2026-04-26, which reproduced the error on a fresh clone of candle rather than asking for the reporter's diff. Kept as the record of the approach not taken.
+- **Context:** @AlpineVibrations tried the fix proposed in [p3](candle-3448-p3.md) and reported "still the same error as I reported above. I only added what you specified and it didn't seem to fix it." The exact-same-error signal (layer 15, expected [6144,1536], got [12288,1536]) strongly suggests the double-wide branch never activated. Without their diff we can't tell why — most likely config field wasn't parsed, or wasn't used at the MLP call site.
+- **Purpose:** Lowest-friction next step — ask for their diff + give them one debug print that will diagnose the issue regardless. Doesn't require cloning candle ourselves.
 
 ---
 

@@ -1,14 +1,14 @@
 # candle #3530 — reply 1 (posted)
 
 - **Target issue:** https://github.com/huggingface/candle/issues/3530
-- **Status:** Posted (May 12, 2026)
+- **Status:** Posted 2026-05-12 14:31 UTC as [this comment](https://github.com/huggingface/candle/issues/3530#issuecomment-4431550797). On 2026-11-01 the body below was replaced with the posted text, which differs from the archived draft only in punctuation (dashes made parentheses or commas).
 - **Context:** First reply on the thread. @sempervictus (RageLtMan, SemperVictus, Boston MA — 203 public repos, 120 followers) reports candle uses 81 GB / 119 GB on NVIDIA Spark loading what they describe as "about the size of an 80B NVPF4 model" and hypothesizes double-mapping (mmap-then-copy → 2× bounds counting). Zero existing comments at draft time. The OP's question is binary: is the actual on-disk model size ~40 GiB (supporting the 2× theory) or ~80 GiB (ruling it out)? `hf-fm inspect --check-gpu --dtypes` reads the safetensors header byte counts — ground truth for that comparison — which is the diagnostic this reply offers. v0.10.1 shipped `--check-gpu` the same day as this draft, making this the first candle-side application of the new flag.
-- **Outcome:** —
+- **Outcome:** @sempervictus replied the same day, without naming the repo: FP4 models are about half their parameter count on disk (so ~40 GiB for 80B), the problem appears only on Spark (SM121), not on RTX Pro (SM120), and KV cache cannot grow into the remaining ~40 GiB "gap", with a crash log. Answered by [p2](candle-3530-p2.md).
 - **Lesson / Leverage angle:** First-responder framing on the freshest open issue; cleanest fit yet for v0.10.1's `--check-gpu`. The dtype histogram + verdict block is the differentiator over Python alternatives (`huggingface_hub` and `safetensors_explorer` don't ship an equivalent fit-against-actual-GPU view). If the OP shares the repo, we can run the command ourselves and post the result inline as a p2.
 
 ---
 
-The double-mapping hypothesis turns on a binary question — the actual on-disk size of the model file — which `hf-fm inspect --check-gpu --dtypes` answers by reading each tensor's safetensors header via HTTP Range (no weight data downloaded):
+The double-mapping hypothesis turns on a binary question (the actual on-disk size of the model file) which `hf-fm inspect --check-gpu --dtypes` answers by reading each tensor's safetensors header via HTTP Range (no weight data downloaded):
 
 - If the model packs **1 fp4 per byte** (one fp4 per `u8` cell, 4 bits of padding — common): 80B params ≈ 80 GiB on disk → your 81 GB `used` is approximately correct, no double-mapping, and the title's "model size unused" framing probably points at runtime accounting (KV / activations budget) rather than a bounds-calc bug.
 - If the model packs **2 fp4 per byte** (true packed format): 80B params ≈ 40 GiB on disk → your 81 GB `used` is ~2× the model, supporting your mmap-then-copy hypothesis.
@@ -36,7 +36,7 @@ $ hf-fm inspect openai/gpt-oss-20b --check-gpu --dtypes
   weight size for KV cache and activations.
 ```
 
-The `U8` row is the MXFP4 weights — safetensors has no native fp4 dtype, so the format stores them as raw bytes (one fp4 per byte, in this case) with separate scaling factors elsewhere. The `Size` column is the actual disk-byte count: that's the number to compare against your `used: 81` snapshot.
+The `U8` row is the MXFP4 weights; safetensors has no native fp4 dtype, so the format stores them as raw bytes (one fp4 per byte, in this case) with separate scaling factors elsewhere. The `Size` column is the actual disk-byte count: that's the number to compare against your `used: 81` snapshot.
 
 Could you share the specific repo you're loading on Spark? Running the command above against it lands the ground-truth weight bytes, and the gap math is sharp either way.
 
