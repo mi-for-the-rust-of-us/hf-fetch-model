@@ -249,7 +249,15 @@ pub fn download_lock_path(cache_root: &Path, repo_folder: &str, etag: &str) -> P
     // BORROW: explicit .to_owned() for &str → owned String for path concatenation
     let mut name = etag.to_owned();
     name.push_str(".lock");
-    cache_root.join(".locks").join(repo_folder).join(name)
+    download_locks_dir(cache_root, repo_folder).join(name)
+}
+
+/// Directory holding one repo's download locks:
+/// `{cache_root}/.locks/{repo_folder}/` (new in v0.12.6). `cache dedupe`
+/// tests every lock in it before touching the repo.
+#[must_use]
+pub fn download_locks_dir(cache_root: &Path, repo_folder: &str) -> PathBuf {
+    cache_root.join(".locks").join(repo_folder)
 }
 
 /// Header-cache directory: `{repo_dir}/.hf-fm-header-cache/`.

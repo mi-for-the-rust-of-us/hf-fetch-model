@@ -9,8 +9,11 @@
 //! [`cache_summary_all()`] adds datasets and Spaces),
 //! [`cache_repo_usage()`] returns a single repo's per-file sizes,
 //! [`verify_duplicates()`] hashes the snapshot files that duplicate their
-//! blobs, and [`verify_cache()`] re-checks `SHA256` digests of cached files
-//! against `HuggingFace` LFS metadata.
+//! blobs, [`plan_dedupe()`] and [`apply_dedupe()`] replace those files with
+//! hard links to their blobs, and [`verify_cache()`] re-checks `SHA256`
+//! digests of cached files against `HuggingFace` LFS metadata.
+
+mod dedupe;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -21,6 +24,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::FetchError;
 
 pub use crate::cache_layout::RepoType;
+pub use dedupe::{
+    DedupeCandidate, DedupePlan, DedupeReport, DedupeSkip, DedupeSkipReason, apply_dedupe,
+    plan_dedupe,
+};
 
 /// Filename of the per-repo `hf-fm` snapshot sidecar.
 ///

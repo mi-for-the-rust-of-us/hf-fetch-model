@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cache::plan_dedupe` and `cache::apply_dedupe`**
+  ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)):
+  the library side of reclaiming the duplicated copies. `plan_dedupe(repo_id)`
+  pairs every snapshot file that holds bytes of its own with the blobs of its
+  length, reading no file, so `DedupePlan::reclaimable_bytes` is an upper
+  bound. `apply_dedupe(&plan, verify)` compares each pair byte for byte and
+  replaces the copy with a hard link to the blob that equals it (made under a
+  temporary name and renamed over the copy, so the file is never missing), and
+  returns a `DedupeReport`: what it linked and reclaimed, and each file it
+  skipped with its reason (`DedupeSkipReason`: the blob is a symlink into
+  `huggingface_hub`'s shared store, the bytes differ, the file is in use, the
+  volume cannot hard-link, a download is in progress, or, with `verify`, the
+  bytes do not hash to the blob's name). A repo with a partial download or a
+  held download lock is left alone, checked again when the plan is applied.
+  The report and plan types are `#[non_exhaustive]`.
+
 ### Fixed
 
 - **A hard-linked snapshot file is counted once on Windows**

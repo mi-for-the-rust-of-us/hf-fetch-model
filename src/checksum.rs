@@ -68,7 +68,6 @@ async fn compute_sha256(path: &Path) -> Result<String, std::io::Error> {
 ///
 /// Returns [`std::io::Error`] if the file cannot be read.
 pub(crate) fn sha256_hex_of_file(path: &Path) -> Result<String, std::io::Error> {
-    use std::fmt::Write as _;
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
@@ -85,16 +84,24 @@ pub(crate) fn sha256_hex_of_file(path: &Path) -> Result<String, std::io::Error> 
         }
     }
 
-    // Manual lowercase-hex encoding: `sha2` 0.11 returns
-    // `hybrid_array::Array<u8, _>`, which (unlike `generic_array::GenericArray`)
-    // does not implement `fmt::LowerHex`, so `format!("{digest:x}")` no longer
-    // compiles. `write!` into `String` is infallible; the `Result` is discarded.
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for &b in &digest {
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+/// Encodes `bytes` (a digest) as lowercase hex, two digits per byte.
+///
+/// Manual encoding: `sha2` 0.11 returns `hybrid_array::Array<u8, _>`, which
+/// (unlike `generic_array::GenericArray`) does not implement `fmt::LowerHex`,
+/// so `format!("{digest:x}")` no longer compiles. Shared with `cache dedupe
+/// --verify`, which hashes a copy while it compares it.
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        // `write!` into a `String` is infallible; the `Result` is discarded.
         let _ = write!(&mut hex, "{b:02x}");
     }
-    Ok(hex)
+    hex
 }
 
 #[cfg(test)]
