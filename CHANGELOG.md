@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.6] — `cache dedupe` reclaims the duplicated Windows copies
+
 ### Added
 
 - **`hf-fm cache dedupe [REPO_ID...] [--dry-run] [--yes] [--verify]`** reclaims
