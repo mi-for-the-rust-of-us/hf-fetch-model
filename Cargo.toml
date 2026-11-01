@@ -101,6 +101,19 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Hard-link recognition on Windows (v0.12.6, issue #21). `std` exposes a
+# file's volume serial number and file index only behind the unstable
+# `windows_by_handle` feature, and reaching them directly takes an `unsafe`
+# Win32 call that `unsafe_code = "forbid"` rules out. `winapi-util` (safe
+# wrappers over `windows-sys`, by the author of `same-file` and `walkdir`)
+# exposes them through `file::information`, holds no handle beyond the call,
+# and was already in `Cargo.lock` behind an Android build-dependency. Windows
+# builds only; no other platform's build changes. `same-file` is the
+# documented fallback, but keeps a handle open per file and offers equality
+# only.
+winapi-util = "0.1.11"
+
 [[bin]]
 name = "hf-fetch-model"
 path = "src/bin/main.rs"

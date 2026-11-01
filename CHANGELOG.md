@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A hard-linked snapshot file is counted once on Windows**
+  ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)).
+  `du`, its `DUP` column, `cache delete`'s figure and `cache gc` recognised one
+  physical file under two names only on Unix, so on Windows a pointer
+  hard-linked to its blob was counted twice (6.00 MiB for a 3 MiB file) and
+  reported as a duplicated copy. They now read the file's volume serial number
+  and file index there too. The identity also carries the file's length, on
+  every platform, because a 64-bit file index is not guaranteed unique on ReFS.
+  The price is one more open per file on Windows (with no access rights, so a
+  file another process holds exclusively is still identified): on the
+  maintainer's cache (72 repos, 2,839 files, 763 GiB) `du` takes 980 ms instead
+  of 700 ms, warm, with identical output.
+
+### Changed
+
+- **New Windows-only dependency: `winapi-util` 0.1.11** (`Unlicense OR MIT`),
+  for the file identity above. `std` exposes it only behind the unstable
+  `windows_by_handle` feature, and this crate forbids `unsafe`. It was already
+  in `Cargo.lock`, so no package is added; other platforms' builds are
+  unchanged.
+
 ## [0.12.5] — `du` names the duplicates and lists dataset repos
 
 ### Added

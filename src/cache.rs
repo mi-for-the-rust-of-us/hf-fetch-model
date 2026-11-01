@@ -570,10 +570,10 @@ pub struct CachedModelSummary {
     /// writes on Windows, which never tries a symlink there, and for this
     /// crate's own writes whenever creating a symlink is refused), the repo
     /// holds those bytes twice, so this figure can reach double the
-    /// snapshot's own size. Where the pointers are symlinks, or hard links on
-    /// Unix, only the blob's bytes count (a hard link on Windows is counted
-    /// twice; see `physical_id`). See `walk_repo_files` for why both
-    /// directories are walked.
+    /// snapshot's own size. Where the pointers are symlinks or hard links, only
+    /// the blob's bytes count (on Windows since v0.12.6, which recognises a
+    /// hard link there; before, one was counted twice). See `walk_repo_files`
+    /// for why both directories are walked.
     ///
     /// It includes the payloads the repo links to in `huggingface_hub`'s
     /// shared blob store; see [`shared_size`](Self::shared_size). What
@@ -954,7 +954,7 @@ pub fn shared_store_size() -> Result<u64, FetchError> {
 /// symlinks not followed; `0` when `dir` does not exist.
 fn dir_bytes(dir: &Path) -> u64 {
     let mut total: u64 = 0;
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen: HashSet<FileId> = HashSet::new();
     let mut newest: Option<std::time::SystemTime> = None;
     walk_other_files(dir, &mut total, &mut seen, &mut newest);
     total
@@ -1423,37 +1423,55 @@ pub fn resolved_file_size(path: &Path) -> Option<u64> {
     }
 }
 
-/// Physical-file identity, used to count one file once however many
-/// directory entries name it.
+/// A physical file's identity: the volume it is on, its index on that volume,
+/// and its length in bytes. Two directory entries with the same identity are
+/// one file under two names (a hard link), whose bytes exist once.
 ///
-/// `Some` on Unix, where `(st_dev, st_ino)` is stable and free. `None`
-/// everywhere else: Windows exposes `nFileIndex` only behind the unstable
-/// `windows_by_handle` feature, and reaching it directly takes an `unsafe`
-/// Win32 call that this crate's `unsafe_code = "forbid"` rules out
-/// absolutely (`forbid`, unlike `deny`, cannot be lifted by an inner
-/// `allow`). Nothing in the stack creates a hard link, so no layout that
-/// actually occurs needs this: [`crate::chunked`]'s `symlink_or_copy` and
-/// `hf-hub`'s own pointer writer each only ever symlink or copy. A hard
-/// link made by hand on Windows is therefore counted twice, which is the
-/// one inaccuracy left here; revisit alongside any change that starts
-/// creating hard links.
+/// The length is part of it because a 64-bit file index is not guaranteed
+/// unique on `ReFS`, whose file IDs are 128-bit (as `same-file`'s own source
+/// notes). Two files of different lengths can then never be mistaken for one,
+/// so a collision cannot hide bytes from `du`.
+type FileId = (u64, u64, u64);
+
+/// The [`FileId`] of the file at `path`, whose metadata (following a
+/// symlink, as for the file it names) is `meta`, used to count one file once
+/// however many directory entries name it.
+///
+/// On Unix it is `(st_dev, st_ino, len)`, read from `meta` for free; `path`
+/// is not used. On Windows it is `(volume serial number, file index, len)`
+/// (new in v0.12.6), read through `winapi-util` from a handle opened with no
+/// access rights, as `std::fs::metadata` opens one, so a file held open
+/// exclusively by another process is still identified. Before v0.12.6 Windows
+/// had none, and a hard link there was counted twice. `None` when the file
+/// cannot be opened, or on a platform with no identity; the caller then
+/// counts the entry as a file of its own.
 #[cfg(unix)]
 // This arm always returns `Some`, so `unnecessary_wraps` fires on it. The
-// `Option` is still required: the signature is shared with the
-// `#[cfg(not(unix))]` arm below, which can only ever return `None`, and
-// unwrapping it here would push the platform split out into every call site.
-// The lint cannot fire on Windows, where that arm compiles instead, which is
-// how this reached CI unseen.
+// `Option` is still required: the signature is shared with the Windows arm
+// below, which returns `None` when the file cannot be opened, and unwrapping
+// it here would push the platform split out into every call site. The lint
+// cannot fire on Windows, where that arm compiles instead, which is how this
+// reached CI unseen.
 #[allow(clippy::unnecessary_wraps)]
-fn physical_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn physical_id(_path: &Path, meta: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
+    Some((meta.dev(), meta.ino(), meta.len()))
 }
 
-/// Non-Unix counterpart of [`physical_id`]; see its docs for why this is
-/// always `None`.
-#[cfg(not(unix))]
-fn physical_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+/// Windows arm of [`physical_id`]; see its docs.
+#[cfg(windows)]
+fn physical_id(path: &Path, meta: &std::fs::Metadata) -> Option<FileId> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // No access rights: enough to query the file's information, and never a
+    // sharing violation, whatever share mode another process opened it with.
+    let file = std::fs::OpenOptions::new().access_mode(0).open(path).ok()?;
+    let info = winapi_util::file::information(&file).ok()?;
+    Some((info.volume_serial_number(), info.file_index(), meta.len()))
+}
+
+/// Counterpart of [`physical_id`] for platforms with no file identity.
+#[cfg(not(any(unix, windows)))]
+fn physical_id(_path: &Path, _meta: &std::fs::Metadata) -> Option<FileId> {
     None
 }
 
@@ -1518,7 +1536,7 @@ struct BlobRecord {
     /// Length in bytes.
     len: u64,
     /// Its [`physical_id`], where the platform provides one.
-    id: Option<(u64, u64)>,
+    id: Option<FileId>,
     /// Whether it is a partial download's temp file or resume sidecar.
     partial: bool,
 }
@@ -1577,12 +1595,12 @@ fn walk_repo_files(repo_dir: &Path) -> RepoFileWalk {
     let mut partial_bytes: u64 = 0;
     let mut last_modified: Option<std::time::SystemTime> = None;
     // Identities of the physical files already charged to `total_size`.
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen: HashSet<FileId> = HashSet::new();
     // What the blobs and the snapshot entries are, for pairing them once both
     // are read.
     let mut blobs: Vec<BlobRecord> = Vec::new();
     let mut copies: Vec<(u64, PathBuf)> = Vec::new();
-    let mut entry_ids: HashSet<(u64, u64)> = HashSet::new();
+    let mut entry_ids: HashSet<FileId> = HashSet::new();
     let mut linked_blobs: HashSet<OsString> = HashSet::new();
     // Newest mtime outside `snapshots/`: the age of a repo that has no
     // snapshot files at all.
@@ -1702,7 +1720,7 @@ struct DuplicateScan {
 fn pair_duplicates(
     mut blobs: Vec<BlobRecord>,
     copies: Vec<(u64, PathBuf)>,
-    entry_ids: &HashSet<(u64, u64)>,
+    entry_ids: &HashSet<FileId>,
     linked_blobs: &HashSet<OsString>,
 ) -> DuplicateScan {
     // `read_dir` order is arbitrary; sorting makes the pairing repeatable.
@@ -1755,7 +1773,7 @@ struct BlobTotals<'a> {
     /// resume sidecar.
     partial_size: &'a mut u64,
     /// Identities of the physical files already charged.
-    seen: &'a mut HashSet<(u64, u64)>,
+    seen: &'a mut HashSet<FileId>,
     /// Newest mtime seen outside `snapshots/`.
     newest: &'a mut Option<std::time::SystemTime>,
     /// Every regular blob charged, for pairing with the snapshot entries.
@@ -1775,17 +1793,19 @@ fn walk_blob_files(blobs_dir: &Path, shared_store: Option<&Path>, totals: &mut B
     let Ok(entries) = std::fs::read_dir(blobs_dir) else {
         return;
     };
-    // Shared payloads already charged to this repo, by resolved path:
-    // `physical_id` is unavailable on Windows, where the store can exist too.
+    // Shared payloads already charged to this repo, by resolved path, so a
+    // payload is charged once even where its identity cannot be read.
     let mut shared_seen: HashSet<PathBuf> = HashSet::new();
     for entry in entries {
         let Ok(entry) = entry else { continue };
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
         if meta.is_file() {
             note_newest_mtime(totals.newest, &meta);
-            if let Some(id) = physical_id(&meta)
+            let id = physical_id(&path, &meta);
+            if let Some(id) = id
                 && !totals.seen.insert(id)
             {
                 continue;
@@ -1797,9 +1817,9 @@ fn walk_blob_files(blobs_dir: &Path, shared_store: Option<&Path>, totals: &mut B
                 *totals.partial_size = totals.partial_size.saturating_add(meta.len());
             }
             totals.blobs.push(BlobRecord {
-                path: entry.path(),
+                path,
                 len: meta.len(),
-                id: physical_id(&meta),
+                id,
                 partial,
             });
             continue;
@@ -1810,7 +1830,7 @@ fn walk_blob_files(blobs_dir: &Path, shared_store: Option<&Path>, totals: &mut B
             continue;
         }
         let Some(store) = shared_store else { continue };
-        let Ok(target) = std::fs::canonicalize(entry.path()) else {
+        let Ok(target) = std::fs::canonicalize(&path) else {
             continue;
         };
         if !target.starts_with(store) {
@@ -1823,7 +1843,7 @@ fn walk_blob_files(blobs_dir: &Path, shared_store: Option<&Path>, totals: &mut B
             continue;
         }
         note_newest_mtime(totals.newest, &target_meta);
-        if let Some(id) = physical_id(&target_meta) {
+        if let Some(id) = physical_id(&target, &target_meta) {
             totals.seen.insert(id);
         }
         if !shared_seen.insert(target) {
@@ -1845,7 +1865,7 @@ fn walk_blob_files(blobs_dir: &Path, shared_store: Option<&Path>, totals: &mut B
 fn walk_other_files(
     path: &Path,
     total_size: &mut u64,
-    seen: &mut HashSet<(u64, u64)>,
+    seen: &mut HashSet<FileId>,
     newest: &mut Option<std::time::SystemTime>,
 ) {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -1861,7 +1881,7 @@ fn walk_other_files(
         }
     } else if meta.is_file() {
         note_newest_mtime(newest, &meta);
-        if let Some(id) = physical_id(&meta)
+        if let Some(id) = physical_id(path, &meta)
             && !seen.insert(id)
         {
             return;
@@ -1886,13 +1906,13 @@ struct SnapshotTotals<'a> {
     /// Newest mtime across the snapshot files.
     last_modified: &'a mut Option<std::time::SystemTime>,
     /// Identities of the physical files already charged.
-    seen: &'a mut HashSet<(u64, u64)>,
+    seen: &'a mut HashSet<FileId>,
     /// Length and path of every entry that holds bytes of its own: the
     /// candidates for being a copy of a blob.
     copies: &'a mut Vec<(u64, PathBuf)>,
     /// Identities of the physical files the entries resolve to; a blob in
     /// this set has a hard link among them.
-    entry_ids: &'a mut HashSet<(u64, u64)>,
+    entry_ids: &'a mut HashSet<FileId>,
     /// File names that the symlink entries' targets end in; a blob with one
     /// of these names has a symlink pointing at it.
     linked_blobs: &'a mut HashSet<OsString>,
@@ -1963,7 +1983,7 @@ fn walk_snapshot_files(
             // What the entry resolves to, for telling a pointer from a copy:
             // a symlink names its blob in its target, and a hard link shares
             // the blob's identity.
-            let id = metadata.as_ref().and_then(physical_id);
+            let id = metadata.as_ref().and_then(|m| physical_id(&path, m));
             if let Some(id) = id {
                 totals.entry_ids.insert(id);
             }
@@ -2920,9 +2940,9 @@ mod tests {
     }
 
     /// A hard-linked pointer is the same physical file as its blob, so it is
-    /// counted once. Nothing in the stack creates these today; this guards
-    /// the `(st_dev, st_ino)` dedup for the day something does.
-    #[cfg(unix)]
+    /// counted once, on every platform: this is issue #21's Windows test,
+    /// where until v0.12.6 such a pointer was counted twice. Hard links need
+    /// no privilege, so it runs for real everywhere.
     #[test]
     fn walk_counts_a_hard_linked_pointer_once() {
         let (_tmp, repo_dir, blob, snap) = repo_with_blob(2048);
@@ -3192,8 +3212,8 @@ mod tests {
     }
 
     /// A symlinked pointer shares its blob: nothing is duplicated, and the
-    /// blob is not an orphan. The link is read by name, so this holds on
-    /// Windows too, where `physical_id` has nothing to say.
+    /// blob is not an orphan. The link is read by name, so this holds even
+    /// where the blob's identity cannot be read.
     #[test]
     fn walk_reports_no_duplicate_for_a_symlinked_pointer() {
         let (_tmp, repo_dir, _blob, snap) = repo_with_blob(1000);
@@ -3212,8 +3232,8 @@ mod tests {
         assert_eq!(walk.total_size, 1000);
     }
 
-    /// A hard-linked pointer is the blob itself, not a copy of it.
-    #[cfg(unix)]
+    /// A hard-linked pointer is the blob itself, not a copy of it, on Windows
+    /// too since v0.12.6.
     #[test]
     fn walk_reports_no_duplicate_for_a_hard_linked_pointer() {
         let (_tmp, repo_dir, blob, snap) = repo_with_blob(1000);
@@ -3223,6 +3243,44 @@ mod tests {
 
         assert_eq!(walk.duplicated_bytes, 0);
         assert_eq!(walk.orphan_blob_bytes, 0);
+        assert_eq!(walk.total_size, 1000);
+    }
+
+    /// A hard link shares its file's identity and a copy does not, and a file
+    /// another process holds open exclusively is still identified.
+    #[test]
+    fn physical_id_tells_a_hard_link_from_a_copy() {
+        let (_tmp, _repo_dir, blob, snap) = repo_with_blob(100);
+        let linked = snap.join("linked.bin");
+        let copied = snap.join("copied.bin");
+        std::fs::hard_link(&blob, &linked).unwrap();
+        std::fs::copy(&blob, &copied).unwrap();
+        let id = |p: &Path| physical_id(p, &std::fs::metadata(p).unwrap());
+
+        assert!(id(&blob).is_some());
+        assert_eq!(id(&linked), id(&blob));
+        assert_ne!(id(&copied), id(&blob));
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&blob)
+                .unwrap();
+            assert_eq!(id(&linked), id(&blob), "held open, still identified");
+        }
+    }
+
+    /// The length is part of the identity, so two files that report one
+    /// volume and index (a 64-bit index can repeat on `ReFS`) but differ in
+    /// length are still two files.
+    #[test]
+    fn a_file_id_includes_the_length() {
+        let (_tmp, _repo_dir, blob, _snap) = repo_with_blob(100);
+        let id = physical_id(&blob, &std::fs::metadata(&blob).unwrap()).unwrap();
+        assert_eq!(id.2, 100);
     }
 
     /// A blob nothing points at and nothing copies is an orphan, whatever its
