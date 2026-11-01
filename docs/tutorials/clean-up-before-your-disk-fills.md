@@ -2,7 +2,7 @@
 
 *See what the HuggingFace cache holds, decide what to keep, and reclaim the rest — with a dry-run before anything is deleted.*
 
-*~2,780 words · about 11 min read*
+*~2,830 words · about 11 min read*
 
 <!-- Last updated: 2026-11-01, hf-fm v0.12.6 -->
 
