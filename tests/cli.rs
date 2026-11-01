@@ -6070,3 +6070,241 @@ fn cache_delete_of_several_repos_goes_on_after_one_fails_and_then_fails() {
     assert!(!repo_exists(dir.path(), "models--test-org--free"));
     assert!(repo_exists(dir.path(), "models--test-org--stuck"));
 }
+
+// -----------------------------------------------------------------------
+// cache dedupe reclaims the duplicated copies (v0.12.6, issue #21)
+// -----------------------------------------------------------------------
+
+/// `du --json`'s `(size, duplicated_bytes)` for `repo_id`.
+fn du_json_size_and_dup(hf_home: &std::path::Path, repo_id: &str) -> (u64, u64) {
+    let entry = du_json_entry(hf_home, repo_id, "model");
+    let field = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("{key} u64 in {entry}"))
+    };
+    (field("size"), field("duplicated_bytes"))
+}
+
+#[test]
+fn help_shows_cache_dedupe() {
+    let (stdout, stderr, success) = run(hf_fm().args(["cache", "dedupe", "--help"]));
+    assert!(success, "cache dedupe --help should succeed: {stderr}");
+    for flag in ["--dry-run", "--yes", "--verify"] {
+        assert!(
+            stdout.contains(flag),
+            "{flag} is documented, got:\n{stdout}"
+        );
+    }
+    let (cache_help, _, _) = run(hf_fm().args(["cache", "--help"]));
+    assert!(
+        cache_help.contains("dedupe"),
+        "listed under `cache`, got:\n{cache_help}"
+    );
+}
+
+#[test]
+fn cache_dedupe_dry_run_previews_and_changes_nothing() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 3072);
+
+    let (stdout, stderr, success) =
+        run(hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["cache", "dedupe", "--dry-run"]));
+    assert!(success, "--dry-run should succeed: {stderr}");
+    assert!(
+        stdout.contains("up to 3.0 KiB  test-org/twice  (1 file)"),
+        "the preview names the repo and its upper bound, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Up to 3.0 KiB in 1 file across 1 repo.")
+            && stdout.contains("Dry run: nothing was compared or changed."),
+        "and says nothing changed, got:\n{stdout}"
+    );
+    assert_eq!(
+        du_json_size_and_dup(dir.path(), "test-org/twice"),
+        (6144, 3072),
+        "the copy is still there"
+    );
+}
+
+#[test]
+fn cache_dedupe_reclaims_every_copy_and_du_counts_each_file_once() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--a", "e1", "m.bin", 3072);
+    stage_blob_and_copy(dir.path(), "models--test-org--b", "e2", "m.bin", 5120);
+    let (total, listed, _) = du_repo_figures(dir.path(), "test-org/b");
+    assert_eq!((total, listed), (10_240, 5120), "the copy before");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "--yes"]));
+    assert!(success, "dedupe should succeed: {stderr}");
+    assert!(
+        stdout.contains("Reclaimed 8.0 KiB: 2 files replaced by hard links to their blobs."),
+        "the result is what was reclaimed, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Compared 16.0 KiB in"),
+        "both sides of each pair were read, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("deduplicating test-org/a"),
+        "each repo is reported as it starts, got:\n{stderr}"
+    );
+
+    assert_eq!(du_json_size_and_dup(dir.path(), "test-org/a"), (3072, 0));
+    assert_eq!(du_json_size_and_dup(dir.path(), "test-org/b"), (5120, 0));
+    let (total, listed, _) = du_repo_figures(dir.path(), "test-org/b");
+    assert_eq!(total, listed, "the repo now holds what it lists");
+
+    let (again, again_err, again_ok) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "--yes"]));
+    assert!(again_ok, "a second run should succeed: {again_err}");
+    assert!(
+        again.contains("Nothing to reclaim"),
+        "a second run has nothing to do, got:\n{again}"
+    );
+}
+
+#[test]
+fn cache_dedupe_prints_the_repo_an_index_resolved_to_even_under_yes() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--large", "e1", "m.bin", 8192);
+    stage_blob_and_copy(dir.path(), "models--test-org--small", "e2", "m.bin", 1024);
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "2", "--yes"]));
+    assert!(success, "dedupe by index should succeed: {stderr}");
+    assert!(
+        stdout.contains("index 2 is test-org/small  (as listed by the last `du`)"),
+        "the index is resolved aloud, got:\n{stdout}"
+    );
+    assert_eq!(
+        du_json_size_and_dup(dir.path(), "test-org/small"),
+        (1024, 0)
+    );
+    assert_eq!(
+        du_json_size_and_dup(dir.path(), "test-org/large"),
+        (16_384, 8192),
+        "only the named repo is touched"
+    );
+}
+
+#[test]
+fn cache_dedupe_refuses_a_dataset_and_an_uncached_repo_before_anything_changes() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 3072);
+    stage_blob_and_copy(dir.path(), "datasets--test-org--d", "e2", "d.bin", 2048);
+
+    for bad in ["datasets/test-org/d", "test-org/absent"] {
+        let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+            "cache",
+            "dedupe",
+            "test-org/twice",
+            bad,
+            "--yes",
+        ]));
+        assert!(!success, "{bad} must be refused, got:\n{stdout}");
+        assert!(
+            stderr.contains("models only") || stderr.contains("is not cached"),
+            "and say why, got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        du_json_size_and_dup(dir.path(), "test-org/twice"),
+        (6144, 3072),
+        "a bad argument aborts before the good one is touched"
+    );
+}
+
+#[test]
+fn cache_dedupe_leaves_a_repo_with_a_partial_download_alone() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--busy", "e1", "m.bin", 3072);
+    std::fs::write(
+        dir.path()
+            .join("hub")
+            .join("models--test-org--busy")
+            .join("blobs")
+            .join("e9.chunked.part"),
+        [0_u8; 16],
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "--yes"]));
+    assert!(success, "dedupe should succeed: {stderr}");
+    assert!(
+        stdout.contains(
+            "skipped test-org/busy: a download into the repo is in progress or was interrupted"
+        ) && stdout.contains("hf-fm cache clean-partial test-org/busy"),
+        "the repo is skipped with the way out, got:\n{stdout}"
+    );
+    assert!(stdout.contains("Nothing to reclaim"), "got:\n{stdout}");
+}
+
+#[test]
+fn cache_dedupe_answered_no_changes_nothing() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 3072);
+
+    let (stdout, stderr, success) = run_with_stdin(
+        hf_fm().env("HF_HOME", dir.path()).args(["cache", "dedupe"]),
+        "n\n",
+    );
+    assert!(success, "declining should succeed: {stderr}");
+    assert!(
+        stderr.contains("Reclaim up to 3.0 KiB? [y/N]") && stdout.contains("Aborted."),
+        "the prompt states the bound, got:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        du_json_size_and_dup(dir.path(), "test-org/twice"),
+        (6144, 3072)
+    );
+}
+
+#[test]
+fn du_and_gc_point_to_cache_dedupe_only_for_model_copies() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "datasets--test-org--d", "e2", "d.bin", 2048);
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stdout.contains("are duplicated copies") && !stdout.contains("cache dedupe"),
+        "dataset copies alone get no pointer to a models-only command, got:\n{stdout}"
+    );
+
+    stage_blob_and_copy(dir.path(), "models--test-org--twice", "e1", "m.bin", 10_240);
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stdout.contains("`hf-fm cache dedupe` replaces them with hard links to their blobs"),
+        "the footer points to the command, got:\n{stdout}"
+    );
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["du", "test-org/twice"]));
+    assert!(success, "du <repo> should succeed: {stderr}");
+    assert!(
+        stdout.contains("`hf-fm cache dedupe test-org/twice` replaces the duplicated copies"),
+        "and so does the repo's drill-down, got:\n{stdout}"
+    );
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "gc",
+        "--max-size",
+        "1KiB",
+        "--dry-run",
+    ]));
+    assert!(success, "gc --dry-run should succeed: {stderr}");
+    assert!(
+        stdout.contains("`hf-fm cache dedupe` reclaims them and keeps every model."),
+        "and so does gc's preview, got:\n{stdout}"
+    );
+}

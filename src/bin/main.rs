@@ -768,6 +768,33 @@ enum CacheCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reclaim the duplicated copies: replace each snapshot file that holds
+    /// the same bytes as its blob with a hard link to that blob.
+    ///
+    /// On Windows `hf-hub` stores every file twice, as its blob and as a full
+    /// copy in `snapshots/` (`du`'s `DUP` column); this keeps every model and
+    /// frees the copies. Each copy is compared with its blob byte for byte
+    /// before it is replaced, so the preview says "up to" and the result says
+    /// what was reclaimed. With no repo, every cached model; models only. A
+    /// numeric index is the `#` of the last `du`, and the repo each index
+    /// resolved to is printed, `--yes` or not.
+    Dedupe {
+        /// Repository identifiers or numeric indexes from `du` output (omit for every cached model).
+        repo_ids: Vec<String>,
+
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+
+        /// Print what could be reclaimed, without comparing, linking or prompting.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Also hash each copy and check it against the `SHA256` its blob is
+        /// named by (LFS files); a pair that does not match is left alone.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Delete cached repos by repo ID or numeric index.
     ///
     /// Every argument is resolved first, then the repos are deleted, so one
@@ -1326,6 +1353,12 @@ fn run(cli: Cli) -> Result<(), FetchError> {
                 let resolved = repo_id.map(|r| resolve_du_arg(r.as_str())).transpose()?;
                 run_cache_clean_partial(resolved.as_deref(), yes, dry_run)
             }
+            CacheCommands::Dedupe {
+                repo_ids,
+                yes,
+                dry_run,
+                verify,
+            } => run_cache_dedupe(&repo_ids, yes, dry_run, verify),
             // BORROW: explicit .as_str() for String → &str conversion
             CacheCommands::Delete {
                 repo_ids,
@@ -3944,15 +3977,28 @@ fn print_duplicate_figure(duplicated_bytes: u64, repo_count: usize, total_size: 
 
 /// Prints `du`'s footer line for the duplicated copies, and the note on
 /// what they are, when there are any.
-fn print_duplicate_footer(duplicated_bytes: u64, repo_count: usize, total_size: u64) {
+///
+/// The note points to `cache dedupe` only when `in_models` (some model repo
+/// holds copies): the command reclaims copies in model repos only.
+fn print_duplicate_footer(
+    duplicated_bytes: u64,
+    repo_count: usize,
+    total_size: u64,
+    in_models: bool,
+) {
     if !print_duplicate_figure(duplicated_bytes, repo_count, total_size) {
         return;
     }
+    let reclaim = if in_models {
+        " `hf-fm cache dedupe` replaces them with hard links to their blobs, \
+         keeping every model."
+    } else {
+        ""
+    };
     println!(
         "  Note: a duplicated copy is a snapshot file stored again beside its blob, \
          which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; \
-         `--verify-duplicates` hashes the copies to confirm them. Reclaiming them is \
-         tracked in https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21."
+         `--verify-duplicates` hashes the copies to confirm them.{reclaim}"
     );
 }
 
@@ -4130,7 +4176,14 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
     if let Some(volumes) = &volumes {
         print_volume_totals(volumes);
     }
-    print_duplicate_footer(total_dup, dup_repos, total_size);
+    print_duplicate_footer(
+        total_dup,
+        dup_repos,
+        total_size,
+        summaries
+            .iter()
+            .any(|s| s.repo_type == cache::RepoType::Model && s.duplicated_bytes > 0),
+    );
     if any_partial {
         println!("  \u{25cf} = partial downloads");
     }
@@ -4306,6 +4359,13 @@ fn run_du_repo(
                 du_repo_gap_note(listed_bytes, disk_bytes, has_partial)
             ),
         }
+    }
+    // `cache dedupe` takes models only, as `du` addresses them.
+    if usage.duplicated_bytes > 0 && repo_type == cache::RepoType::Model {
+        println!(
+            "  `hf-fm cache dedupe {address}` replaces the duplicated copies with hard \
+             links to their blobs."
+        );
     }
     if usage.shared_size > 0 {
         println!(
@@ -5164,7 +5224,14 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     ) {
         print_volume_totals(&volumes);
     }
-    print_duplicate_footer(total_dup, dup_repos, total_size);
+    print_duplicate_footer(
+        total_dup,
+        dup_repos,
+        total_size,
+        repos
+            .iter()
+            .any(|r| r.repo_type == cache::RepoType::Model && r.duplicated_bytes > 0),
+    );
     if any_partial {
         println!("  \u{25cf} = partial downloads");
     }
@@ -5707,6 +5774,280 @@ fn run_cache_delete(
     Ok(())
 }
 
+/// Resolves `cache dedupe`'s arguments to cached model repo IDs, in the order
+/// given and de-duplicated; no argument means every cached model.
+///
+/// Every argument that was a numeric index prints the repo it resolved to,
+/// under `--yes` too, as `cache delete` does: the indexes are those of the
+/// last `du`.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidArgument`] when an argument does not resolve
+/// (see [`resolve_repo_arg`]), names a dataset or Space, or names a repo that
+/// is not cached, and [`FetchError::Io`] when the cache cannot be read.
+fn resolve_dedupe_targets(args: &[String]) -> Result<Vec<String>, FetchError> {
+    if args.is_empty() {
+        return Ok(cache::cache_summary()?
+            .into_iter()
+            .map(|s| s.repo_id)
+            .collect());
+    }
+    let cache_dir = cache::hf_cache_dir()?;
+    let mut targets: Vec<String> = Vec::with_capacity(args.len());
+    // The listing behind an index is computed once, however many are given.
+    let mut listing: Option<Vec<cache::CachedModelSummary>> = None;
+
+    // EXPLICIT: carries the lazily-built listing and the de-duplicated targets across arguments
+    for arg in args {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        let repo_id = match arg.as_str().parse::<usize>() {
+            Ok(n) => {
+                if listing.is_none() {
+                    listing = Some(du_listing()?);
+                }
+                let (repo_type, repo_id) =
+                    resolve_index(n, listing.as_deref().unwrap_or_default())?;
+                // BORROW: explicit .as_str() instead of Deref coercion
+                let address = repo_type.address(repo_id.as_str());
+                println!("  index {n} is {address}  (as listed by the last `du`)");
+                if repo_type != cache::RepoType::Model {
+                    return Err(FetchError::InvalidArgument(format!(
+                        "{address} is a {} (this command takes models only)",
+                        repo_type.label()
+                    )));
+                }
+                repo_id
+            }
+            // BORROW: explicit .as_str() instead of Deref coercion
+            Err(_) => resolve_du_arg(arg.as_str())?,
+        };
+        if targets.contains(&repo_id) {
+            continue;
+        }
+        // BORROW: explicit .as_str() instead of Deref coercion
+        let repo_dir = cache_layout::repo_dir(&cache_dir, repo_id.as_str());
+        // `symlink_metadata`, not `exists()`: a relocated repo whose link
+        // dangles is still reported here, rather than as uncached.
+        if std::fs::symlink_metadata(&repo_dir).is_err() {
+            return Err(FetchError::InvalidArgument(format!(
+                "{repo_id} is not cached"
+            )));
+        }
+        targets.push(repo_id);
+    }
+    Ok(targets)
+}
+
+/// Formats a run's wall time: `4.2 s` under a minute, `6 min 12 s` above.
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{:.1} s", elapsed.as_secs_f64())
+    } else {
+        format!("{} min {} s", secs / 60, secs % 60)
+    }
+}
+
+/// The snapshot file `path` as printed under its repo: relative to the repo's
+/// `snapshots/` directory, or in full where it is not under it.
+fn snapshot_relative(path: &Path, repo_dir: &Path) -> String {
+    let snapshots = cache_layout::snapshots_dir(repo_dir);
+    // BORROW: explicit .to_string() for Display → owned String
+    path.strip_prefix(&snapshots)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Reclaims the duplicated copies of the given cached models, or of every one.
+///
+/// Resolves the arguments, plans every repo (no file is read), and prints the
+/// preview: per repo, the most it can reclaim ("up to", since the plan pairs
+/// by length), and what is left alone and why. With `--dry-run` it stops
+/// there. Otherwise it prompts once, unless `--yes`, then compares and links
+/// repo by repo, reporting each on stderr as it starts, and prints what it
+/// reclaimed, how long the comparison took, and every file it left alone with
+/// its reason. A file left alone does not fail the command: the others go on,
+/// and a later run picks it up.
+///
+/// # Errors
+///
+/// Returns the errors of [`resolve_dedupe_targets`], and
+/// [`FetchError::InvalidArgument`] or [`FetchError::Io`] from
+/// [`cache::plan_dedupe`].
+// EXPLICIT: sequential pipeline (resolve, plan, preview, prompt, apply, report); splitting it hides the flow
+#[allow(clippy::too_many_lines)]
+fn run_cache_dedupe(
+    args: &[String],
+    yes: bool,
+    dry_run: bool,
+    verify: bool,
+) -> Result<(), FetchError> {
+    let cache_dir = cache::hf_cache_dir()?;
+    if !cache_dir.exists() {
+        println!("No HuggingFace cache found at {}", cache_dir.display());
+        return Ok(());
+    }
+    println!("Cache: {}\n", cache_dir.display());
+
+    let targets = resolve_dedupe_targets(args)?;
+    let plans: Vec<cache::DedupePlan> = targets
+        .iter()
+        // BORROW: explicit .as_str() instead of Deref coercion
+        .map(|repo_id| cache::plan_dedupe(repo_id.as_str()))
+        .collect::<Result<_, _>>()?;
+
+    // The preview: one row per repo with something to reclaim.
+    let active: Vec<&cache::DedupePlan> =
+        plans.iter().filter(|p| !p.candidates.is_empty()).collect();
+    let size_cells: Vec<String> = active
+        .iter()
+        .map(|p| format_size(p.reclaimable_bytes()))
+        .collect();
+    let sw = size_cells.iter().map(String::len).max().unwrap_or(0);
+    for (plan, size) in active.iter().zip(&size_cells) {
+        let n = plan.candidates.len();
+        println!(
+            "  up to {size:>sw$}  {}  ({n} {})",
+            plan.repo_id,
+            pluralize(n, "file", "files")
+        );
+    }
+    // What is left alone before anything is read: repos with a download in
+    // progress, and copies whose blob is a symlink into the shared store.
+    for plan in &plans {
+        if plan.download_in_progress {
+            println!(
+                "  skipped {}: a download into the repo is in progress or was interrupted; \
+                 finish it, or run `hf-fm cache clean-partial {}`",
+                plan.repo_id, plan.repo_id
+            );
+        }
+        for skip in &plan.skipped {
+            println!(
+                "  left alone {}  {} ({}): {}",
+                plan.repo_id,
+                snapshot_relative(&skip.path, &plan.repo_dir),
+                format_size(skip.len),
+                skip.reason
+            );
+        }
+    }
+
+    let total = active
+        .iter()
+        .map(|p| p.reclaimable_bytes())
+        .fold(0_u64, u64::saturating_add);
+    let file_count: usize = active.iter().map(|p| p.candidates.len()).sum();
+    if file_count == 0 {
+        println!("  Nothing to reclaim: no snapshot file is a separate copy of a blob.");
+        return Ok(());
+    }
+    println!(
+        "\n  Up to {} in {file_count} {} across {} {}. Each file is compared with its \
+         blob before it is replaced.",
+        format_size(total),
+        pluralize(file_count, "file", "files"),
+        active.len(),
+        pluralize(active.len(), "repo", "repos"),
+    );
+
+    if dry_run {
+        println!("  Dry run: nothing was compared or changed.");
+        return Ok(());
+    }
+    // BORROW: explicit .as_str() instead of Deref coercion
+    if !yes && !confirm_prompt(format!("  Reclaim up to {}? [y/N]", format_size(total)).as_str()) {
+        println!("  Aborted.");
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    let mut linked: usize = 0;
+    let mut reclaimed: u64 = 0;
+    let mut already_linked: usize = 0;
+    let mut unverified: usize = 0;
+    let mut bytes_read: u64 = 0;
+    let mut skipped: Vec<(&cache::DedupePlan, cache::DedupeSkip)> = Vec::new();
+    // EXPLICIT: applies each plan in turn, reporting it on stderr, and tallies the reports
+    for (plan, size) in active.iter().zip(&size_cells) {
+        eprintln!("  deduplicating {} (up to {size})...", plan.repo_id);
+        let report = cache::apply_dedupe(plan, verify);
+        linked += report.linked;
+        reclaimed = reclaimed.saturating_add(report.reclaimed_bytes);
+        already_linked += report.already_linked;
+        unverified += report.unverified;
+        bytes_read = bytes_read.saturating_add(report.bytes_read);
+        skipped.extend(report.skipped.into_iter().map(|skip| (*plan, skip)));
+    }
+    let elapsed = start.elapsed();
+
+    println!(
+        "\n  Reclaimed {}: {linked} {}.",
+        format_size(reclaimed),
+        pluralize(
+            linked,
+            "file replaced by a hard link to its blob",
+            "files replaced by hard links to their blobs"
+        ),
+    );
+    if bytes_read > 0 {
+        let secs = elapsed.as_secs_f64();
+        // CAST: u64 → f64 → u64, precision loss acceptable; a display-only throughput
+        #[allow(
+            clippy::as_conversions,
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let rate = if secs > 0.0 {
+            format!(" ({}/s)", format_size((bytes_read as f64 / secs) as u64))
+        } else {
+            String::new()
+        };
+        println!(
+            "  Compared {} in {}{rate}.",
+            format_size(bytes_read),
+            format_elapsed(elapsed)
+        );
+    }
+    if already_linked > 0 {
+        println!(
+            "  {already_linked} {} already linked.",
+            pluralize(already_linked, "file was", "files were")
+        );
+    }
+    if unverified > 0 {
+        println!(
+            "  {unverified} {} linked without a hash check: git-stored files, whose blob \
+             is named by a git hash rather than a SHA-256.",
+            pluralize(unverified, "file was", "files were")
+        );
+    }
+    if !skipped.is_empty() {
+        let skipped_bytes = skipped
+            .iter()
+            .map(|(_, skip)| skip.len)
+            .fold(0_u64, u64::saturating_add);
+        println!(
+            "  Left alone: {} {} ({}):",
+            skipped.len(),
+            pluralize(skipped.len(), "file", "files"),
+            format_size(skipped_bytes)
+        );
+        for (plan, skip) in &skipped {
+            println!(
+                "    {}  {}: {}",
+                plan.repo_id,
+                snapshot_relative(&skip.path, &plan.repo_dir),
+                skip.reason
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Prints the snapshot directory path for a cached model.
 ///
 /// Resolves the named ref (default: `main`) to a commit hash and constructs
@@ -6026,6 +6367,9 @@ struct GcCacheNotes {
     duplicated_bytes: u64,
     /// Repos holding duplicated copies.
     duplicated_repos: usize,
+    /// Whether some model repo holds duplicated copies, which `cache dedupe`
+    /// reclaims (it takes models only).
+    duplicates_in_models: bool,
     /// Bytes on disk across the whole cache, `du`'s total.
     cache_bytes: u64,
     /// Dataset and Space repos, which `gc` never evicts.
@@ -6286,11 +6630,16 @@ fn render_gc_plan_preview(plan: &GcPlan, notes: &GcCacheNotes) {
         notes.duplicated_repos,
         notes.cache_bytes,
     ) {
+        let reclaim = if notes.duplicates_in_models {
+            " `hf-fm cache dedupe` reclaims them and keeps every model."
+        } else {
+            ""
+        };
         println!(
             "  gc selects whole repos by age and budget and does not deduplicate: \
              removing models to recover space that deduplication would recover \
              without losing any is what this figure warns against. `hf-fm du` \
-             names the copies per repo."
+             names the copies per repo.{reclaim}"
         );
     }
     if notes.other_repos > 0 {
@@ -6369,6 +6718,7 @@ fn run_cache_gc(
             .chain(&others)
             .filter(|s| s.duplicated_bytes > 0)
             .count(),
+        duplicates_in_models: summaries.iter().any(|s| s.duplicated_bytes > 0),
         cache_bytes: cache_bytes_on_disk(
             summaries
                 .iter()

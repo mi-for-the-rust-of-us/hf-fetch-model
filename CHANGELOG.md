@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`hf-fm cache dedupe [REPO_ID...] [--dry-run] [--yes] [--verify]`** reclaims
+  the duplicated copies that `du`'s `DUP` column has named since v0.12.5
+  ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)):
+  each snapshot file that holds the same bytes as its blob is replaced with a
+  hard link to that blob, so every model stays and its second copy goes. With
+  no argument it covers every cached model (models only, as `cache gc`); a
+  numeric index is the `#` of the last `du`, and the repo each index resolved to
+  is printed, `--yes` or not. It previews per repo the most it can reclaim
+  (`up to`, since the plan pairs by length), prompts once unless `--yes`, then
+  compares every copy with its blob byte for byte before replacing it, and
+  reports what it reclaimed, the bytes it read and how fast, and every file it
+  left alone with the reason. `--dry-run` previews without reading anything.
+  `--verify` also hashes each copy against the SHA-256 its blob is named by and
+  leaves a pair alone if they disagree; a git-stored file's blob, named by a git
+  hash, is linked and counted as unchecked. A repo with a partial download or
+  a held download lock is skipped whole, with a pointer to `cache
+  clean-partial`. The reclaimed figure can exceed `DUP` where two cached
+  revisions copy one blob: `DUP` counts the blob once, and dedupe frees both
+  copies.
+- **`du`, `du <repo>` and `cache gc --dry-run` point to `cache dedupe`** where a
+  model repo holds duplicated copies. The footer's link to issue #21 is gone;
+  copies in dataset and Space repos get no pointer, since the command takes
+  models only.
 - **`cache::plan_dedupe` and `cache::apply_dedupe`**
   ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)):
   the library side of reclaiming the duplicated copies. `plan_dedupe(repo_id)`
