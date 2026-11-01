@@ -13,10 +13,10 @@ This folder archives comments drafted or posted on upstream issues (primarily [h
 
 | Thread | Opened by | Last activity | Attached PR | Next step for us |
 |---|---|---|---|---|
-| [candle #3617](https://github.com/huggingface/candle/issues/3617): unbounded pickle-VM working set | us | our comment, 2026-07-30 | **our [#3628](https://github.com/huggingface/candle/pull/3628)**: open, no review since 2026-06-18 | Ask for a review on #3628: it is now the only open fix for #3620's memo replay too (see next row) |
-| [candle #3620](https://github.com/huggingface/candle/issues/3620): pickle memo bomb | professor-moody | our comment, 2026-06-30 | [#3688](https://github.com/huggingface/candle/pull/3688) **closed unmerged** by its author 2026-08-21, after astorise noted that #3628 covers the same attack | Same as above |
+| [candle #3617](https://github.com/huggingface/candle/issues/3617): unbounded pickle-VM working set | us | our comment, 2026-07-30 | **our [#3628](https://github.com/huggingface/candle/pull/3628)**: open; `repeat_n` fix pushed and status comment ([p1](candle-3628-p1.md)) posted 2026-11-01; both CI runs at `action_required` | None: awaiting workflow approval and a review |
+| [candle #3620](https://github.com/huggingface/candle/issues/3620): pickle memo bomb | professor-moody | our comment, 2026-06-30 | [#3688](https://github.com/huggingface/candle/pull/3688) **closed unmerged** by its author 2026-08-21, after astorise noted that #3628 covers the same attack | None: covered by the #3628 comment (bounds the memo replay; offers to add #3620 to its closing references) |
 | [candle #3530](https://github.com/huggingface/candle/issues/3530): memory left unused on Spark | sempervictus | our [p3](candle-3530-p3.md), 2026-11-01, answering maintainer ivarflakstad's 2026-08-16 question (do our numbers look right, to close) | none | None: the maintainer decides whether to close |
-| [candle #3619](https://github.com/huggingface/candle/issues/3619): `Long1` panic | professor-moody | our comment, 2026-06-30 | [#3626](https://github.com/huggingface/candle/pull/3626) (satyakwok): open, no review | None |
+| [candle #3619](https://github.com/huggingface/candle/issues/3619): `Long1` panic | professor-moody | our comment, 2026-06-30 | [#3626](https://github.com/huggingface/candle/pull/3626) (satyakwok): open, no review; conflicts with #3628 on the same `LONG1` lines | None: the #3628 comment offers to rebase onto #3626 if it lands first |
 | [candle #3448](https://github.com/huggingface/candle/issues/3448): Gemma 4 load | AlpineVibrations | our comment ([p5](candle-3448-p5.md)), 2026-04-26 | [#3608](https://github.com/huggingface/candle/pull/3608) (eddyb): draft, idle since 2026-06-12 | None |
 | [candle #3401](https://github.com/huggingface/candle/issues/3401): LightOnOCR-2-1B | Abhinav5132 | our comment, 2026-04-16 | [#3772](https://github.com/huggingface/candle/pull/3772) (the reporter): open | None |
 | [candle #2875](https://github.com/huggingface/candle/issues/2875): F8_E4M3 quantize error | AlpineVibrations | our comment, 2026-08-24 | none | None |
@@ -101,6 +101,7 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [candle-3401-p1.md](candle-3401-p1.md) | candle #3401 — LightOnOCR-2-1B | Posted |
 | [candle-3530-p1.md](candle-3530-p1.md) | candle #3530 — 80B NVFP4 fit / double-mapping diagnostic ask | Posted (2026-05-12) |
 | [candle-3530-p2.md](candle-3530-p2.md) | candle #3530 — best-guess repo identification + corrected on-disk math | Posted (2026-05-13) |
+| [candle-3628-p1.md](candle-3628-p1.md) | candle PR #3628 — status after 4½ months: re-verified on `main`, `repeat_n` fix, re-fuzzed, scope since June (#3688 closed; overlaps #3626 and #3961); reviewed with fresh eyes before posting | Posted (2026-11-01) |
 | [candle-3530-p3.md](candle-3530-p3.md) | candle #3530 — answering the maintainer: figures re-checked, the ~14 GiB is a remainder, the 18 GiB KV pool is the configured context (xinfer at `cf9b63b`) | Posted (2026-11-01) |
 | [candle-3617-p1.md](candle-3617-p1.md) | candle #3617 — `.pth` pickle-VM DoS (issue we opened) | Posted |
 | [candle-3617-p2.md](candle-3617-p2.md) | candle #3617 — PR #3628 announced | Posted |
