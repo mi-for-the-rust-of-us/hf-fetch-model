@@ -827,8 +827,81 @@ async fn dispatch_download(
         result
     };
 
+    // Prevention (v0.12.6, issue #21): `hf-hub` never tries a symlink on
+    // Windows, so the pointer it just wrote is a full copy of its blob. Where
+    // the listing names the file's SHA-256, link it to `blobs/<sha256>`.
+    // Best-effort: the download has succeeded either way. A pointer the
+    // chunked path already linked is recognised by identity, without a read.
+    // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
+    if let Ok(pointer) = &result
+        && let Some(sha256) = metadata_map
+            .get(file.filename.as_str())
+            .and_then(|m| m.sha256.as_deref())
+    {
+        link_pointer_to_blob(cache_dir, repo_id, sha256, pointer).await;
+    }
+
     log_download_result(file.filename.as_str(), &result, file_size, start.elapsed());
     result
+}
+
+/// Replaces a freshly downloaded pointer that is a copy of its blob with a
+/// hard link to it, on a blocking thread: see
+/// [`link_pointer_to_blob_blocking`]. Logs the outcome and never fails.
+async fn link_pointer_to_blob(
+    cache_dir: &std::path::Path,
+    repo_id: &str,
+    sha256: &str,
+    pointer: &std::path::Path,
+) {
+    // BORROW: explicit .to_path_buf()/.to_owned() — owned values move into the blocking task
+    let (cache_dir, repo_id, sha256, pointer_owned) = (
+        cache_dir.to_path_buf(),
+        repo_id.to_owned(),
+        sha256.to_owned(),
+        pointer.to_path_buf(),
+    );
+    let outcome = tokio::task::spawn_blocking(move || {
+        link_pointer_to_blob_blocking(&cache_dir, &repo_id, &sha256, &pointer_owned)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(Some(linked))) => {
+            tracing::debug!(pointer = %pointer.display(), outcome = ?linked, "pointer is one file with its blob");
+        }
+        Ok(Ok(None)) => {} // EXPLICIT: nothing to link (a symlink already, no such blob, or other bytes)
+        Ok(Err(e)) => {
+            tracing::debug!(pointer = %pointer.display(), error = %e, "pointer left as a copy of its blob");
+        }
+        Err(e) => {
+            tracing::debug!(pointer = %pointer.display(), error = %e, "linking task failed; pointer left as is");
+        }
+    }
+}
+
+/// The blocking core of [`link_pointer_to_blob`]: links `pointer` to
+/// `blobs/<sha256>` in `repo_id`'s cache directory when the two hold the same
+/// bytes (see `cache::link_copy_to_blob`, which compares them byte for byte
+/// rather than trusting the name).
+///
+/// `Ok(None)` when `sha256` is not a plain name, the blob does not exist, or
+/// there is nothing to link.
+fn link_pointer_to_blob_blocking(
+    cache_dir: &std::path::Path,
+    repo_id: &str,
+    sha256: &str,
+    pointer: &std::path::Path,
+) -> std::io::Result<Option<crate::cache::LinkOutcome>> {
+    // The SHA-256 comes from the Hub's listing and names a path below.
+    if !crate::cache_layout::is_safe_hub_name(sha256) {
+        return Ok(None);
+    }
+    let repo_dir = crate::cache_layout::repo_dir(cache_dir, repo_id);
+    let blob = crate::cache_layout::blob_path(&repo_dir, sha256);
+    if !blob.is_file() {
+        return Ok(None);
+    }
+    crate::cache::link_copy_to_blob(pointer, &blob)
 }
 
 /// Collects download task results into a file map and failure list.
@@ -1352,6 +1425,46 @@ mod tests {
     )]
 
     use super::*;
+
+    /// The prevention step, on the layout `hf-hub` leaves on Windows: the
+    /// pointer is a copy of `blobs/<sha256>`, and becomes one file with it;
+    /// a blob of that name holding other bytes of the same length is never
+    /// linked; and a name that could leave the cache is not looked up.
+    #[test]
+    fn prevention_links_an_hf_hub_copy_to_the_blob_its_sha256_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = crate::cache_layout::repo_dir(tmp.path(), "org/model");
+        let sha = "9a3f7c1e0b2d4f6a8c0e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a";
+        let blob = crate::cache_layout::blob_path(&repo_dir, sha);
+        let pointer = crate::cache_layout::pointer_path(&repo_dir, "c0ffee", "model.bin");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        std::fs::write(&blob, vec![b'x'; 2048]).unwrap();
+        std::fs::copy(&blob, &pointer).unwrap();
+
+        let outcome = link_pointer_to_blob_blocking(tmp.path(), "org/model", sha, &pointer);
+
+        assert_eq!(outcome.unwrap(), Some(crate::cache::LinkOutcome::Linked));
+        assert!(crate::cache::same_physical_file(&pointer, &blob));
+
+        // Same name, same length, other bytes: a stale blob is not trusted.
+        let other = crate::cache_layout::pointer_path(&repo_dir, "c0ffe2", "model.bin");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, vec![b'y'; 2048]).unwrap();
+        let outcome = link_pointer_to_blob_blocking(tmp.path(), "org/model", sha, &other);
+        assert_eq!(outcome.unwrap(), None);
+        assert_eq!(std::fs::read(&other).unwrap(), vec![b'y'; 2048]);
+
+        // No such blob, or a name that is not one plain name: nothing to do.
+        assert_eq!(
+            link_pointer_to_blob_blocking(tmp.path(), "org/model", "feedface", &other).unwrap(),
+            None
+        );
+        assert_eq!(
+            link_pointer_to_blob_blocking(tmp.path(), "org/model", "../blobs/x", &other).unwrap(),
+            None
+        );
+    }
 
     /// Builds a fake hf-hub-style cache layout under `root`:
     /// `root/{repo_folder}/refs/main` (containing `commit_hash`) and

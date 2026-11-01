@@ -6195,6 +6195,44 @@ fn cache_dedupe_prints_the_repo_an_index_resolved_to_even_under_yes() {
     );
 }
 
+/// What the maintainer's cache showed: two snapshot files of one length, but
+/// only one blob, so the second holds bytes of its own. The plan counts both
+/// ("up to"); the comparison links one and leaves the other, with its reason,
+/// and a second run links nothing and says so.
+#[test]
+fn cache_dedupe_leaves_a_same_length_file_without_a_blob_and_says_so() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--layers", "e1", "a.bin", 4096);
+    let snapshot = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--layers")
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000");
+    std::fs::write(snapshot.join("b.bin"), vec![1_u8; 4096]).unwrap();
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "--yes"]));
+    assert!(success, "dedupe should succeed: {stderr}");
+    assert!(
+        stdout.contains("up to 8.0 KiB  test-org/layers  (2 files)")
+            && stdout.contains("Reclaimed 4.0 KiB: 1 file replaced by a hard link to its blob.")
+            && stdout.contains("Left alone: 1 file (4.0 KiB):")
+            && stdout.contains("b.bin: no blob of its length holds the same bytes"),
+        "one linked, one left alone with its reason, got:\n{stdout}"
+    );
+
+    let (again, again_err, again_ok) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "dedupe", "--yes"]));
+    assert!(again_ok, "a second run should succeed: {again_err}");
+    assert!(
+        again.contains("Nothing reclaimed: no candidate held the same bytes as a blob."),
+        "a second run links nothing and says so, got:\n{again}"
+    );
+}
+
 #[test]
 fn cache_dedupe_refuses_a_dataset_and_an_uncached_repo_before_anything_changes() {
     let dir = temp_hf_home();

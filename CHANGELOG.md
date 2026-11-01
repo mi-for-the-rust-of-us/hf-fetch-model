@@ -27,7 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a held download lock is skipped whole, with a pointer to `cache
   clean-partial`. The reclaimed figure can exceed `DUP` where two cached
   revisions copy one blob: `DUP` counts the blob once, and dedupe frees both
-  copies.
+  copies. The preview can exceed both where snapshot files share a length with
+  fewer blobs than files: a file with no blob of its own is compared, left
+  alone ("no blob of its length holds the same bytes"), and compared again by
+  a later run, which then says "Nothing reclaimed".
 - **`du`, `du <repo>` and `cache gc --dry-run` point to `cache dedupe`** where a
   model repo holds duplicated copies. The footer's link to issue #21 is gone;
   copies in dataset and Space repos get no pointer, since the command takes
@@ -65,6 +68,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A download on Windows no longer stores an LFS file twice.** Where a
+  symlink is refused (no Developer Mode, no elevation), the chunked path now
+  makes a hard link to the blob, and falls back to a copy only on a volume that
+  cannot hard-link (FAT32, exFAT). After `hf-hub`'s own path, which always
+  copies, the pointer is linked to `blobs/<sha256>` when the listing names the
+  file's SHA-256 and the two are byte-equal: never by name or length alone, so
+  a blob of that name holding other bytes is not trusted. Non-LFS files (named
+  by a git hash) may stay copies, for `cache dedupe`. On a fresh
+  `julien-c/dummy-unknown`, the `hf-hub` path now leaves 2.2 KiB of copies
+  instead of 276.5 KiB, and the chunked path none. The on-disk layout of new
+  Windows downloads is therefore a hard link where it was a copy; `hf-hub`,
+  `huggingface_hub` and candle-mi read it as before. Hard-linked names share
+  their bytes: editing one in place changes the other, as a symlink always did
+  on Unix. A re-download of the same etag by the chunked path renames a new
+  blob into place and leaves the old pointer's file as a copy, until the next
+  `cache dedupe`.
 - **New Windows-only dependency: `winapi-util` 0.1.11** (`Unlicense OR MIT`),
   for the file identity above. `std` exposes it only behind the unstable
   `windows_by_handle` feature, and this crate forbids `unsafe`. It was already

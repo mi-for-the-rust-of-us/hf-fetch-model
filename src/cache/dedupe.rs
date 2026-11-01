@@ -620,6 +620,47 @@ pub(crate) fn link_over(pointer: &Path, blob: &Path) -> std::io::Result<LinkOutc
     renamed.map(|()| LinkOutcome::Linked)
 }
 
+/// Links the pointer `hf-hub` just wrote as a copy to its blob, when the two
+/// hold the same bytes: the download path's prevention step (new in v0.12.6).
+///
+/// `Ok(None)` when there is nothing to do: the pointer is a link already (not
+/// a regular file), the blob is not a regular file, or the two differ in
+/// length or in content. Identity is checked before anything is read, so a
+/// pointer already linked to its blob costs no read. Otherwise the two are
+/// compared byte for byte, never matched by name or length alone: a blob left
+/// by an earlier download under the same name could hold other bytes (bit
+/// rot, or a listing that changed between the listing and the download), and
+/// linking to it would serve them.
+///
+/// # Errors
+///
+/// Returns the `std::io::Error` of a read or of [`link_over`].
+pub(crate) fn link_copy_to_blob(
+    pointer: &Path,
+    blob: &Path,
+) -> std::io::Result<Option<LinkOutcome>> {
+    let pointer_meta = std::fs::symlink_metadata(pointer)?;
+    let blob_meta = std::fs::symlink_metadata(blob)?;
+    if !pointer_meta.is_file() || !blob_meta.is_file() || pointer_meta.len() != blob_meta.len() {
+        return Ok(None);
+    }
+    let blob_id = physical_id(blob, &blob_meta);
+    if blob_id.is_some() && physical_id(pointer, &pointer_meta) == blob_id {
+        return Ok(Some(LinkOutcome::AlreadyLinked));
+    }
+    let mut bytes_read: u64 = 0;
+    if !files_equal(
+        pointer,
+        blob,
+        &mut CompareBuffers::new(),
+        &mut None,
+        &mut bytes_read,
+    )? {
+        return Ok(None);
+    }
+    link_over(pointer, blob).map(Some)
+}
+
 /// Suffix of the temporary name [`link_over`] creates a link under, beside
 /// the pointer it replaces.
 const TEMP_LINK_SUFFIX: &str = ".hf-fm-link.tmp";
@@ -1060,6 +1101,60 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// Prevention links an `hf-hub`-style copy to the blob of its bytes, and
+    /// refuses a same-length blob of other content: a name and a length are
+    /// never enough.
+    #[test]
+    fn link_copy_to_blob_links_equal_bytes_only() {
+        let bytes = content();
+        let (_tmp, _repo_dir, blob, snap) = repo(&sha256_hex(&bytes), &bytes);
+        let copy = snap.join("model.bin");
+        std::fs::copy(&blob, &copy).unwrap();
+        assert_eq!(
+            link_copy_to_blob(&copy, &blob).unwrap(),
+            Some(LinkOutcome::Linked)
+        );
+        assert_eq!(id(&copy), id(&blob));
+        assert_eq!(
+            link_copy_to_blob(&copy, &blob).unwrap(),
+            Some(LinkOutcome::AlreadyLinked),
+            "a second call reads nothing and changes nothing"
+        );
+
+        let stale = blob.with_file_name("0".repeat(64));
+        let mut other = bytes.clone();
+        other[7] ^= 0xff;
+        std::fs::write(&stale, &other).unwrap();
+        let fresh = snap.join("fresh.bin");
+        std::fs::write(&fresh, &bytes).unwrap();
+        assert_eq!(link_copy_to_blob(&fresh, &stale).unwrap(), None);
+        assert_eq!(
+            std::fs::read(&fresh).unwrap(),
+            bytes,
+            "the new bytes are kept"
+        );
+        assert_ne!(id(&fresh), id(&stale));
+    }
+
+    /// A pointer that is already a symlink is left alone.
+    #[test]
+    fn link_copy_to_blob_leaves_a_symlinked_pointer_alone() {
+        let (_tmp, _repo_dir, blob, snap) = repo("deadbeef", &[b'x'; 100]);
+        let pointer = snap.join("model.bin");
+        let target: PathBuf = ["..", "..", "blobs", "deadbeef"].iter().collect();
+        if !try_symlink(&target, &pointer) {
+            eprintln!("skipped: this platform refuses symlinks");
+            return;
+        }
+        assert_eq!(link_copy_to_blob(&pointer, &blob).unwrap(), None);
+        assert!(
+            std::fs::symlink_metadata(&pointer)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

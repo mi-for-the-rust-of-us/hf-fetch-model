@@ -28,6 +28,7 @@ pub use dedupe::{
     DedupeCandidate, DedupePlan, DedupeReport, DedupeSkip, DedupeSkipReason, apply_dedupe,
     plan_dedupe,
 };
+pub(crate) use dedupe::{LinkOutcome, link_copy_to_blob};
 
 /// Filename of the per-repo `hf-fm` snapshot sidecar.
 ///
@@ -573,11 +574,12 @@ pub struct CachedModelSummary {
     /// `huggingface_hub`'s shared blob store, which live outside it.
     ///
     /// It is not the sum of the snapshot's logical file sizes. Where a
-    /// snapshot entry is a full copy of its blob (always for files `hf-hub`
-    /// writes on Windows, which never tries a symlink there, and for this
-    /// crate's own writes whenever creating a symlink is refused), the repo
-    /// holds those bytes twice, so this figure can reach double the
-    /// snapshot's own size. Where the pointers are symlinks or hard links, only
+    /// snapshot entry is a full copy of its blob (files `hf-hub` writes on
+    /// Windows, which never tries a symlink there, until this crate links
+    /// them after the download or `cache dedupe` does; before v0.12.6, also
+    /// this crate's own writes whenever a symlink was refused), the repo holds
+    /// those bytes twice, so this figure can reach double the snapshot's own
+    /// size. Where the pointers are symlinks or hard links, only
     /// the blob's bytes count (on Windows since v0.12.6, which recognises a
     /// hard link there; before, one was counted twice). See `walk_repo_files`
     /// for why both directories are walked.
@@ -888,6 +890,7 @@ pub struct RepoUsage {
     /// same length exists that is neither a link nor the blob itself, each
     /// blob pairing with at most one entry. Detection is by length, so it
     /// is an estimate until [`verify_duplicates`] hashes the copies.
+    /// [`apply_dedupe`] reclaims them (since v0.12.6).
     pub duplicated_bytes: u64,
     /// Bytes of `blobs/` that neither a snapshot entry points at, nor a copy
     /// duplicates, nor a partial download owns (new in v0.12.5): blobs left
@@ -1476,6 +1479,19 @@ fn physical_id(path: &Path, meta: &std::fs::Metadata) -> Option<FileId> {
     Some((info.volume_serial_number(), info.file_index(), meta.len()))
 }
 
+/// Whether `a` and `b` name one physical file, following symlinks: a symlink
+/// to a file and the file, or two hard links. `false` when either cannot be
+/// read or the platform has no identity. For other modules' tests.
+#[cfg(test)]
+pub(crate) fn same_physical_file(a: &Path, b: &Path) -> bool {
+    let id = |p: &Path| {
+        std::fs::metadata(p)
+            .ok()
+            .and_then(|meta| physical_id(p, &meta))
+    };
+    id(a).is_some() && id(a) == id(b)
+}
+
 /// Counterpart of [`physical_id`] for platforms with no file identity.
 #[cfg(not(any(unix, windows)))]
 fn physical_id(_path: &Path, _meta: &std::fs::Metadata) -> Option<FileId> {
@@ -1555,12 +1571,16 @@ struct BlobRecord {
 ///
 /// The `HuggingFace` layout stores each file's bytes once, under
 /// `blobs/<etag>`, and puts a *pointer* at `snapshots/<commit>/<filename>`.
-/// That pointer is a symlink on Unix. On Windows it is usually a full copy,
-/// and the repo then holds the same bytes twice: `hf-hub` copies there
-/// unconditionally, never trying a symlink (its own comment says symlinks
-/// "require elevated privileges"), and [`crate::chunked`]'s
-/// `symlink_or_copy` tries one and falls back to `std::fs::copy` when it is
-/// refused, as it is without `SeCreateSymbolicLinkPrivilege`.
+/// That pointer is a symlink on Unix. On Windows it was usually a full copy
+/// until v0.12.6, and the repo then holds the same bytes twice: `hf-hub`
+/// copies there unconditionally, never trying a symlink (its own comment says
+/// symlinks "require elevated privileges"), and [`crate::chunked`]'s
+/// `symlink_or_copy` fell back to `std::fs::copy` when a symlink was refused,
+/// as it is without `SeCreateSymbolicLinkPrivilege`. Since v0.12.6 that
+/// fallback makes a hard link, this crate links `hf-hub`'s copy to its blob
+/// after the download where the listing names the file's `SHA256`, and
+/// `cache dedupe` reclaims the copies already there; a hard-linked pointer is
+/// the blob's own physical file, so it is counted once.
 ///
 /// Walking `snapshots/` alone, as this did until the fix for
 /// [issue #16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16),

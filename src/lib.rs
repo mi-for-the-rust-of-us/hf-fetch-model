@@ -231,7 +231,10 @@
 //! [`cache::RepoUsage`] splits a repo's footprint into the duplicated copies
 //! `hf-hub` leaves on Windows (a snapshot file stored again beside its blob),
 //! orphan blobs, partial downloads and bookkeeping, and
-//! [`cache::verify_duplicates`] hashes the copies against their blobs.
+//! [`cache::verify_duplicates`] hashes the copies against their blobs. Since
+//! v0.12.6 [`cache::plan_dedupe`] and [`cache::apply_dedupe`] reclaim them,
+//! replacing each copy with a hard link to the blob it equals, and a download
+//! on Windows leaves a hard link rather than a copy where it can.
 //! [`cache::cache_summary_all`] lists datasets and Spaces beside the models
 //! (each marked by [`cache::RepoType`]), where [`cache::cache_summary`] keeps to
 //! models so that eviction and status never reach a dataset;

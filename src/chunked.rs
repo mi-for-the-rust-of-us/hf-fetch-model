@@ -1137,11 +1137,17 @@ fn make_relative(src: &Path, dst: &Path) -> PathBuf {
     rel
 }
 
-/// Creates a symlink from `dst` pointing to `src`, or falls back to copy on Windows.
+/// Creates a symlink from `dst` pointing to `src`; on Windows, where one is
+/// refused, a hard link, and a copy only where neither can be made.
 ///
-/// On Windows, if symlink creation fails (e.g., `SeCreateSymbolicLinkPrivilege` is
-/// missing), the blob is **copied** rather than moved. This preserves the blob in
-/// `blobs/<etag>` for cross-revision deduplication.
+/// On Windows a symlink needs `SeCreateSymbolicLinkPrivilege` (Developer Mode
+/// or an elevated shell). Without it, a hard link to the blob (new in
+/// v0.12.6, issue #21) gives the same single physical file and needs no
+/// privilege; a copy is the last resort, on a volume that cannot hard-link
+/// (FAT32, exFAT). `dst` does not exist here, so `std::fs::hard_link` creates
+/// it directly; replacing an existing pointer is `cache::link_over`'s job.
+/// Either way the blob stays in `blobs/<etag>` for cross-revision
+/// deduplication.
 ///
 /// Diverges from `hf-hub`'s `symlink_or_rename()` which uses `rename` and destroys
 /// the blob — see Finding 2 of the v0.9.5 security audit.
@@ -1155,8 +1161,15 @@ fn symlink_or_copy(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     #[cfg(target_os = "windows")]
     {
         if std::os::windows::fs::symlink_file(&rel_src, dst).is_err() {
-            // Copy rather than rename to preserve the blob for cross-revision deduplication.
-            std::fs::copy(src, dst)?;
+            match std::fs::hard_link(src, dst) {
+                Ok(()) => {}
+                // A concurrent downloader created it first, as on Unix below.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // Copy rather than rename to preserve the blob for cross-revision deduplication.
+                Err(_) => {
+                    std::fs::copy(src, dst)?;
+                }
+            }
         }
     }
 
@@ -1285,6 +1298,29 @@ mod tests {
             crate::cache_layout::repo_folder_name("RWKV/RWKV7-Goose-World3-1.5B-HF"),
             "models--RWKV--RWKV7-Goose-World3-1.5B-HF"
         );
+    }
+
+    /// The chunked path's pointer is one physical file with its blob, a
+    /// symlink or (on Windows without symlink rights, since v0.12.6) a hard
+    /// link: which one cannot be forced, and `windows-latest` may allow
+    /// symlinks, so the assertion is the shared identity. The blob stays.
+    #[test]
+    fn symlink_or_copy_leaves_one_physical_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = tmp.path().join("blobs").join("e1");
+        let pointer = tmp.path().join("snapshots").join("c1").join("model.bin");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        std::fs::write(&blob, vec![b'x'; 4096]).unwrap();
+
+        symlink_or_copy(&blob, &pointer).unwrap();
+
+        assert!(crate::cache::same_physical_file(&pointer, &blob));
+        assert_eq!(std::fs::read(&pointer).unwrap(), vec![b'x'; 4096]);
+        assert!(blob.is_file(), "the blob is kept");
+        // A pointer that already exists is left as it is.
+        symlink_or_copy(&blob, &pointer).unwrap();
+        assert!(crate::cache::same_physical_file(&pointer, &blob));
     }
 
     #[test]

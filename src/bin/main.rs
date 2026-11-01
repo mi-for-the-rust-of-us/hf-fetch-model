@@ -5983,15 +5983,21 @@ fn run_cache_dedupe(
     }
     let elapsed = start.elapsed();
 
-    println!(
-        "\n  Reclaimed {}: {linked} {}.",
-        format_size(reclaimed),
-        pluralize(
-            linked,
-            "file replaced by a hard link to its blob",
-            "files replaced by hard links to their blobs"
-        ),
-    );
+    if linked == 0 {
+        // A file with no blob of its own but the length of one stays a
+        // candidate, so a later run can find nothing to link.
+        println!("\n  Nothing reclaimed: no candidate held the same bytes as a blob.");
+    } else {
+        println!(
+            "\n  Reclaimed {}: {linked} {}.",
+            format_size(reclaimed),
+            pluralize(
+                linked,
+                "file replaced by a hard link to its blob",
+                "files replaced by hard links to their blobs"
+            ),
+        );
+    }
     if bytes_read > 0 {
         let secs = elapsed.as_secs_f64();
         // CAST: u64 → f64 → u64, precision loss acceptable; a display-only throughput
