@@ -64,7 +64,7 @@ hf-fetch-model   (the library; the hf-fm CLI is behind feature "cli")
 | `http_range` | public | `HttpRangeReader`: the `Read + Seek` over HTTP Range requests that remote inspection runs on, with request and byte caps; the substrate under `inspect`'s entry points, for a reader-based parser of your own |
 | `header_cache` | public | Opt-in on-disk cache of parsed remote headers (`--cache-headers`), with its one-hour trust window |
 | `peek` | public | Small-file reads (`hf-fm peek`), with optional gzip decoding |
-| `cache` | public | Cache inspection, status, disk usage, verification and cleanup |
+| `cache` | public | Cache inspection, status, disk usage, verification and cleanup; its private `cache::dedupe` submodule (`cache/dedupe.rs`) replaces duplicated snapshot copies with hard links (`plan_dedupe` / `apply_dedupe`, re-exported from `cache`) and holds the one routine that swaps a pointer for a link, which the download path also uses |
 | `cache_layout` | public | Path construction for the HF cache layout and hf-fetch-model's sidecars |
 | `auth` | public | `resolve_token`: the token every request carries, explicit or found the way `huggingface_hub` finds one (`HF_TOKEN`, the `hf auth login` token file) |
 | `checksum` | public | SHA256 verification |

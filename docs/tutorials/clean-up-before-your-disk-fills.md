@@ -2,9 +2,9 @@
 
 *See what the HuggingFace cache holds, decide what to keep, and reclaim the rest — with a dry-run before anything is deleted.*
 
-*~2,430 words · about 10 min read*
+*~2,780 words · about 11 min read*
 
-<!-- Last updated: 2026-10-31, hf-fm v0.12.5 -->
+<!-- Last updated: 2026-11-01, hf-fm v0.12.6 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -35,6 +35,15 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    additions. The status / delete-prompt / verify / path blocks are older
    and unchanged. The 2026-10-10 narrative numbers (816 GiB, 75 repos) were
    replaced, not mixed with the new ones.
+
+   v0.12.6 (2026-11-01) adds the cache dedupe walkthrough, captured from
+   the release binary on the same cache: the dry run, then the real run of
+   the very preview shown (the reader sees it before the result), then a
+   du of the reclaimed cache (609 GiB). The v0.12.5 du / gc / du <repo>
+   blocks above it still describe the cache before dedupe, on purpose; only
+   their pointer lines were updated to the text v0.12.6 prints for that same
+   state (the footer note, the gc line, the du <repo> hint), since v0.12.5's
+   pointed to an issue that this release closes.
 3. Safety: every destructive command appears with --dry-run, or with its
    confirmation prompt visible and answered `n`. Never paste an output
    that shows an actual deletion the reader did not see previewed first.
@@ -65,6 +74,7 @@ The second tutorial in the v0.10 docs effort. If a step is confusing or an outpu
 - [The 30-second answer](#the-30-second-answer)
 - [Seeing: the `du` family](#seeing-the-du-family)
 - [Diagnosing one repo: `status`](#diagnosing-one-repo-status)
+- [Reclaiming the copies, keeping every model: `cache dedupe`](#reclaiming-the-copies-keeping-every-model-cache-dedupe)
 - [Acting: `delete`, `clean-partial`, `gc`](#acting-delete-clean-partial-gc)
 - [Trust, but verify: `cache verify`](#trust-but-verify-cache-verify)
 - [Scripting: `cache path`](#scripting-cache-path)
@@ -100,7 +110,7 @@ Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
   763.22 GiB  total (72 repos, 2839 files)
   By volume: C: 762.71 GiB · D: 525.44 MiB
   154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
-  Note: a duplicated copy is a snapshot file stored again beside its blob, which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; `--verify-duplicates` hashes the copies to confirm them. Reclaiming them is tracked in https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21.
+  Note: a duplicated copy is a snapshot file stored again beside its blob, which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; `--verify-duplicates` hashes the copies to confirm them. `hf-fm cache dedupe` replaces them with hard links to their blobs, keeping every model.
   ● = partial downloads
   → = relocated: the repo's directory is a link to where its bytes are
   Note: a size range means that repo's cached `.gguf` files are mutually exclusive quant alternatives rather than shards of one file — you likely only need one of them (see `du <repo>` for the exact file sizes). The total above still reflects real bytes on disk across every cached file.
@@ -128,11 +138,11 @@ Skipped (relocated behind a link; evicting them frees nothing here):
 
 Cache: 728.67 GiB → 282.79 GiB (free 445.88 GiB)
   154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
-  gc selects whole repos by age and budget and does not deduplicate: removing models to recover space that deduplication would recover without losing any is what this figure warns against. `hf-fm du` names the copies per repo.
+  gc selects whole repos by age and budget and does not deduplicate: removing models to recover space that deduplication would recover without losing any is what this figure warns against. `hf-fm du` names the copies per repo. `hf-fm cache dedupe` reclaims them and keeps every model.
 Note: 3 dataset or Space repos (34.55 GiB) not counted above; gc evicts models only.
 ```
 
-That preview says: every model untouched for six months, removed in one stroke, frees 445.88 GiB of the 728.67 GiB of models, about three fifths. Pick the threshold to fit your own cache: on this one, 90 days would have taken 702.54 GiB, nearly all of it, since most of it has sat idle for three months or more. Read the lines under `Cache:` before you trust the figure. On Windows the cache holds a second copy of many files (154.16 GiB here, which `du` names, below), and eviction removes whole models: it would delete models to recover space that deduplication would recover without losing any. And `gc` selects among models only, so the 34.55 GiB of datasets that `du` lists are not in its 728.67 GiB; the last line says so. The `note:` above the list is a repo, `gpt2`, that was moved to another disk behind a link: evicting it would free nothing here, so it is skipped. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
+That preview says: every model untouched for six months, removed in one stroke, frees 445.88 GiB of the 728.67 GiB of models, about three fifths. Pick the threshold to fit your own cache: on this one, 90 days would have taken 702.54 GiB, nearly all of it, since most of it has sat idle for three months or more. Read the lines under `Cache:` before you trust the figure. On Windows the cache holds a second copy of many files (154.16 GiB here, which `du` names, below), and eviction removes whole models: it would delete models to recover space that deduplication recovers without losing any. Run [`cache dedupe`](#reclaiming-the-copies-keeping-every-model-cache-dedupe) first. And `gc` selects among models only, so the 34.55 GiB of datasets that `du` lists are not in its 728.67 GiB; the last line says so. The `note:` above the list is a repo, `gpt2`, that was moved to another disk behind a link: evicting it would free nothing here, so it is skipped. When the list looks right, re-run without `--dry-run` and answer the prompt. The rest of the tutorial is what to check before you trust that list.
 
 ## Seeing: the `du` family
 
@@ -192,7 +202,7 @@ hf-fm du google/gemma-scope-2b-pt-res --verify-duplicates
   Verified 1 duplicated copy (72.04 MiB): identical to their blob.
 ```
 
-(That repo's 288 MiB file has no copy; the 72 MiB file is the duplicate, and `Verified` shows it holds its blob's bytes.) **Do not hard-link the copies by hand to reclaim them.** On Windows `du` cannot yet tell a hard-linked pointer from a copy, so the volume would free the bytes while `du` kept reporting them, and `cache delete` would keep promising to free them twice. Reclaiming them safely is the planned `cache dedupe` ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)).
+(That repo's 288 MiB file has no copy; the 72 MiB file is the duplicate, and `Verified` shows it holds its blob's bytes.) Reclaiming them without deleting a model is [`cache dedupe`](#reclaiming-the-copies-keeping-every-model-cache-dedupe), below. Since v0.12.6 `du` also recognises a hard link on Windows, so a pointer hard-linked to its blob, by `cache dedupe` or by hand, is counted once.
 
 Drill into one repo by its index:
 
@@ -213,9 +223,10 @@ hf-fm du 15
   14.24 GiB  total on disk
 
   duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B
+  `hf-fm cache dedupe microsoft/Phi-3.5-mini-instruct` replaces the duplicated copies with hard links to their blobs.
 ```
 
-The two totals differ, and not by rounding. The files as listed add up to 7.12 GiB, but the repo occupies 14.24 GiB, because each file is stored twice: as its blob in `blobs/`, and as a full copy under `snapshots/` where Linux and macOS would put a symlink. That is how hf-fm's downloads usually land on Windows, where creating a symlink needs Developer Mode or an elevated shell. The last line says it in numbers: all 7.12 GiB of the difference is duplicated copies (the same 7.12 GiB as in row 15's `DUP`), and the rest, 140 B, is bookkeeping (`refs/` and hf-fm's header cache). Together with the listed bytes the four figures add up to `total on disk`; a repo with an interrupted download adds a `partial downloads` figure, and a blob that nothing points at an `orphan blobs` one. The listing shows what the model is made of; `total on disk` is what deleting it frees, and it is the figure the whole-cache `du`, `cache gc` and `cache delete` all use. Where the two agree, as they do with symlinked entries on Linux and macOS, `du` prints a single `total` line.
+The two totals differ, and not by rounding. The files as listed add up to 7.12 GiB, but the repo occupies 14.24 GiB, because each file is stored twice: as its blob in `blobs/`, and as a full copy under `snapshots/` where Linux and macOS would put a symlink. That is how hf-fm's downloads landed on Windows before v0.12.6, where creating a symlink needs Developer Mode or an elevated shell; since then they hard-link LFS files to their blob instead, and `cache dedupe` reclaims the copies already there. The last line says it in numbers: all 7.12 GiB of the difference is duplicated copies (the same 7.12 GiB as in row 15's `DUP`), and the rest, 140 B, is bookkeeping (`refs/` and hf-fm's header cache). Together with the listed bytes the four figures add up to `total on disk`; a repo with an interrupted download adds a `partial downloads` figure, and a blob that nothing points at an `orphan blobs` one. The listing shows what the model is made of; `total on disk` is what deleting it frees, and it is the figure the whole-cache `du`, `cache gc` and `cache delete` all use. Where the two agree, as they do with symlinked entries on Linux and macOS, `du` prints a single `total` line.
 
 And `du --tree` renders the whole cache as one structural view — repos as branches, files as leaves sorted by size — which is where pathological layouts jump out (here, per-layer decoder shards stepping down from 10.97 GiB):
 
@@ -299,6 +310,57 @@ Downloaded to: …/models--NousResearch--Meta-Llama-3.1-8B/snapshots/1f47e50c…
 ```
 
 The shards pick up at 27–29% — exactly where `status` left them above — not 0%. The interrupted bytes counted. (The final `14.97 GiB` line is hf-fm reporting the file's full size, not the bytes fetched this run; the ~4 GiB already on disk is why it finished as fast as it did.) Clean partials only when you have decided *not* to resume.
+
+## Reclaiming the copies, keeping every model: `cache dedupe`
+
+On Windows, the cheapest gigabytes in the cache are the duplicated copies: deleting nothing gets them back. Since v0.12.6 `cache dedupe` replaces each snapshot file that holds the same bytes as its blob with a hard link to that blob, so the file is still there, and still read by hf-fm, `hf-hub` and Python's `huggingface_hub`, but its bytes exist once. Preview it first:
+
+```sh
+hf-fm cache dedupe --dry-run
+```
+
+```
+Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
+
+  up to   1.11 GiB  Qwen/Qwen3-0.6B-Base  (1 file)
+  up to   9.69 GiB  bartowski/Mistral-7B-Instruct-v0.3-GGUF  (5 files)
+…
+  up to  38.30 GiB  bluelightai/clt-qwen3-1.7b-base-20k  (54 files)
+…
+  up to   7.60 GiB  google/gemma-scope-2b-pt-transcoders  (27 files)
+…
+  up to   7.12 GiB  microsoft/Phi-3.5-mini-instruct  (2 files)
+…
+
+  Up to 155.00 GiB in 231 files across 21 repos. Each file is compared with its blob before it is replaced.
+  Dry run: nothing was compared or changed.
+```
+
+The preview reads nothing: it pairs every snapshot file with the blobs of its length, hence "up to". The real run compares each pair byte for byte before it touches anything, and links only the pairs that are equal. Without `--dry-run` it shows the same preview, asks once, and then:
+
+```
+  Reclaimed 154.16 GiB: 228 files replaced by hard links to their blobs.
+  Compared 309.23 GiB in 1 min 34 s (3.29 GiB/s).
+  Left alone: 3 files (864.40 MiB):
+    google/gemma-scope-2b-pt-transcoders  50eec2f25c60545a9a74c1c3a26a0afdd0b4b872\layer_0\width_16k\average_l0_76\params.npz: no blob of its length holds the same bytes
+    google/gemma-scope-2b-pt-transcoders  50eec2f25c60545a9a74c1c3a26a0afdd0b4b872\layer_12\width_16k\average_l0_6\params.npz: no blob of its length holds the same bytes
+    google/gemma-scope-2b-pt-transcoders  50eec2f25c60545a9a74c1c3a26a0afdd0b4b872\layer_25\width_16k\average_l0_41\params.npz: no blob of its length holds the same bytes
+```
+
+That is exactly the 154.16 GiB the `DUP` footer named, and `C:` gained it, to within a few hundred KiB of cluster slack. The 0.84 GiB the preview over-counted is the three files left alone: that repo holds 27 files of one length but only 24 blobs, so three of its files are stored in the snapshot alone and are not copies of anything; the comparison found that out, and says so. `du` afterwards:
+
+```
+    #                      SIZE  REPO                                                     FILES
+    1                159.05 GiB  mntss/clt-gemma-2-2b-2.5M                                   53
+    2                 40.62 GiB  bluelightai/clt-qwen3-1.7b-base-20k                         88
+    3                 34.54 GiB  datasets/TheQweaker/rented_boxes                          1952  ●
+…
+  ─────────────────────────────────────────────────────────────────────────────────────────────
+  609.07 GiB  total (72 repos, 2839 files)
+  By volume: C: 608.55 GiB · D: 525.44 MiB
+```
+
+The `DUP` column is gone, row 2 is half the size it was, and `du microsoft/Phi-3.5-mini-instruct` now prints a single `7.12 GiB  total (20 files)`. A second run finds the same three files, compares them again (a fraction of a second; they differ early) and reports `Nothing reclaimed`. Name repos (or `du` indexes) to limit it, add `--verify` to also check each copy against the SHA-256 its blob is named by, and note that a repo with a download in progress is skipped whole. Hard-linked files share their bytes, so editing one in place would change the other; no download tool does that. From v0.12.6 on, new downloads on Windows do not make the copy in the first place for LFS files.
 
 ## Acting: `delete`, `clean-partial`, `gc`
 
@@ -389,7 +451,7 @@ Protected by --except:
 
 Cache: 728.67 GiB → 390.12 GiB (free 338.55 GiB)
   154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
-  gc selects whole repos by age and budget and does not deduplicate: removing models to recover space that deduplication would recover without losing any is what this figure warns against. `hf-fm du` names the copies per repo.
+  gc selects whole repos by age and budget and does not deduplicate: removing models to recover space that deduplication would recover without losing any is what this figure warns against. `hf-fm du` names the copies per repo. `hf-fm cache dedupe` reclaims them and keeps every model.
 Note: 3 dataset or Space repos (34.55 GiB) not counted above; gc evicts models only.
 ```
 
@@ -440,6 +502,7 @@ cd (hf-fm cache path google/gemma-2-2b-it)         # PowerShell
 |----------|---------|
 | Where are the bytes? | `du`, `du --age`, `du --tree` (models, datasets and Spaces) |
 | What is stored twice (Windows)? | `du --sort dup`, `du <N>`, `du --verify-duplicates` |
+| Get the copies' space back, keeping every model | `cache dedupe` (`--dry-run` first; `--verify` to also hash) |
 | What's inside repo #N? | `du <N>` |
 | Is this repo healthy? | `status <repo>`, `cache verify <repo\|N>` |
 | Remove repos | `cache delete <repo\|N>...` (`--dry-run`; a repo behind a link loses the link, `--with-target` the bytes) |

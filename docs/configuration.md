@@ -284,4 +284,16 @@ for s in &summaries {
 }
 ```
 
-The two answer different questions. `cache_repo_usage` lists a repo's logical files, each at its own size. Since v0.12.2, `total_size` is the bytes the repo's whole directory occupies on disk, which is what deleting it would free. The two can differ: on Windows, where snapshot files are usually copies of their blobs rather than links, the repo holds those bytes twice.
+The two answer different questions. `cache_repo_usage` lists a repo's logical files, each at its own size. Since v0.12.2, `total_size` is the bytes the repo's whole directory occupies on disk, which is what deleting it would free. The two can differ: on Windows, where snapshot files written before v0.12.6 are copies of their blobs rather than links, the repo holds those bytes twice. `cache::plan_dedupe` and `cache::apply_dedupe` (since v0.12.6) replace each such copy with a hard link to its blob, after comparing the two byte for byte:
+
+```rust
+use hf_fetch_model::cache;
+
+let plan = cache::plan_dedupe("microsoft/Phi-3.5-mini-instruct")?;
+println!("up to {} bytes", plan.reclaimable_bytes());
+let report = cache::apply_dedupe(&plan, false); // `true` also hashes each copy
+println!("reclaimed {} bytes in {} files", report.reclaimed_bytes, report.linked);
+for skip in &report.skipped {
+    println!("left alone {}: {}", skip.path.display(), skip.reason);
+}
+```

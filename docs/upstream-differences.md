@@ -22,9 +22,9 @@ hf-fetch-model sends every chunk request to the Hub's `/resolve` URL and follows
 
 The HF cache links `snapshots/<commit>/<filename>` to `blobs/<etag>`. On Windows without `SeCreateSymbolicLinkPrivilege` (the default for non-admin users), Python's `huggingface_hub` cannot create the symlink and **moves** a newly downloaded blob out of `blobs/` into `snapshots/`. Its cache guide says as much: without symlinks the cache keeps files in `snapshots/` directly, so a file may be downloaded again for every revision that contains it.
 
-hf-fetch-model tries a symlink first and falls back to a **copy**, keeping the blob in `blobs/<etag>` for the next revision. The cost is the file held twice on disk, which `du` reports since v0.12.2. `hf-hub` 1.0 also copies on Windows (it does not try a symlink there at all), so files `hf-hub` writes for hf-fetch-model keep their blob too.
+hf-fetch-model tries a symlink first, then (since v0.12.6) a **hard link** to the blob, and falls back to a **copy** only on a volume that cannot hard-link (FAT32, exFAT). Either way the blob stays in `blobs/<etag>` for the next revision, and with a hard link the bytes exist once, as with a symlink. `hf-hub` 1.0 copies on Windows (it does not try a symlink there at all), so files `hf-hub` writes for hf-fetch-model keep their blob too; since v0.12.6 hf-fetch-model then replaces that copy with a hard link to `blobs/<sha256>` when the listing names the file's SHA-256 and the two are byte-equal. Until v0.12.6 every such file was held twice on disk, which `du` reports since v0.12.2 and names since v0.12.5; `hf-fm cache dedupe` reclaims those copies. Python's `huggingface_hub` and `hf-hub` both read a hard-linked pointer as cached, and both remove a pointer before rewriting it, so neither writes through the link into the blob.
 
-**File:** `chunked.rs` (`symlink_or_copy`).
+**Files:** `chunked.rs` (`symlink_or_copy`), `download.rs` (`link_pointer_to_blob`), `cache/dedupe.rs` (`link_over`).
 
 ---
 

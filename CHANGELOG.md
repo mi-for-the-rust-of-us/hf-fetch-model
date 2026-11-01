@@ -84,6 +84,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on Unix. A re-download of the same etag by the chunked path renames a new
   blob into place and leaves the old pointer's file as a copy, until the next
   `cache dedupe`.
+- **The docs reclaim the copies instead of warning against it.** The cache
+  tutorial gains a `cache dedupe` walkthrough captured from the release binary
+  on the maintainer's cache (the dry run, the run of that very preview, and
+  `du` after it: 763.22 GiB down to 609.07 GiB), the README a reclaim example
+  and a command-table row, the CLI reference a *Cache dedupe flags* section,
+  and the FAQ an entry on getting the space back. The v0.12.5 warning against
+  hard-linking the copies by hand is gone from the README, the tutorial, the
+  FAQ and the CLI reference, since a hand-made hard link is now counted once,
+  and the statements that Windows downloads hold every file twice
+  (`upstream-differences.md`, `configuration.md`, the tutorial's two totals)
+  now say until when. The v0.12.5 `du` and `gc` captures still show the cache
+  before the reclaim; only their pointer lines were updated to v0.12.6's text.
 - **New Windows-only dependency: `winapi-util` 0.1.11** (`Unlicense OR MIT`),
   for the file identity above. `std` exposes it only behind the unstable
   `windows_by_handle` feature, and this crate forbids `unsafe`. It was already

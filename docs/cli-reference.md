@@ -23,6 +23,7 @@ cargo install hf-fetch-model --features cli
 - [Other commands](#other-commands)
 - [Cache commands](#cache-commands)
 - [Cache clean-partial flags](#cache-clean-partial-flags)
+- [Cache dedupe flags](#cache-dedupe-flags)
 - [Cache delete flags](#cache-delete-flags)
 - [Cache gc flags](#cache-gc-flags)
 - [Cache verify flags](#cache-verify-flags)
@@ -49,6 +50,7 @@ cargo install hf-fetch-model --features cli
 | `download-file <REPO_ID> <FILENAME>` | Download a single file (or glob pattern) and print its cache path |
 | `du [REPO_ID\|N]` | Show cache disk usage — per-repo breakdown (by name or `#` index), or cache-wide summary of models, datasets and Spaces, with the duplicated copies named |
 | `cache clean-partial [REPO_ID\|N]` | Remove interrupted downloads' temp files (`.chunked.part`, and `hf-hub` / `huggingface_hub`'s `.incomplete`) |
+| `cache dedupe [REPO_ID\|N]...` | Reclaim the duplicated copies: replace each snapshot file that equals its blob with a hard link to it (every cached model when no repo is given), `--dry-run` to preview |
 | `cache delete <REPO_ID\|N>...` | Delete cached repos (each `models--org--name/` directory): several per call, `--dry-run` to preview, a repo moved behind a link loses the link only |
 | `cache path <REPO_ID\|N>` | Print the snapshot directory path for scripting |
 | `cache verify <REPO_ID\|N>` | Re-verify SHA256 digests of cached files against HuggingFace LFS metadata |
@@ -437,14 +439,14 @@ hf-fm du datasets/wikitext
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--age` | Show a last-modified age column (e.g., `2 days ago`, `3 months ago`) | off |
-| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,repo_type,size,shared_bytes?,duplicated_bytes,relocated_to?,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,duplicated_bytes,total_files,repo_count,shared_store_bytes?,volume_bytes?,verification?}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max`, with the same meaning as in `list-files --json`, are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down `{cache_dir,repo_id,repo_type,files[{filename,size}],total_bytes,listed_bytes,duplicated_bytes,orphan_blob_bytes,partial_bytes,bookkeeping_bytes,relocated_to?,shared_bytes?,file_count,has_partial,quant_alternatives,size_min,size_max,verification?}` with the same quant-range fields. A repo's `size` and `total_bytes`, and the flat view's top-level `total_bytes`, are **bytes on disk**: everything in the repo's directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars), each physical file counted once, plus the payloads the repo links to in `huggingface_hub`'s shared blob store (see below), so the flat view's `size` equals `du <REPO_ID> --json`'s `total_bytes` for the same repo. Per-file `size`, and so `size_min`/`size_max`, is each file's own size, and `listed_bytes` (since v0.12.2) is the sum of `files[].size`. It is smaller than `total_bytes` where snapshot entries are copies of their blobs, which they always are for files `hf-hub` writes on Windows, and larger where symlinked entries share one blob, as across several cached revisions. Before v0.12.2, `total_bytes` was that sum ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)). | off |
+| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,repo_type,size,shared_bytes?,duplicated_bytes,relocated_to?,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,duplicated_bytes,total_files,repo_count,shared_store_bytes?,volume_bytes?,verification?}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max`, with the same meaning as in `list-files --json`, are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down `{cache_dir,repo_id,repo_type,files[{filename,size}],total_bytes,listed_bytes,duplicated_bytes,orphan_blob_bytes,partial_bytes,bookkeeping_bytes,relocated_to?,shared_bytes?,file_count,has_partial,quant_alternatives,size_min,size_max,verification?}` with the same quant-range fields. A repo's `size` and `total_bytes`, and the flat view's top-level `total_bytes`, are **bytes on disk**: everything in the repo's directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars), each physical file counted once, plus the payloads the repo links to in `huggingface_hub`'s shared blob store (see below), so the flat view's `size` equals `du <REPO_ID> --json`'s `total_bytes` for the same repo. Per-file `size`, and so `size_min`/`size_max`, is each file's own size, and `listed_bytes` (since v0.12.2) is the sum of `files[].size`. It is smaller than `total_bytes` where snapshot entries are copies of their blobs, as files `hf-hub` writes on Windows were until v0.12.6 (and are until `cache dedupe`, for a cache filled before it), and larger where symlinked entries share one blob, as across several cached revisions. Before v0.12.2, `total_bytes` was that sum ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)). | off |
 | `--sort KEY` | Order the summary (and `--json`'s `repos`) by `size` (the default) or `dup`, the bytes stored twice as duplicated copies. The `#` column stays each repo's rank by size, which is what `du <N>` takes. Conflicts with a repo argument and with `--tree`. | `size` |
 | `--verify-duplicates` | Hash every duplicated copy and compare it with its blob's name (the SHA-256 of an LFS file's content). Reads each copy once, so it takes minutes on tens of GiB, and reports each repo on stderr as it starts. Copies that differ are listed; git-stored files, whose blob is named by a git hash, are counted as unverifiable; copies that cannot be read (locked, permissions) are counted as unreadable and the rest are still checked. In `--json`, a `verification` object: `{identical,identical_bytes,unreadable,unreadable_bytes,differs,differs_bytes,unverifiable,unverifiable_bytes,differing[],unreadable_repos[]}`. The exit status stays 0; `unreadable` and `differs` are what a script checks. Conflicts with `--tree`. | off |
 | `--tree` | Hierarchical tree view: repos as branches, files as leaves, using box-drawing connectors. Composes with `--age` and `--json`; conflicts with the positional repo argument (the per-repo view is already covered by `du <REPO_ID>`). | off |
 
 Since v0.12.5 `du` lists every repo the cache holds: models, datasets and Spaces, so its total is the cache's. A dataset or Space is addressed behind its Hub prefix (`datasets/<org>/<name>`, `spaces/<org>/<name>`), which the `REPO` column prints, and a `#` index works for any of them; a bare name (`gpt2`) resolves when it names a cached model. `repo_type` in `--json` is `model`, `dataset` or `space`.
 
-**Duplicated copies.** Where a snapshot file is stored again beside its blob (what `hf-hub` leaves on Windows, which never tries a symlink), `du` adds a `DUP` column beside `SIZE` and a footer, `154.16 GiB of 763.22 GiB are duplicated copies (21 repos)`. The column appears only when some repo has copies, so a cache of symlinks prints as it always did. A blob counts when a snapshot file of the same length that is neither a link nor the blob itself exists in the same repo, each blob pairing with one file; a blob that a symlink or hard link points at does not. `du <REPO_ID>` ends with the gap in figures, `duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B`, which with the listed bytes add up to `total on disk` (where the listing is the larger, as for symlinked entries sharing one blob across revisions, it keeps the note that names the possibilities). Do not hard-link the copies by hand: on Windows `du` cannot yet tell a hard-linked pointer from a copy, so the volume would free the bytes while `du` kept reporting them.
+**Duplicated copies.** Where a snapshot file is stored again beside its blob (what `hf-hub` leaves on Windows, which never tries a symlink), `du` adds a `DUP` column beside `SIZE` and a footer, `154.16 GiB of 763.22 GiB are duplicated copies (21 repos)`. The column appears only when some repo has copies, so a cache of symlinks prints as it always did. A blob counts when a snapshot file of the same length that is neither a link nor the blob itself exists in the same repo, each blob pairing with one file; a blob that a symlink or hard link points at does not. `du <REPO_ID>` ends with the gap in figures, `duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B`, which with the listed bytes add up to `total on disk` (where the listing is the larger, as for symlinked entries sharing one blob across revisions, it keeps the note that names the possibilities). [`cache dedupe`](#cache-dedupe-flags) reclaims the copies; the footer, `du <REPO_ID>` and `cache gc --dry-run` point to it where a model repo holds some. Since v0.12.6 a hard-linked pointer is recognised on Windows too (by volume serial number and file index), so it is counted once and is not a duplicate.
 
 **Relocated repos.** A repo whose cache entry is a symlink or a Windows junction to a directory elsewhere (moved to another disk) is marked with `→` and its target, reported as `relocated_to` in `--json`, and named in `du <REPO_ID>`. Every figure still counts it; when the bytes sit on more than one volume the footer adds `By volume: C: 762.71 GiB · D: 525.44 MiB` (`volume_bytes` in `--json`).
 
@@ -504,6 +506,33 @@ Removes hf-fm's `.chunked.part` temp blobs with their `.state` sidecars, and sin
 |------|-------------|---------|
 | `--dry-run` | Preview what would be removed without deleting | off |
 | `--yes` | Skip confirmation prompt | off |
+
+```sh
+# Reclaim the duplicated copies of every cached model (preview, then prompt)
+hf-fm cache dedupe
+
+# Preview only: what each repo could reclaim, nothing read or changed
+hf-fm cache dedupe --dry-run
+
+# Some repos, by name or index; also hash each copy against its blob's name
+hf-fm cache dedupe microsoft/Phi-3.5-mini-instruct 15 --verify
+```
+
+## Cache dedupe flags
+
+Replaces each snapshot file that holds the same bytes as one of its repo's blobs with a hard link to that blob (new in v0.12.6, [#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)): the model keeps every file, and the second copy that `hf-hub` leaves on Windows (`du`'s `DUP`) goes. With no argument it covers every cached model; models only, as `cache gc`. Arguments resolve as `cache delete`'s do, and every index prints the repo it resolved to, `--yes` or not.
+
+The preview pairs each snapshot file that holds bytes of its own with the blobs of its length and reads nothing, so it says `up to`. The run then compares each file with those blobs byte for byte, stopping at the first difference, and links it to the one it equals; the link is made under a temporary name and renamed over the file, so the file is never missing. It reports what it reclaimed (what the volume gains, to within one cluster per file), the bytes it read and how fast, and every file it left alone with the reason: its blob is a symlink into `huggingface_hub`'s shared store (a hard link to it would dangle), no blob of its length holds the same bytes, the file is in use by another process, or the volume cannot hard-link (FAT32, exFAT). A repo with a partial download or a held download lock is skipped whole, checked again before anything is touched; finish the download or run `cache clean-partial` first. A file left alone does not fail the command.
+
+The reclaimed figure can be larger than `DUP`, which counts a blob once, where two cached revisions both copy it: both copies go. The preview can be larger than both where a repo holds more files of one length than blobs of that length: the files without a blob of their own are compared and left alone, by this run and every later one (which then says `Nothing reclaimed`). On the maintainer's cache, 154.16 GiB in 228 files across 21 repos were reclaimed out of a preview of 155.00 GiB, comparing 309.23 GiB in 1 min 34 s.
+
+Hard-linked names share their bytes: editing one of them in place changes the other, as editing a file behind a symlink always did on Unix. No download tool writes through one: `hf-hub` and `huggingface_hub` remove a pointer before they rewrite it, and hf-fm renames a new blob into place. All three read a hard-linked pointer as cached.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--dry-run` | Print what could be reclaimed, without reading, linking or prompting | off |
+| `--yes` | Skip confirmation prompt | off |
+| `--verify` | Also hash each copy while comparing it, and check the digest against the SHA-256 its blob is named by (LFS files). A pair whose bytes are equal but do not hash to that name (both corrupt alike) is left alone and reported; a git-stored file, whose blob is named by a git hash, is linked and counted as linked without a hash check. Byte equality alone already refuses a copy that differs from its blob | off |
 
 ```sh
 # Delete a cached model (interactive prompt)

@@ -62,6 +62,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 |---------|-------------|
 | `hf-fm <REPO_ID>` *(default)* | Download a model (multi-connection, auto-tuned) |
 | `hf-fm cache clean-partial` | Remove interrupted downloads' temp files: hf-fm's `.chunked.part`, and the `.incomplete` files `hf-hub` / `huggingface_hub` leave (a download still running is skipped) |
+| `hf-fm cache dedupe [REPO_ID\|N]...` | Reclaim the duplicated copies (Windows): replace each snapshot file that equals its blob with a hard link to it, keeping every model; `--dry-run` to preview |
 | `hf-fm cache delete <REPO_ID\|N>...` | Delete cached repos: several per call, `--dry-run` to preview; a repo moved to another disk behind a link loses the link only |
 | `hf-fm cache gc --older-than/--max-size` | Garbage-collect cached models by age and/or size budget |
 | `hf-fm cache path <REPO_ID\|N>` | Print snapshot directory path (for scripting) |
@@ -352,7 +353,7 @@ $ hf-fm cache path google/gemma-2-2b-it
 
 ### Duplicated copies, datasets, and repos moved to another disk
 
-On Windows `hf-hub` never tries a symlink, so every file is stored twice: as its blob and as a full copy in `snapshots/`. `du` counts both (they occupy the disk) and, since 0.12.5, names the second copy: a `DUP` column beside `SIZE` (only when some repo has copies, so the Linux and macOS output above is unchanged), and a footer. The listing also covers datasets and Spaces, so its total is the cache's, and a repo moved to another disk behind a junction or symlink is marked with its target and the footer splits the bytes by volume. From a 763 GiB Windows cache:
+On Windows `hf-hub` never tries a symlink, so until 0.12.6 every file was stored twice: as its blob and as a full copy in `snapshots/`. `du` counts both (they occupy the disk) and, since 0.12.5, names the second copy: a `DUP` column beside `SIZE` (only when some repo has copies, so the Linux and macOS output above is unchanged), and a footer. The listing also covers datasets and Spaces, so its total is the cache's, and a repo moved to another disk behind a junction or symlink is marked with its target and the footer splits the bytes by volume. From a 763 GiB Windows cache, before `cache dedupe` (below):
 
 ```
 $ hf-fm du
@@ -369,7 +370,7 @@ Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
   763.22 GiB  total (72 repos, 2839 files)
   By volume: C: 762.71 GiB · D: 525.44 MiB
   154.16 GiB of 763.22 GiB are duplicated copies (21 repos)
-  Note: a duplicated copy is a snapshot file stored again beside its blob, which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; `--verify-duplicates` hashes the copies to confirm them. Reclaiming them is tracked in https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21.
+  Note: a duplicated copy is a snapshot file stored again beside its blob, which is how hf-hub writes on Windows. `du <repo>` shows each repo's share; `--verify-duplicates` hashes the copies to confirm them. `hf-fm cache dedupe` replaces them with hard links to their blobs, keeping every model.
   ● = partial downloads
   → = relocated: the repo's directory is a link to where its bytes are
 
@@ -381,7 +382,30 @@ $ hf-fm du microsoft/Phi-3.5-mini-instruct
   14.24 GiB  total on disk
 
   duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B
+  `hf-fm cache dedupe microsoft/Phi-3.5-mini-instruct` replaces the duplicated copies with hard links to their blobs.
 ```
+
+Since 0.12.6 `cache dedupe` reclaims them: each copy is compared with its blob byte for byte and replaced with a hard link to it, so the model keeps every file and the second copy goes. The preview pairs by length and reads nothing, hence "up to"; the result is what it reclaimed, and every file it left alone is named with its reason. On the same cache:
+
+```
+$ hf-fm cache dedupe --yes
+Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
+
+  up to   1.11 GiB  Qwen/Qwen3-0.6B-Base  (1 file)
+  up to   9.69 GiB  bartowski/Mistral-7B-Instruct-v0.3-GGUF  (5 files)
+…
+  up to   7.12 GiB  microsoft/Phi-3.5-mini-instruct  (2 files)
+…
+  Up to 155.00 GiB in 231 files across 21 repos. Each file is compared with its blob before it is replaced.
+
+  Reclaimed 154.16 GiB: 228 files replaced by hard links to their blobs.
+  Compared 309.23 GiB in 1 min 34 s (3.29 GiB/s).
+  Left alone: 3 files (864.40 MiB):
+    google/gemma-scope-2b-pt-transcoders  50eec2f25c60545a9a74c1c3a26a0afdd0b4b872\layer_0\width_16k\average_l0_76\params.npz: no blob of its length holds the same bytes
+…
+```
+
+`C:` gained 154.16 GiB, `du`'s total fell from 763.22 GiB to 609.07 GiB, its `DUP` column is gone, and `du microsoft/Phi-3.5-mini-instruct` now prints one `7.12 GiB  total (20 files)`. The three files left alone have the length of the repo's blobs but no blob of their own. New downloads on Windows no longer store LFS files twice: the chunked path makes a hard link where a symlink is refused, and the `hf-hub` path's copy is linked to its blob afterwards.
 
 `du --sort dup` puts the repos with the most copies first (`#` stays each repo's rank by size, which `du <N>` takes), and `du --verify-duplicates` hashes every copy against its blob's name to confirm it. A dataset or Space is addressed behind its Hub prefix, `hf-fm du datasets/wikitext`; a root-level repo by its bare name, `hf-fm du gpt2`. `cache delete` takes several repos and a `--dry-run`, and on a repo behind a link removes the link only (`--with-target` deletes the bytes too):
 
@@ -397,7 +421,7 @@ $ hf-fm cache delete gpt2 --dry-run
   Dry run: would delete 1 repo, freeing 0 B. Nothing was deleted.
 ```
 
-Do not hard-link the copies by hand to reclaim them: `du` cannot yet tell a hard-linked pointer from a copy on Windows, so the volume would free the bytes while `du` kept reporting them. Reclaiming them is the planned `cache dedupe` ([#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)). The [cache tutorial](docs/tutorials/clean-up-before-your-disk-fills.md) walks through all of it.
+The [cache tutorial](docs/tutorials/clean-up-before-your-disk-fills.md) walks through all of it.
 
 ## Library quick start
 
@@ -436,7 +460,7 @@ Filter, progress, auth, and more via the builder — see [Configuration](docs/co
 | [FAQ](docs/FAQ.md) | Common questions — installation, auth, cache location, discovery, errors |
 | [Inspect tutorial](docs/tutorials/inspect-before-downloading.md) | Walkthrough: read tensor metadata, size, and architecture without downloading weights |
 | [Quant tutorial](docs/tutorials/pick-a-quant-that-fits.md) | Walkthrough: compare a base model's quantized siblings and plan which one fits your GPU before downloading it (`quants --fits`, `--cache-headers`) |
-| [Cache tutorial](docs/tutorials/clean-up-before-your-disk-fills.md) | Walkthrough: see what the cache holds, then reclaim disk space safely (`du` → `status` → `cache gc`) |
+| [Cache tutorial](docs/tutorials/clean-up-before-your-disk-fills.md) | Walkthrough: see what the cache holds, then reclaim disk space safely (`du` → `status` → `cache dedupe` → `cache gc`) |
 | [Case studies](docs/case-studies/) | Real investigations where `inspect` did the diagnostic work — per-layer shape variation, OOM forensics from a crash log, and remote GGUF inspect before and after growing read-ahead (up to 11.7× faster) |
 | [Search](docs/search.md) | Comma filtering, `--exact`, model card metadata |
 | [Configuration](docs/configuration.md) | Builder API, presets, progress callbacks |
