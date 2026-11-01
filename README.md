@@ -396,6 +396,7 @@ Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
 …
   up to   7.12 GiB  microsoft/Phi-3.5-mini-instruct  (2 files)
 …
+
   Up to 155.00 GiB in 231 files across 21 repos. Each file is compared with its blob before it is replaced.
 
   Reclaimed 154.16 GiB: 228 files replaced by hard links to their blobs.

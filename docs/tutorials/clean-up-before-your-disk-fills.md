@@ -13,8 +13,8 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    the reader as "you", short paragraphs over bullet lists where prose
    works.
 2. Reproducibility: unlike the inspect tutorial, there is no revision to
-   pin — the cache is machine-local. Output blocks come from three capture
-   sessions on the same machine. The du / gc blocks are from 2026-10-10
+   pin — the cache is machine-local. Output blocks come from capture
+   sessions on the same machine, dated below. The du / gc blocks are from 2026-10-10
    (816 GiB, 75 repos), recaptured for v0.12.2, whose du counts bytes on
    disk, everything in each repo's directory (issue #16); the 2026-06-11
    captures they replace counted snapshot files only. The status / delete /
@@ -37,16 +37,20 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    replaced, not mixed with the new ones.
 
    v0.12.6 (2026-11-01) adds the cache dedupe walkthrough, captured from
-   the release binary on the same cache: the dry run, then the real run of
-   the very preview shown (the reader sees it before the result), then a
-   du of the reclaimed cache (609 GiB). The v0.12.5 du / gc / du <repo>
+   a --release build of main on the same cache: the dry run, then the real
+   run (with --yes) of the very preview shown, whose result block starts
+   after that repeated preview, then a du of the reclaimed cache (609 GiB),
+   trimmed after its first rows and its totals. The v0.12.5 du / gc / du <repo>
    blocks above it still describe the cache before dedupe, on purpose; only
    their pointer lines were updated to the text v0.12.6 prints for that same
    state (the footer note, the gc line, the du <repo> hint), since v0.12.5's
-   pointed to an issue that this release closes.
+   pointed to issue #21, which this release resolves.
 3. Safety: every destructive command appears with --dry-run, or with its
    confirmation prompt visible and answered `n`. Never paste an output
    that shows an actual deletion the reader did not see previewed first.
+   The one exception is cache dedupe, which deletes no model and loses no
+   byte: its real run is shown, but only after its --dry-run preview, and
+   the reader is told to run the preview first.
    The partial-download captures (status PARTIAL rows, clean-partial dry
    run, the resume run) were produced by deliberately interrupting a
    `--preset safetensors` download of the ungated mirror
@@ -336,9 +340,10 @@ Cache: C:\Users\Eric JACOPIN\.cache\huggingface\hub
   Dry run: nothing was compared or changed.
 ```
 
-The preview reads nothing: it pairs every snapshot file with the blobs of its length, hence "up to". The real run compares each pair byte for byte before it touches anything, and links only the pairs that are equal. Without `--dry-run` it shows the same preview, asks once, and then:
+The preview reads nothing: it pairs every snapshot file with the blobs of its length, hence "up to". The real run compares each pair byte for byte before it touches anything, and links only the pairs that are equal. Without `--dry-run` it shows the same preview and asks once (this run used `--yes`, which skips the question), and then, while it reports each repo on stderr as it starts:
 
 ```
+…
   Reclaimed 154.16 GiB: 228 files replaced by hard links to their blobs.
   Compared 309.23 GiB in 1 min 34 s (3.29 GiB/s).
   Left alone: 3 files (864.40 MiB):
@@ -358,9 +363,10 @@ That is exactly the 154.16 GiB the `DUP` footer named, and `C:` gained it, to wi
   ─────────────────────────────────────────────────────────────────────────────────────────────
   609.07 GiB  total (72 repos, 2839 files)
   By volume: C: 608.55 GiB · D: 525.44 MiB
+…
 ```
 
-The `DUP` column is gone, row 2 is half the size it was, and `du microsoft/Phi-3.5-mini-instruct` now prints a single `7.12 GiB  total (20 files)`. A second run finds the same three files, compares them again (a fraction of a second; they differ early) and reports `Nothing reclaimed`. Name repos (or `du` indexes) to limit it, add `--verify` to also check each copy against the SHA-256 its blob is named by, and note that a repo with a download in progress is skipped whole. Hard-linked files share their bytes, so editing one in place would change the other; no download tool does that. From v0.12.6 on, new downloads on Windows do not make the copy in the first place for LFS files.
+The `DUP` column is gone, row 2 is half the size it was, and `du microsoft/Phi-3.5-mini-instruct` now prints a single `7.12 GiB  total (20 files)`. A second run finds the same three files, compares them again (a fraction of a second; they differ early) and reports `Nothing reclaimed`. Name repos (or `du` indexes) to limit it, add `--verify` to also check each copy against the SHA-256 its blob is named by, and note that a repo with a download in progress, or one interrupted and left to resume, is skipped whole. Hard-linked files share their bytes, so editing one in place would change the other; no download tool does that. From v0.12.6 on, new downloads on Windows do not stay stored twice for LFS files: the chunked path makes a hard link where a symlink is refused, and the copy `hf-hub` writes is linked to its blob once the download is done.
 
 ## Acting: `delete`, `clean-partial`, `gc`
 
