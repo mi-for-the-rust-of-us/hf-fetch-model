@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     copied, the destination's free space, and what becomes of the original;
     `--dry-run` stops there, and otherwise it prompts once unless `--yes`. A
     numeric index prints the repo it resolved to, `--yes` or not; datasets and
-    Spaces are addressed as `datasets/org/name`.
+    Spaces are addressed behind their Hub prefix (`datasets/org/name`,
+    `spaces/org/name`).
   - A byte progress bar on a terminal, a line per file otherwise. The result
     states the source volume's free space before and after, and the change.
   - Interrupted, it resumes when run again, copying only what is missing;
@@ -50,18 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [cache roadmap](docs/roadmaps/cache-management-roadmap.md#v0130--cache-move-repo_id-dir-relocate-a-repo-to-another-disk).
   `plan_move` reads only: it refuses a repo with a download in progress, a
   repo holding a link that points outside it (`huggingface_hub`'s shared blob
-  store), a destination inside the cache or already present, and a volume
+  store), a destination inside the cache or already present, a destination on
+  a network share (which a Windows junction cannot lead to), and a volume
   without room, and it counts what an interrupted earlier run already copied.
-  `apply_move` copies into `<DIR>/.hf-fm-move/<folder>.partial`. Each file is
-  hashed with SHA-256 as it is copied, flushed, read back and hashed again,
-  and gets its final name, modification time and permissions only when the
-  digests agree. Hard links inside the repo stay hard links, so a
-  deduplicated repo stays deduplicated. Then it swaps the cache entry for a
-  link to `<DIR>/<folder>`, checks the tree through the link, and drops the
-  original, or keeps it with `keep_original`. On Windows the link is a
-  junction, which needs no privilege; on Unix, a symlink. A repo already
-  behind a link moves again, and `plan_move_back` brings its bytes back into
-  the cache.
+  `apply_move` first links the cache to its staging directory and reads a
+  file through that link, so a destination the link cannot reach fails before
+  any byte is copied; then it copies into `<DIR>/.hf-fm-move/<folder>.partial`.
+  Each file is hashed with SHA-256 as it is copied, flushed, read back and
+  hashed again, and gets its final name, modification time and permissions
+  only when the digests agree. Hard links inside the repo stay hard links, so
+  a deduplicated repo stays deduplicated. Then it swaps the cache entry for a
+  link to `<DIR>/<folder>`, checks the tree through the link against the
+  staged one (so a volume with coarse timestamps, such as FAT32 or exFAT,
+  cannot fail the check), and drops the original, or keeps it with
+  `keep_original`. On Windows the link is a junction, which needs no
+  privilege, and a cache entry that cannot be set aside because a file inside
+  it is open (a sharing or lock violation, a mapped file) is reported as in
+  use, with what to do; on Unix the link is a symlink. A repo already behind
+  a link moves again, and `plan_move_back` brings its bytes back into the
+  cache.
   - **Interruptible.** A staged file with the source's length and
     modification time is trusted, so a rerun copies only what is missing. The
     cache entry set aside during the swap (`<cache>/.hf-fm-move/<folder>.swap`)

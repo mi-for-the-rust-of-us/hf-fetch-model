@@ -795,22 +795,22 @@ const TEMP_LINK_END: &str = ".tmp";
 /// Windows system error codes `std` maps to no specific `ErrorKind`, or (for
 /// `ACCESS_DENIED`) to one that means something else here.
 #[cfg(windows)]
-mod win_error {
+pub(super) mod win_error {
     /// `ERROR_INVALID_FUNCTION`: what FAT32 and exFAT answer to a hard link.
-    pub(super) const INVALID_FUNCTION: i32 = 1;
+    pub(in crate::cache) const INVALID_FUNCTION: i32 = 1;
     /// `ERROR_ACCESS_DENIED`: what a rename over a file in use or read-only
     /// answers (see `rename_error`).
-    pub(super) const ACCESS_DENIED: i32 = 5;
+    pub(in crate::cache) const ACCESS_DENIED: i32 = 5;
     /// `ERROR_SHARING_VIOLATION`: another process opened the file without
     /// sharing it.
-    pub(super) const SHARING_VIOLATION: i32 = 32;
+    pub(in crate::cache) const SHARING_VIOLATION: i32 = 32;
     /// `ERROR_LOCK_VIOLATION`: another process locked part of the file.
-    pub(super) const LOCK_VIOLATION: i32 = 33;
+    pub(in crate::cache) const LOCK_VIOLATION: i32 = 33;
     /// `ERROR_NOT_SUPPORTED`: the volume does not support the request.
-    pub(super) const NOT_SUPPORTED: i32 = 50;
+    pub(in crate::cache) const NOT_SUPPORTED: i32 = 50;
     /// `ERROR_USER_MAPPED_FILE`: the file is memory-mapped by a process, as
     /// a model loader maps its weights.
-    pub(super) const USER_MAPPED_FILE: i32 = 1224;
+    pub(in crate::cache) const USER_MAPPED_FILE: i32 = 1224;
 }
 
 /// The skip reason for an I/O error met while comparing or linking.

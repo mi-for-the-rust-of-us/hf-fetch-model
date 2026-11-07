@@ -71,9 +71,18 @@ const DROP_SUFFIX: &str = ".drop";
 /// volume can hold one, inside [`MOVE_DIR_NAME`].
 const PROBE_SUFFIX: &str = ".probe";
 
+/// Name of the empty file written into the staging directory to probe it:
+/// read through a link to check the link can be followed, then hard-linked to
+/// check the volume can hard-link.
+const PROBE_FILE: &str = ".hf-fm-probe";
+
 /// Suffix of a file being copied, beside its final name in the staging
 /// directory.
 const COPY_TEMP_SUFFIX: &str = ".hf-fm-copy.tmp";
+
+/// How far a staged file's modification time may be from the source's and
+/// still match: FAT32's two-second resolution.
+const MTIME_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Size of each read while copying and hashing, in bytes: 1 MiB.
 const COPY_BLOCK: usize = 1 << 20;
@@ -228,8 +237,10 @@ pub struct MoveReport {
     /// Bytes those files hold.
     pub copied_bytes: u64,
     /// Files an interrupted earlier run had already copied and verified,
-    /// kept as they were. Their bytes are not hashed again, so a blob whose
-    /// name they did not match was reported by that run only.
+    /// kept as they were. Their bytes are not hashed again, so a blob among
+    /// them whose content does not match its name is not reported in
+    /// [`name_mismatches`](Self::name_mismatches) (`hf-fm cache verify`
+    /// checks every blob).
     pub resumed_files: usize,
     /// Bytes those files hold.
     pub resumed_bytes: u64,
@@ -427,14 +438,17 @@ pub fn apply_move(plan: &MovePlan, keep_original: bool) -> Result<MoveReport, Fe
 /// cut short is dropped (or kept), but only once the cache entry is seen to
 /// hold every file the original holds. An original that is still in the way
 /// stops the move there. For [`MoveKind::Finish`] that is all; otherwise the
-/// move is planned again, and must still be the move `plan` describes. Before
-/// any byte is copied, a link to the destination's
-/// parent is created and removed, so a volume that cannot hold one fails
-/// here; a volume that cannot hard-link gets separate copies instead. The
-/// source is walked again after the copy and must not have changed. Any
-/// failure before the swap leaves the cache entry untouched and the staged
-/// files in place for the next run; a failure during the swap, or a check
-/// through the new link that does not match, puts the entry back.
+/// move is planned again, and must still be the move `plan` describes.
+///
+/// Before any byte is copied, a link from the cache to the staging directory
+/// is created, a file is read through it, and the link is removed, so a
+/// destination the cache cannot link to, or whose link does not lead there,
+/// fails at once; a volume that cannot hard-link gets separate copies
+/// instead. After the copy the source is walked again and must not have
+/// changed, and the staged tree must hold what the source holds. Any failure
+/// before the swap leaves the cache entry untouched and the staged files in
+/// place for the next run; a failure during the swap, or a tree read through
+/// the new link that is not the staged one, puts the entry back.
 ///
 /// With `keep_original`, an original that was a directory in the cache is
 /// kept at `<cache>/.hf-fm-move/<folder>`, and one behind a link stays where
@@ -444,15 +458,25 @@ pub fn apply_move(plan: &MovePlan, keep_original: bool) -> Result<MoveReport, Fe
 /// # Errors
 ///
 /// Returns [`FetchError::InvalidArgument`] if the cache changed since the
-/// plan into a different move, if a kept original is in the way of
-/// `keep_original`, if an original an interrupted move left cannot be dropped
-/// or kept, if the source changed during the copy, or if the copy did not
-/// read back as copied through the new link (the swap is then undone).
+/// plan into a different move, or in any of the ways [`plan_move`] refuses.
+/// Returns [`FetchError::InvalidArgument`] if a kept original is in the way
+/// of `keep_original`.
+/// Returns [`FetchError::InvalidArgument`] if an original an interrupted
+/// move left cannot be dropped or kept, and is in the way of the swap.
+/// Returns [`FetchError::InvalidArgument`] if the cache cannot link to the
+/// destination, or a link to it does not lead there.
+/// Returns [`FetchError::InvalidArgument`] if the destination's volume cannot
+/// hard-link and lacks the room for separate copies of the hard-linked files.
+/// Returns [`FetchError::InvalidArgument`] if the source changed during the
+/// copy, or the staged tree does not hold what the source holds.
+/// Returns [`FetchError::InvalidArgument`] if the tree read through the new
+/// link is not the one copied (the swap is then undone).
 /// Returns [`FetchError::Checksum`] if a copy does not read back as the bytes
 /// copied.
-/// Returns [`FetchError::Io`] on a filesystem failure; a cache entry that
-/// cannot be swapped because a file inside it is open is reported with
-/// [`std::io::ErrorKind::ResourceBusy`].
+/// Returns [`FetchError::Io`] if the cache entry cannot be set aside or
+/// replaced (the swap is then undone); a file inside it in use is reported
+/// with [`std::io::ErrorKind::ResourceBusy`].
+/// Returns [`FetchError::Io`] on any other filesystem failure.
 pub fn apply_move_with_progress<F>(
     plan: &MovePlan,
     keep_original: bool,
@@ -544,10 +568,21 @@ where
             fresh.staging.display()
         )));
     }
+    // The staged tree, as the destination's volume records it: the swap is
+    // checked against it, since a volume with coarse timestamps (FAT32,
+    // exFAT) rounds the source's modification times.
+    let staged = walk(&fresh.staging)?;
+    if !same_tree(&fresh.entries, &staged, false) {
+        return Err(FetchError::InvalidArgument(format!(
+            "the copy at {} does not hold what {} holds (it is kept, and the next run copies only the difference)",
+            fresh.staging.display(),
+            fresh.repo_type.address(&fresh.repo_id)
+        )));
+    }
 
     on_event(MoveEvent::Swapping);
     swap(&fresh)?;
-    check_swapped(&fresh)?;
+    check_swapped(&fresh, &staged)?;
     report.original = Some(settle_aside(&fresh, keep_original, &mut on_event));
     // The move directories, once empty; one holding a kept original stays.
     for move_dir in [fresh.staging.parent(), fresh.aside.parent()]
@@ -826,9 +861,11 @@ fn plan_in(
 
     // The directory the bytes are read from now, and the one they are read
     // from once the aside is back.
+    // BORROW: explicit .clone() for owned PathBuf, keeping `current_target` for `source`
     let walk_from = current_target.clone().unwrap_or_else(|| current.clone());
     // BORROW: explicit .clone() for owned PathBuf
     let source = current_target.unwrap_or_else(|| entry.clone());
+    // BORROW: explicit .to_path_buf() for owned PathBuf
     let staging_parent = if matches!(kind, MoveKind::Back { .. }) {
         cache_dir.to_path_buf()
     } else {
@@ -944,8 +981,8 @@ fn count_entries(plan: &mut MovePlan) {
     }
 }
 
-/// Refuses a destination inside the cache or the source, and one that
-/// already exists.
+/// Refuses a destination inside the cache or the source, one that already
+/// exists, and one on a network share.
 fn check_destination(
     plan: &MovePlan,
     walk_from: &Path,
@@ -959,6 +996,12 @@ fn check_destination(
         return Err(FetchError::InvalidArgument(format!(
             "{} already exists (refusing to merge {address} into it; remove it or choose another directory)",
             plan.destination.display()
+        )));
+    }
+    if is_network_path(staging_parent) {
+        return Err(FetchError::InvalidArgument(format!(
+            "{} is on a network share, which a junction cannot lead to (choose a local volume)",
+            staging_parent.display()
         )));
     }
     let inside = |outer: &Path| {
@@ -982,6 +1025,18 @@ fn check_destination(
     Ok(())
 }
 
+/// Whether `path` names a network share: a UNC path (`\\server\share`), as
+/// `canonicalize` also returns for a drive letter mapped to one. A Windows
+/// junction cannot lead there (the system refuses to follow it); a symlink on
+/// Unix can, and its paths never take this form.
+fn is_network_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..))
+    )
+}
+
 /// Whether a download into the repo whose cache folder is `folder` is in
 /// progress or was interrupted: a partial download in `source`'s `blobs/`,
 /// or a download lock another process holds.
@@ -1003,9 +1058,7 @@ fn guarded_target(link: &Path, folder: &str, address: &str) -> Result<PathBuf, F
     let target = std::fs::canonicalize(link)
         .map(strip_verbatim_prefix)
         .map_err(|e| {
-            FetchError::InvalidArgument(format!(
-                "{address} links to a target that cannot be read ({e})"
-            ))
+            FetchError::InvalidArgument(format!("failed to resolve the link of {address}: {e}"))
         })?;
     if target.file_name().and_then(std::ffi::OsStr::to_str) != Some(folder) {
         return Err(FetchError::InvalidArgument(format!(
@@ -1186,12 +1239,24 @@ fn same_tree(a: &[Entry], b: &[Entry], with_times: bool) -> bool {
 /// Whether the staged file at `staged` can be trusted as a verified copy: a
 /// regular file with the source's length and modification time, which only a
 /// verified copy is given before it takes its final name.
+///
+/// The times are compared to within [`MTIME_TOLERANCE`], since a volume with
+/// coarse timestamps stores the time it was given rounded (FAT32 to two
+/// seconds, exFAT to ten milliseconds); a file rewritten since it was staged
+/// has a time far from the one the copy was given.
 fn staged_matches(staged: &Path, len: u64, modified: Option<SystemTime>) -> bool {
+    let Some(modified) = modified else {
+        return false;
+    };
     std::fs::symlink_metadata(staged).is_ok_and(|meta| {
         meta.is_file()
             && meta.len() == len
-            && modified.is_some()
-            && meta.modified().ok() == modified
+            && meta.modified().is_ok_and(|staged_time| {
+                let gap = staged_time
+                    .duration_since(modified)
+                    .or_else(|_| modified.duration_since(staged_time));
+                gap.is_ok_and(|gap| gap <= MTIME_TOLERANCE)
+            })
     })
 }
 
@@ -1252,31 +1317,18 @@ fn prepare(plan: &MovePlan) -> Result<bool, FetchError> {
     std::fs::create_dir_all(&plan.staging).map_err(|e| io(&plan.staging, e))?;
 
     if !matches!(plan.kind, MoveKind::Back { .. }) {
-        let probe = move_dir_child(&plan.cache_dir, &plan.folder, PROBE_SUFFIX);
-        if let Some(parent) = probe.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-        }
-        // A probe an interrupted run left is a link of ours; anything else at
-        // that name is not, and makes the creation below fail.
-        if std::fs::symlink_metadata(&probe).is_ok_and(|m| m.file_type().is_symlink()) {
-            remove_dir_link(&probe).map_err(|e| io(&probe, e))?;
-        }
-        let target = plan.destination.parent().unwrap_or(&plan.staging);
-        create_dir_link(target, &probe).map_err(|e| {
-            FetchError::InvalidArgument(format!(
-                "{} cannot be linked to from the cache ({e}); choose a local volume that supports {}",
-                target.display(),
-                if cfg!(windows) { "junctions" } else { "symlinks" }
-            ))
-        })?;
-        remove_dir_link(&probe).map_err(|e| io(&probe, e))?;
+        let probed = probe_link(plan);
+        // The cache's move directory, made for the probe, once empty: until
+        // the swap, nothing of the move is left in the cache.
+        let _ = std::fs::remove_dir(plan.cache_dir.join(MOVE_DIR_NAME));
+        probed?;
     }
 
     if plan.hard_links == 0 {
         return Ok(true);
     }
-    let probe_file = plan.staging.join(".hf-fm-probe");
-    let probe_link = plan.staging.join(".hf-fm-probe.link");
+    let probe_file = plan.staging.join(PROBE_FILE);
+    let probe_link = plan.staging.join(format!("{PROBE_FILE}.link"));
     let _ = std::fs::remove_file(&probe_link);
     std::fs::write(&probe_file, b"").map_err(|e| io(&probe_file, e))?;
     let works = std::fs::hard_link(&probe_file, &probe_link).is_ok();
@@ -1310,6 +1362,58 @@ fn prepare(plan: &MovePlan) -> Result<bool, FetchError> {
     Ok(works)
 }
 
+/// Creates a link from the cache to the staging directory, as the swap will
+/// to the destination beside it, reads a file through it, and removes it. A
+/// destination the cache cannot link to, or whose link the system does not
+/// follow (a junction to a network share), fails here, before any byte is
+/// copied.
+fn probe_link(plan: &MovePlan) -> Result<(), FetchError> {
+    let io = |path: &Path, e: std::io::Error| FetchError::Io {
+        // BORROW: explicit .to_path_buf() for owned PathBuf
+        path: path.to_path_buf(),
+        source: e,
+    };
+    let kind = if cfg!(windows) {
+        "junctions"
+    } else {
+        "symlinks"
+    };
+    let probe = move_dir_child(&plan.cache_dir, &plan.folder, PROBE_SUFFIX);
+    if let Some(parent) = probe.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+    }
+    // A probe an interrupted run left is a link of ours; anything else at
+    // that name is not, and makes the creation below fail.
+    if std::fs::symlink_metadata(&probe).is_ok_and(|m| m.file_type().is_symlink()) {
+        remove_dir_link(&probe).map_err(|e| io(&probe, e))?;
+    }
+    let marker = plan.staging.join(PROBE_FILE);
+    std::fs::write(&marker, b"").map_err(|e| io(&marker, e))?;
+    let linked = create_dir_link(&plan.staging, &probe);
+    let followed = linked.is_ok() && probe.join(PROBE_FILE).is_file();
+    let removed = if linked.is_ok() {
+        remove_dir_link(&probe)
+    } else {
+        Ok(())
+    };
+    let _ = std::fs::remove_file(&marker);
+    if let Err(e) = linked {
+        return Err(FetchError::InvalidArgument(format!(
+            "failed to link the cache to {} (choose a local volume that supports {kind}): {e}",
+            plan.staging.display()
+        )));
+    }
+    removed.map_err(|e| io(&probe, e))?;
+    if !followed {
+        return Err(FetchError::InvalidArgument(format!(
+            "a link from the cache to {} does not lead there (choose a local volume; {kind} \
+             cannot reach every kind of volume, network shares included)",
+            plan.staging.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Removes from the staging directory whatever the repo does not hold (files
 /// it no longer has, an interrupted copy's temp files), so the staged tree
 /// becomes the repo's exactly.
@@ -1318,9 +1422,11 @@ fn prune_staging(plan: &MovePlan) -> Result<(), FetchError> {
     let wanted: HashMap<&Path, &EntryKind> = plan
         .entries
         .iter()
+        // BORROW: explicit .as_path() for &PathBuf → &Path map key
         .map(|e| (e.rel.as_path(), &e.kind))
         .collect();
     for e in &staged {
+        // BORROW: explicit .as_path() for &PathBuf → &Path map key
         let keep = match (wanted.get(e.rel.as_path()), &e.kind) {
             (Some(EntryKind::Dir), EntryKind::Dir)
             | (Some(EntryKind::File { .. }), EntryKind::File { .. }) => true,
@@ -1541,6 +1647,7 @@ where
     if copy_digest != source_digest {
         let _ = std::fs::remove_file(&temp);
         return Err(FetchError::Checksum {
+            // BORROW: explicit .to_string() for Path → String
             filename: dst.display().to_string(),
             expected: source_digest,
             actual: copy_digest,
@@ -1590,42 +1697,92 @@ fn swap(plan: &MovePlan) -> Result<(), FetchError> {
     };
     if let Err(e) = swapped {
         let _ = std::fs::rename(&plan.aside, &plan.entry);
+        remove_move_dir_if_empty(plan);
         return Err(e);
     }
     Ok(())
 }
 
-/// The error for a cache entry that cannot be set aside: "in use" when the
-/// system says so, which on Windows is a file open inside the directory.
-fn in_use_error(plan: &MovePlan, e: std::io::Error) -> FetchError {
-    let e = rename_error(e);
-    if e.kind() == std::io::ErrorKind::ResourceBusy {
-        return FetchError::Io {
-            // BORROW: explicit .clone() for owned PathBuf
-            path: plan.entry.clone(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::ResourceBusy,
-                format!(
-                    "in use by another program (close it and run again; the copy at {} is kept and resumes): {e}",
-                    plan.staging.display()
-                ),
-            ),
-        };
-    }
-    FetchError::Io {
-        // BORROW: explicit .clone() for owned PathBuf
-        path: plan.entry.clone(),
-        source: e,
+/// Removes the cache's move directory once an undone swap has emptied it, so
+/// a failed move leaves nothing in the cache. One holding anything stays.
+fn remove_move_dir_if_empty(plan: &MovePlan) {
+    if let Some(move_dir) = plan.aside.parent() {
+        let _ = std::fs::remove_dir(move_dir);
     }
 }
 
+/// The error for a cache entry that cannot be set aside, saying what to do.
+///
+/// On Windows a file open inside the directory (a model a program has
+/// loaded) makes the rename fail with a sharing violation, a lock violation,
+/// or a mapped-file error, reported with [`std::io::ErrorKind::ResourceBusy`];
+/// or with "access denied", which can also mean the directory is read-only or
+/// not the user's, so its kind is kept. Elsewhere only a busy error is
+/// recognised.
+fn in_use_error(plan: &MovePlan, e: std::io::Error) -> FetchError {
+    let Some((kind, what)) = in_use_cause(&e) else {
+        return FetchError::Io {
+            // BORROW: explicit .clone() for owned PathBuf
+            path: plan.entry.clone(),
+            source: e,
+        };
+    };
+    FetchError::Io {
+        // BORROW: explicit .clone() for owned PathBuf
+        path: plan.entry.clone(),
+        source: std::io::Error::new(
+            kind,
+            format!(
+                "{what} (close any program using it and run again; the copy at {} is kept and resumes): {e}",
+                plan.staging.display()
+            ),
+        ),
+    }
+}
+
+/// The kind and the reading of an error that means a file inside the cache
+/// entry is in use, or `None` for any other error.
+fn in_use_cause(e: &std::io::Error) -> Option<(std::io::ErrorKind, &'static str)> {
+    #[cfg(windows)]
+    {
+        use super::dedupe::win_error::{
+            ACCESS_DENIED, LOCK_VIOLATION, SHARING_VIOLATION, USER_MAPPED_FILE,
+        };
+        match e.raw_os_error() {
+            Some(SHARING_VIOLATION | LOCK_VIOLATION | USER_MAPPED_FILE) => {
+                return Some((
+                    std::io::ErrorKind::ResourceBusy,
+                    "a file inside it is in use by another program",
+                ));
+            }
+            Some(ACCESS_DENIED) => {
+                return Some((
+                    e.kind(),
+                    "access denied, most often because a program has a file inside it open \
+                     (or it is read-only, or not yours)",
+                ));
+            }
+            _ => {}
+        }
+    }
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ResourceBusy | std::io::ErrorKind::ExecutableFileBusy
+    )
+    .then_some((
+        std::io::ErrorKind::ResourceBusy,
+        "a file inside it is in use by another program",
+    ))
+}
+
 /// Checks the swapped entry: the link resolves to the destination, and the
-/// tree read through the entry is the one copied. A mismatch undoes the swap,
-/// keeping the staged copy.
-fn check_swapped(plan: &MovePlan) -> Result<(), FetchError> {
+/// tree read through the entry is `staged`, the one copied, down to each
+/// file's modification time. A mismatch undoes the swap, keeping the staged
+/// copy.
+fn check_swapped(plan: &MovePlan, staged: &[Entry]) -> Result<(), FetchError> {
     let links_right = matches!(plan.kind, MoveKind::Back { .. })
         || super::relocated_target(&plan.entry).is_some_and(|t| same_dir(&t, &plan.destination));
-    let reads_right = walk(&plan.entry).is_ok_and(|tree| same_tree(&plan.entries, &tree, true));
+    let reads_right = walk(&plan.entry).is_ok_and(|tree| same_tree(staged, &tree, true));
     if links_right && reads_right {
         return Ok(());
     }
@@ -1636,6 +1793,7 @@ fn check_swapped(plan: &MovePlan) -> Result<(), FetchError> {
         let _ = std::fs::rename(&plan.destination, &plan.staging);
     }
     let _ = std::fs::rename(&plan.aside, &plan.entry);
+    remove_move_dir_if_empty(plan);
     Err(FetchError::InvalidArgument(format!(
         "{} did not read back as copied through {} (the move was undone; the copy is kept at {})",
         plan.repo_type.address(&plan.repo_id),
@@ -1930,9 +2088,11 @@ mod tests {
             .into_iter()
             .filter_map(|e| match e.kind {
                 EntryKind::File { .. } => {
-                    Some((e.rel.clone(), std::fs::read(root.join(&e.rel)).unwrap()))
+                    let bytes = std::fs::read(root.join(&e.rel)).unwrap();
+                    Some((e.rel, bytes))
                 }
                 EntryKind::Link { target } => {
+                    // BORROW: explicit .to_string_lossy().into_owned() for Path → owned bytes
                     Some((e.rel, target.to_string_lossy().into_owned().into_bytes()))
                 }
                 EntryKind::Dir => None,
@@ -2037,6 +2197,7 @@ mod tests {
         let kept = kept_path(&f.cache, FOLDER);
         assert_eq!(
             report.original,
+            // BORROW: explicit .clone() for owned PathBuf
             Some(MoveOriginal::Kept { path: kept.clone() })
         );
         assert_eq!(contents(&kept), before);
@@ -2150,6 +2311,17 @@ mod tests {
             Some(c_id),
             "a directory on a drive has the drive's identity"
         );
+    }
+
+    /// A UNC path, typed or as `canonicalize` returns it for a mapped
+    /// drive, is a network share; a drive path is not.
+    #[cfg(windows)]
+    #[test]
+    fn is_network_path_tells_shares_from_drives() {
+        assert!(is_network_path(Path::new(r"\\server\share\hf-cache")));
+        assert!(is_network_path(Path::new(r"\\?\UNC\server\share\hf-cache")));
+        assert!(!is_network_path(Path::new(r"D:\hf-cache")));
+        assert!(!is_network_path(Path::new(r"\\?\D:\hf-cache")));
     }
 
     #[test]
@@ -2391,7 +2563,9 @@ mod tests {
             stranded_in(&f.cache).unwrap(),
             vec![StrandedMove {
                 repo_type: RepoType::Model,
+                // BORROW: explicit .to_owned() for &str → owned String
                 repo_id: "org/model".to_owned(),
+                // BORROW: explicit .clone() for owned PathBuf
                 aside: aside.clone(),
             }],
             "what `du` warns about"
@@ -2604,6 +2778,37 @@ mod tests {
         let p = plan(&f, &f.dest).unwrap();
         let _ = apply_move(&p, false).unwrap();
         assert!(!f.cache.join(MOVE_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn a_swap_that_fails_is_undone_and_the_copy_kept() {
+        let f = fixture();
+        let before = contents(&f.repo);
+        let p = plan(&f, &f.dest).unwrap();
+        // BORROW: explicit .clone() for owned PathBuf moved into the callback
+        let destination = p.destination.clone();
+        // Something takes the destination's name after the copy: the swap's
+        // last rename fails.
+        let err = apply_move_with_progress(&p, false, |event| {
+            if matches!(event, MoveEvent::Swapping) {
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::write(destination.join("someone-else.txt"), b"x").unwrap();
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(err, FetchError::Io { .. }), "{err}");
+        assert!(
+            super::super::relocated_target(&f.repo).is_none(),
+            "the entry is a directory again"
+        );
+        assert_eq!(contents(&f.repo), before, "and whole");
+        assert!(!p.aside.exists(), "nothing is left aside");
+        assert_eq!(
+            contents(&p.staging),
+            before,
+            "the verified copy is kept for the next run"
+        );
+        assert!(destination.join("someone-else.txt").is_file());
     }
 
     #[test]

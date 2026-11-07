@@ -802,7 +802,7 @@ enum CacheCommands {
     /// bad argument removes nothing. A numeric index is the `#` of the last
     /// `du`, and shifts after each deletion; the repo each index resolved to
     /// is printed, `--yes` or not. A dataset or Space is addressed behind
-    /// its Hub prefix (`datasets/org/name`).
+    /// its Hub prefix (`datasets/org/name`, `spaces/org/name`).
     ///
     /// A repo moved to another disk behind a link loses the link only; its
     /// bytes stay, and `--with-target` deletes them too.
@@ -880,7 +880,8 @@ enum CacheCommands {
     /// it stopped when run again. A repo already moved moves again to a new
     /// `<DIR>`; `--back` brings it back into the cache. A numeric index is the
     /// `#` of the last `du`, and the repo it resolved to is printed, `--yes`
-    /// or not; a dataset or Space is addressed as `datasets/org/name`.
+    /// or not. A dataset or Space is addressed behind its Hub prefix
+    /// (`datasets/org/name`, `spaces/org/name`).
     Move {
         /// Repository identifier or numeric index from `du` output.
         repo_id: String,
@@ -1427,6 +1428,7 @@ fn run(cli: Cli) -> Result<(), FetchError> {
                 yes,
                 dry_run,
             } => run_cache_move(
+                // BORROW: explicit .as_str() instead of Deref coercion
                 repo_id.as_str(),
                 dir.as_deref(),
                 MoveFlags {
@@ -6198,8 +6200,6 @@ fn run_cache_dedupe(
     Ok(())
 }
 
-/// Prints the snapshot directory path for a cached model.
-///
 /// The flags of `cache move`, kept together so its runner takes them as one.
 #[derive(Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // EXPLICIT: three independent CLI switches
@@ -6217,7 +6217,10 @@ struct MoveFlags {
 ///
 /// # Errors
 ///
-/// Returns the errors of [`resolve_repo_arg`] and [`resolve_index`].
+/// Returns [`FetchError::InvalidArgument`] if a numeric index is out of
+/// range, or the argument is not a valid repo ID or a cached bare name.
+/// Returns [`FetchError::Io`] if the cache cannot be listed to resolve an
+/// index.
 fn resolve_move_arg(arg: &str) -> Result<(cache::RepoType, String), FetchError> {
     if let Ok(n) = arg.parse::<usize>() {
         let (repo_type, repo_id) = resolve_index(n, &du_listing()?)?;
@@ -6384,8 +6387,12 @@ fn print_move_original(original: Option<&cache::MoveOriginal>) {
 ///
 /// # Errors
 ///
-/// Returns the errors of [`resolve_move_arg`], [`cache::plan_move`] or
-/// [`cache::plan_move_back`], and [`cache::apply_move_with_progress`].
+/// Returns [`FetchError::InvalidArgument`] if the argument resolves to no
+/// cached repo, or the move is refused: by [`cache::plan_move`] or
+/// [`cache::plan_move_back`] before anything is copied, or by
+/// [`cache::apply_move_with_progress`] while it runs.
+/// Returns [`FetchError::Checksum`] if a copy does not read back as copied.
+/// Returns [`FetchError::Io`] on a filesystem failure.
 // EXPLICIT: sequential pipeline (resolve, plan, preview, confirm, copy, report); splitting it hides the flow
 #[allow(clippy::too_many_lines)]
 fn run_cache_move(repo_arg: &str, dir: Option<&Path>, flags: MoveFlags) -> Result<(), FetchError> {
@@ -6628,6 +6635,8 @@ fn print_move_leftover(leftover: &MoveLeftovers, cache_dir: &Path) {
     );
 }
 
+/// Prints the snapshot directory path for a cached model.
+///
 /// Resolves the named ref (default: `main`) to a commit hash and constructs
 /// the snapshot path. Output is a bare path with no decoration, intended for
 /// shell substitution: `cd $(hf-fm cache path org/model)`.
