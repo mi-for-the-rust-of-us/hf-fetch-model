@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — `cache move` relocates a repo to another disk
+
 ### Added
 
 - **`hf-fm cache move <REPO_ID|N> <DIR> [--dry-run] [--yes] [--keep-original]`
