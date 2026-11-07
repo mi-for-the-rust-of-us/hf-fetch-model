@@ -1545,20 +1545,30 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// An identity for the volume holding `path`: the device number on Unix, the
-/// volume serial number on Windows; `None` where it cannot be read.
-fn volume_id(path: &Path) -> Option<u64> {
+/// An identity for the volume holding `path`: the device number on Unix; on
+/// Windows the volume serial number together with the drive (or share) the
+/// canonical path names. `None` where it cannot be read.
+///
+/// The serial number alone does not tell two volumes apart: a volume cloned
+/// from another keeps its serial number, and the maintainer's `C:` and `D:`
+/// share one (2026-11-07). The drive tells those apart, and the serial number
+/// a volume mounted in a folder of the same drive.
+fn volume_id(path: &Path) -> Option<(u64, String)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|meta| meta.dev())
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), String::new()))
     }
     #[cfg(windows)]
     {
         let handle = winapi_util::Handle::from_path_any(path).ok()?;
-        winapi_util::file::information(&handle)
-            .ok()
-            .map(|info| info.volume_serial_number())
+        let serial = winapi_util::file::information(&handle)
+            .ok()?
+            .volume_serial_number();
+        let drive = super::volume_label(&std::fs::canonicalize(path).ok()?)?;
+        Some((serial, drive))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1845,6 +1855,29 @@ mod tests {
         }
         let err = plan(&f, &f.dest).unwrap_err();
         assert!(err.to_string().contains("pointing outside"), "{err}");
+    }
+
+    /// Two drives are two volumes even when they share a serial number, as a
+    /// cloned disk does (the maintainer's `C:` and `D:` both report
+    /// `84AB-E302`, which made the first build call a move from `C:` to `D:`
+    /// a same-volume move).
+    #[cfg(windows)]
+    #[test]
+    fn volume_id_tells_drives_apart() {
+        let (c, d) = (Path::new("C:\\"), Path::new("D:\\"));
+        if !d.exists() {
+            eprintln!("skipped: no D: drive");
+            return;
+        }
+        let (Some(c_id), Some(d_id)) = (volume_id(c), volume_id(d)) else {
+            panic!("both drives have an identity");
+        };
+        assert_ne!(c_id, d_id);
+        assert_eq!(
+            volume_id(Path::new("C:\\Windows")),
+            Some(c_id),
+            "a directory on a drive has the drive's identity"
+        );
     }
 
     #[test]
