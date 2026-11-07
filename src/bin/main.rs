@@ -6270,7 +6270,8 @@ fn print_move_preview(plan: &cache::MovePlan, keep_original: bool) {
     }
     if let Some(staging) = &plan.stale_staging {
         println!(
-            "  The files it had copied stay at {}: a later move to that disk resumes from them;              delete them otherwise.",
+            "  The files it had copied stay at {}: a later move to that disk resumes from them; \
+             delete them otherwise.",
             staging.display()
         );
     }
@@ -6616,7 +6617,9 @@ fn print_move_leftover(leftover: &MoveLeftovers, cache_dir: &Path) {
         // BORROW: explicit .as_str() instead of Deref coercion
         let address = s.repo_type.address(s.repo_id.as_str());
         eprintln!(
-            "warning: {address} is out of the cache: an interrupted move left it at {},              which may be its only copy; `hf-fm cache move {address} --back` puts it back              (or rerun the move to resume it)",
+            "warning: {address} is out of the cache: an interrupted move left it at {}, \
+             which may be its only copy; `hf-fm cache move {address} --back` puts it back \
+             (or rerun the move to resume it)",
             s.aside.display()
         );
     }
@@ -6629,7 +6632,8 @@ fn print_move_leftover(leftover: &MoveLeftovers, cache_dir: &Path) {
         "put the repos named above back before deleting anything there"
     };
     println!(
-        "  Not counted above: {} in {} (originals kept by `cache move --keep-original`,          or left by an interrupted move); {advice}.",
+        "  Not counted above: {} in {} (originals kept by `cache move --keep-original`, \
+         or left by an interrupted move); {advice}.",
         format_size(leftover.bytes),
         cache_dir.join(cache::MOVE_DIR_NAME).display()
     );

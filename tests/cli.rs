@@ -6632,8 +6632,13 @@ fn cache_move_keep_original_is_reported_by_du() {
     let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
     assert!(success, "du should succeed: {stderr}");
     assert!(
-        stdout.contains("Not counted above: 8.0 KiB in") && stdout.contains(".hf-fm-move"),
-        "du states the kept original apart, got:\n{stdout}"
+        stdout.contains("Not counted above: 8.0 KiB in")
+            && stdout.contains(".hf-fm-move")
+            && stdout.contains(
+                "(originals kept by `cache move --keep-original`, or left by an interrupted move); \
+                 delete them when you no longer need them."
+            ),
+        "du states the kept original apart, in one sentence, got:\n{stdout}"
     );
     let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--json"]));
     assert!(success, "du --json should succeed: {stderr}");
@@ -6685,7 +6690,10 @@ fn cache_move_back_puts_back_an_entry_an_interrupted_move_set_aside() {
     assert!(success, "du should succeed: {stderr}");
     assert!(
         stderr.contains("warning: test-org/a is out of the cache")
-            && stderr.contains("cache move test-org/a --back"),
+            && stderr.contains(
+                ", which may be its only copy; `hf-fm cache move test-org/a --back` puts it back \
+                 (or rerun the move to resume it)"
+            ),
         "du warns that the aside is the repo, got:\n{stderr}"
     );
     assert!(
