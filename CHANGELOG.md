@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cache::plan_move`, `cache::plan_move_back` and `cache::apply_move`
+  (`apply_move_with_progress`): move a cached repo to another disk behind a
+  link, and back.** The library half of `cache move`, asked for by the
+  [junction addendum](docs/dogfooding-feedbacks/hf-fm-dogfooding-du-duplicates-cache-cleaning.md)
+  (finding 5); the design and the maintainer's decisions are in the
+  [cache roadmap](docs/roadmaps/cache-management-roadmap.md#v0130--cache-move-repo_id-dir-relocate-a-repo-to-another-disk).
+  `plan_move` reads only: it refuses a repo with a download in progress, a
+  repo holding a link that points outside it (`huggingface_hub`'s shared blob
+  store), a destination inside the cache or already present, and a volume
+  without room, and it counts what an interrupted earlier run already copied.
+  `apply_move` copies into `<DIR>/.hf-fm-move/<folder>.partial`. Each file is
+  hashed with SHA-256 as it is copied, flushed, read back and hashed again,
+  and gets its final name, modification time and permissions only when the
+  digests agree. Hard links inside the repo stay hard links, so a
+  deduplicated repo stays deduplicated. Then it swaps the cache entry for a
+  link to `<DIR>/<folder>`, checks the tree through the link, and drops the
+  original, or keeps it with `keep_original`. On Windows the link is a
+  junction, which needs no privilege; on Unix, a symlink. A repo already
+  behind a link moves again, and `plan_move_back` brings its bytes back into
+  the cache.
+  - **Interruptible.** A staged file with the source's length and
+    modification time is trusted, so a rerun copies only what is missing. The
+    cache entry set aside during the swap (`<cache>/.hf-fm-move/<folder>.swap`)
+    is put back, or its drop finished, by the next move of the repo. Any
+    failure before the swap leaves the cache untouched, and a swap that fails
+    or does not read back is undone.
+  - A blob whose content does not hash to the SHA-256 it is named by is moved
+    as it is and reported (`MoveReport::name_mismatches`): the cache's copy
+    was already corrupt.
+  - `cache::move_leftover_bytes` totals what `.hf-fm-move/` holds in the
+    cache (a kept original, or what an interrupted move left), which no
+    listing counts.
+  - New Windows dependency: `junction` 2.1.0 (MIT, MSRV 1.85), with default
+    features off, so it never asks for the backup and restore privileges.
+    Its `windows-sys` 0.61 was already locked; it adds `scopeguard`.
+
 ### Changed
 
 - **`anamnesis` bumped `0.7.10` → `0.7.11`.** One pickup for hf-fm: a `GGUF`

@@ -10,10 +10,13 @@
 //! [`cache_repo_usage()`] returns a single repo's per-file sizes,
 //! [`verify_duplicates()`] hashes the snapshot files that duplicate their
 //! blobs, [`plan_dedupe()`] and [`apply_dedupe()`] replace those files with
-//! hard links to their blobs, and [`verify_cache()`] re-checks `SHA256`
-//! digests of cached files against `HuggingFace` LFS metadata.
+//! hard links to their blobs, [`plan_move()`] and [`apply_move()`] move a
+//! repo to another disk behind a link ([`plan_move_back()`] brings it back),
+//! and [`verify_cache()`] re-checks `SHA256` digests of cached files against
+//! `HuggingFace` LFS metadata.
 
 mod dedupe;
+mod relocate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -29,6 +32,10 @@ pub use dedupe::{
     plan_dedupe,
 };
 pub(crate) use dedupe::{LinkOutcome, link_copy_to_blob};
+pub use relocate::{
+    MOVE_DIR_NAME, MoveEvent, MoveKind, MoveOriginal, MovePlan, MoveRecovery, MoveReport,
+    apply_move, apply_move_with_progress, move_leftover_bytes, plan_move, plan_move_back,
+};
 
 /// Filename of the per-repo `hf-fm` snapshot sidecar.
 ///

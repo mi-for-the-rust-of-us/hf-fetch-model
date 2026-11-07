@@ -445,7 +445,16 @@ fn download_in_progress(repo_dir: &Path) -> bool {
         return false;
     };
     // BORROW: explicit .to_string_lossy() for OsStr → str conversion
-    let locks_dir = crate::cache_layout::download_locks_dir(cache_root, &folder.to_string_lossy());
+    download_lock_held_for(cache_root, &folder.to_string_lossy())
+}
+
+/// Whether another process holds one of the download locks of the repo whose
+/// cache folder is `folder` (`<cache_root>/.locks/<folder>/*.lock`).
+///
+/// Shared with `cache move` (v0.13.0), whose source may sit behind a link,
+/// where `repo_dir.parent()` would not be the cache root.
+pub(super) fn download_lock_held_for(cache_root: &Path, folder: &str) -> bool {
+    let locks_dir = crate::cache_layout::download_locks_dir(cache_root, folder);
     let Ok(entries) = std::fs::read_dir(locks_dir) else {
         return false;
     };
@@ -607,7 +616,7 @@ fn files_equal(
 
 /// Reads from `file` until `buf` is full or the file ends, and returns how
 /// many bytes were read: a short read is not the end of a file.
-fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+pub(super) fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     // EXPLICIT: a read may return fewer bytes than asked; loop until full or end of file
     while let Some(rest) = buf.get_mut(filled..) {
@@ -711,7 +720,7 @@ fn link_over(pointer: &Path, blob: &Path) -> std::io::Result<LinkOutcome> {
 /// through such a handle, or when it is read-only. `std` maps that code to
 /// `PermissionDenied`; here it means the file is in use, so it becomes
 /// `ResourceBusy`, keeping the system's message. Other errors pass through.
-fn rename_error(e: std::io::Error) -> std::io::Error {
+pub(super) fn rename_error(e: std::io::Error) -> std::io::Error {
     #[cfg(windows)]
     {
         if e.raw_os_error() == Some(win_error::ACCESS_DENIED) {

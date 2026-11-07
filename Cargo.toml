@@ -113,6 +113,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # documented fallback, but keeps a handle open per file and offers equality
 # only.
 winapi-util = "0.1.11"
+# Directory junctions for `cache move` (v0.13.0): a repo moved to another
+# disk is linked back into the cache by a junction, which, unlike the
+# symlink `std::os::windows::fs::symlink_dir` makes, needs neither Developer
+# Mode nor elevation. Creating one takes `FSCTL_SET_REPARSE_POINT`, an
+# `unsafe` Win32 call that `unsafe_code = "forbid"` rules out here, and a
+# `cmd /c mklink /J` subprocess would expand `%VAR%` inside quoted paths and
+# answer in localised text. `junction` (MIT, MSRV 1.85) adds `scopeguard`
+# alone; its `windows-sys` 0.61 was already in `Cargo.lock`.
+# `default-features = false` is load-bearing: the default `unstable_admin`
+# feature asks for the backup and restore privileges when opening a
+# directory is refused, which a non-administrator does not hold.
+junction = { version = "2.1.0", default-features = false }
 
 [[bin]]
 name = "hf-fetch-model"

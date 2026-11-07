@@ -239,7 +239,10 @@
 //! (each marked by [`cache::RepoType`]), where [`cache::cache_summary`] keeps to
 //! models so that eviction and status never reach a dataset;
 //! [`cache::relocated_target`] and [`cache::volume_label`] say where a repo
-//! moved to another disk behind a link now lives.
+//! moved to another disk behind a link now lives. Since v0.13.0
+//! [`cache::plan_move`] and [`cache::apply_move`] make that move (copy,
+//! verify by `SHA256`, link back, drop or keep the original), and
+//! [`cache::plan_move_back`] undoes it.
 //!
 //! For long verifications (multi-GiB safetensors files), drive
 //! [`cache::verify_cache_with_progress`] with an [`Fn`] callback that receives
