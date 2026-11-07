@@ -868,6 +868,49 @@ enum CacheCommands {
         #[arg(long)]
         list_kept: bool,
     },
+    /// Move a cached repo to another disk, leaving a link to it in the cache.
+    ///
+    /// The repo is copied to `<DIR>/<folder>` (e.g. `D:\hf-cache\models--org--name`),
+    /// each file hashed with SHA-256 as it is copied and again when read
+    /// back. The repo's cache entry is then replaced by a link to the copy (a
+    /// junction on Windows, which needs no administrator rights; a symlink
+    /// elsewhere), and the link is checked. Finally the original is deleted,
+    /// or kept under `<cache>/.hf-fm-move/` with `--keep-original`. Tools
+    /// that read the cache follow the link. An interrupted move resumes where
+    /// it stopped when run again. A repo already moved moves again to a new
+    /// `<DIR>`; `--back` brings it back into the cache. A numeric index is the
+    /// `#` of the last `du`, and the repo it resolved to is printed, `--yes`
+    /// or not; a dataset or Space is addressed as `datasets/org/name`.
+    Move {
+        /// Repository identifier or numeric index from `du` output.
+        repo_id: String,
+
+        /// Directory to move the repo into; it lands in `<DIR>/<folder>`,
+        /// and `<DIR>` is created if missing.
+        #[arg(required_unless_present = "back", conflicts_with = "back")]
+        dir: Option<PathBuf>,
+
+        /// Bring a repo moved earlier back into the cache, replacing its link.
+        #[arg(long)]
+        back: bool,
+
+        /// Keep the original instead of deleting it once the move is checked.
+        ///
+        /// A repo moved out of the cache keeps its original at
+        /// `<cache>/.hf-fm-move/<folder>`, where `du` reports it apart; one
+        /// moved again or back keeps the copy it moved from where it was.
+        #[arg(long)]
+        keep_original: bool,
+
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+
+        /// Print what would be copied and changed, without copying, changing
+        /// or prompting.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print the snapshot directory path for a cached model.
     ///
     /// Output is a bare path (no labels), suitable for shell substitution:
@@ -1375,6 +1418,23 @@ fn run(cli: Cli) -> Result<(), FetchError> {
                 yes,
                 list_kept,
             } => run_cache_gc(older_than, max_size, except, dry_run, yes, list_kept),
+            // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
+            CacheCommands::Move {
+                repo_id,
+                dir,
+                back: _,
+                keep_original,
+                yes,
+                dry_run,
+            } => run_cache_move(
+                repo_id.as_str(),
+                dir.as_deref(),
+                MoveFlags {
+                    keep_original,
+                    yes,
+                    dry_run,
+                },
+            ),
             // BORROW: explicit .as_str()/.as_deref() for owned → borrowed conversions
             CacheCommands::Path { repo_id, revision } => {
                 let resolved = resolve_du_arg(repo_id.as_str())?;
@@ -4043,13 +4103,22 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
         if matches!(sort, DuSort::Dup) {
             ordered.sort_by_key(|s| std::cmp::Reverse(s.duplicated_bytes));
         }
-        return print_du_json(&ordered, store, &cache_dir, verification, volumes);
+        return print_du_json(
+            &ordered,
+            store,
+            &cache_dir,
+            verification,
+            volumes,
+            cache::move_leftover_bytes()?,
+        );
     }
 
     println!("Cache: {}\n", cache_dir.display());
 
+    let move_leftover = cache::move_leftover_bytes()?;
     if summaries.is_empty() {
         println!("No models found in local cache.");
+        print_move_leftover(move_leftover, &cache_dir);
         return Ok(());
     }
 
@@ -4203,6 +4272,7 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
     if let Some(note) = shared_store_note(store, &cache_dir) {
         println!("{note}");
     }
+    print_move_leftover(move_leftover, &cache_dir);
     if let Some(v) = &verification {
         print_duplicate_verification(v);
     }
@@ -4548,6 +4618,12 @@ struct DuJson {
     /// another disk behind a link (new in v0.12.5). Sums to `total_bytes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     volume_bytes: Option<BTreeMap<String, u64>>,
+    /// Bytes in the cache's `.hf-fm-move/` directory: originals kept by
+    /// `cache move --keep-original`, or what an interrupted move left (new in
+    /// v0.13.0). Not part of `total_bytes`, since no listing counts them.
+    /// Omitted when there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_leftover_bytes: Option<u64>,
 }
 
 /// Top-level shape for `du <repo> --json` (per-file drill-down).
@@ -4623,6 +4699,7 @@ fn print_du_json(
     cache_dir: &std::path::Path,
     verification: Option<DuplicateVerification>,
     volumes: Option<Vec<(String, u64)>>,
+    move_leftover: u64,
 ) -> Result<(), FetchError> {
     let mut total_files: usize = 0;
     let mut duplicated_bytes: u64 = 0;
@@ -4663,6 +4740,7 @@ fn print_du_json(
         shared_store_bytes: (store > 0).then_some(store),
         verification,
         volume_bytes: volumes.map(|v| v.into_iter().collect()),
+        move_leftover_bytes: (move_leftover > 0).then_some(move_leftover),
     };
     emit_json(&result)
 }
@@ -4728,6 +4806,7 @@ fn print_du_tree_json(
             cache_dir,
         )
         .map(|v| v.into_iter().collect()),
+        move_leftover_bytes: Some(cache::move_leftover_bytes()?).filter(|&b| b > 0),
     };
     emit_json(&result)
 }
@@ -5185,8 +5264,10 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
 
     println!("Cache: {}\n", cache_dir.display());
 
+    let move_leftover = cache::move_leftover_bytes()?;
     if repos.is_empty() {
         println!("No models found in local cache.");
+        print_move_leftover(move_leftover, &cache_dir);
         return Ok(());
     }
 
@@ -5251,6 +5332,7 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     if let Some(note) = shared_store_note(store, &cache_dir) {
         println!("{note}");
     }
+    print_move_leftover(move_leftover, &cache_dir);
 
     Ok(())
 }
@@ -6098,6 +6180,353 @@ fn run_cache_dedupe(
 
 /// Prints the snapshot directory path for a cached model.
 ///
+/// The flags of `cache move`, kept together so its runner takes them as one.
+#[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // EXPLICIT: three independent CLI switches
+struct MoveFlags {
+    /// Keep the original instead of deleting it.
+    keep_original: bool,
+    /// Skip the confirmation prompt.
+    yes: bool,
+    /// Print the plan and stop.
+    dry_run: bool,
+}
+
+/// Resolves `cache move`'s repo argument to a repo of any type, printing the
+/// repo a numeric index resolved to, as `cache delete` does.
+///
+/// # Errors
+///
+/// Returns the errors of [`resolve_repo_arg`] and [`resolve_index`].
+fn resolve_move_arg(arg: &str) -> Result<(cache::RepoType, String), FetchError> {
+    if let Ok(n) = arg.parse::<usize>() {
+        let (repo_type, repo_id) = resolve_index(n, &du_listing()?)?;
+        println!(
+            // BORROW: explicit .as_str() instead of Deref coercion
+            "  index {n} is {}  (as listed by the last `du`)",
+            repo_type.address(repo_id.as_str())
+        );
+        return Ok((repo_type, repo_id));
+    }
+    resolve_repo_arg(arg)
+}
+
+/// The volume label and free space of the volume holding `path`, or of its
+/// nearest existing ancestor: what `cache move` reports before and after.
+fn volume_free(path: &Path) -> Option<(String, u64)> {
+    let existing = path.ancestors().find(|p| p.exists())?;
+    let canonical = existing.canonicalize().ok()?;
+    let label = cache::volume_label(&canonical)?;
+    let free = fs2::available_space(existing).ok()?;
+    Some((label, free))
+}
+
+/// Prints the `cache move` preview for `plan`: where from and to, what is
+/// copied, what an earlier run left, and what becomes of the original.
+fn print_move_preview(plan: &cache::MovePlan, keep_original: bool) {
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let address = plan.repo_type.address(plan.repo_id.as_str());
+    match plan.recovery {
+        Some(cache::MoveRecovery::RestoreAside) => println!(
+            "  An interrupted move left {} set aside: it is put back first.",
+            plan.aside.display()
+        ),
+        Some(cache::MoveRecovery::FinishDrop) => println!(
+            "  An interrupted move left the original at {}: it is {} first.",
+            plan.aside.display(),
+            if keep_original { "kept" } else { "deleted" }
+        ),
+        // EXPLICIT: nothing left by an earlier run, nothing to say; future variants likewise
+        _ => {}
+    }
+    if plan.kind == cache::MoveKind::Finish {
+        println!(
+            "  {address} is already at {}; nothing to copy.",
+            plan.destination.display()
+        );
+        return;
+    }
+    let heading = if matches!(plan.kind, cache::MoveKind::Back { .. }) {
+        "Move back into the cache"
+    } else {
+        "Move"
+    };
+    println!(
+        "  {heading} {address}  ({}, {} {})",
+        format_size(plan.bytes),
+        plan.files,
+        pluralize(plan.files, "file", "files")
+    );
+    println!("    from  {}", plan.source.display());
+    println!("    to    {}", plan.destination.display());
+    if plan.creates_parent
+        && let Some(parent) = plan.destination.parent()
+    {
+        println!("  {} does not exist yet and is created.", parent.display());
+    }
+    if plan.hard_links > 0 || plan.symlinks > 0 {
+        println!(
+            "  Kept as they are: {} hard {}, {} {}.",
+            plan.hard_links,
+            pluralize(plan.hard_links, "link", "links"),
+            plan.symlinks,
+            pluralize(plan.symlinks, "symlink", "symlinks"),
+        );
+    }
+    if plan.bytes_staged > 0 {
+        println!(
+            "  Already copied by an interrupted run: {}; {} left to copy.",
+            format_size(plan.bytes_staged),
+            format_size(plan.bytes_to_copy())
+        );
+    }
+    // The destination's parent: for `--back` the destination is the cache
+    // entry, which is still the link and would resolve to the other disk.
+    if let Some((label, free)) = plan.destination.parent().and_then(volume_free) {
+        println!("  Free space on {label} {}.", format_size(free));
+    }
+    if plan.same_volume {
+        println!(
+            "  Note: the destination is on the same volume as the bytes; the move frees nothing there."
+        );
+    }
+    let original = match (&plan.kind, keep_original) {
+        (cache::MoveKind::Relocate, false) => format!(
+            "  Then {} is replaced by a link, and the original is deleted.",
+            plan.entry.display()
+        ),
+        (cache::MoveKind::Relocate, true) => format!(
+            "  Then {} is replaced by a link, and the original is kept in {}.",
+            plan.entry.display(),
+            plan.aside.parent().unwrap_or(&plan.aside).display()
+        ),
+        (cache::MoveKind::MoveAgain { from }, keep) => format!(
+            "  Then the link is pointed at the new copy, and {} is {}.",
+            from.display(),
+            if keep { "kept" } else { "deleted" }
+        ),
+        (cache::MoveKind::Back { from }, keep) => format!(
+            "  Then the link is replaced by the copy, and {} is {}.",
+            from.display(),
+            if keep { "kept" } else { "deleted" }
+        ),
+        // EXPLICIT: `Finish` returned above; a future kind gets no sentence
+        _ => String::new(),
+    };
+    if !original.is_empty() {
+        println!("{original}");
+    }
+}
+
+/// Prints what became of the original, from a [`cache::MoveReport`].
+fn print_move_original(original: Option<&cache::MoveOriginal>) {
+    match original {
+        Some(cache::MoveOriginal::Dropped { path }) => {
+            println!("  Original deleted ({}).", path.display());
+        }
+        Some(cache::MoveOriginal::Kept { path }) => {
+            println!("  Original kept at {}.", path.display());
+        }
+        Some(cache::MoveOriginal::Left { path, reason }) => eprintln!(
+            "warning: the original at {} could not be removed ({reason}); \
+             the move stands, and the next `cache move` of this repo finishes it",
+            path.display()
+        ),
+        // EXPLICIT: nothing moved, nothing to say; future variants likewise
+        _ => {}
+    }
+}
+
+/// Moves a cached repo to another disk behind a link, moves it again, or,
+/// when `dir` is `None` (`--back`), brings it back into the cache.
+///
+/// Plans first and prints the plan; `--dry-run` stops there. Otherwise it
+/// prompts once, unless `--yes`, then copies with a progress bar on a terminal
+/// (a line per file otherwise), and reports what it copied, what it found,
+/// what became of the original, and the source volume's free space before and
+/// after.
+///
+/// # Errors
+///
+/// Returns the errors of [`resolve_move_arg`], [`cache::plan_move`] or
+/// [`cache::plan_move_back`], and [`cache::apply_move_with_progress`].
+// EXPLICIT: sequential pipeline (resolve, plan, preview, confirm, copy, report); splitting it hides the flow
+#[allow(clippy::too_many_lines)]
+fn run_cache_move(repo_arg: &str, dir: Option<&Path>, flags: MoveFlags) -> Result<(), FetchError> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let (repo_type, repo_id) = resolve_move_arg(repo_arg)?;
+    // BORROW: explicit .as_str() instead of Deref coercion
+    let plan = match dir {
+        Some(dir) => cache::plan_move(repo_type, repo_id.as_str(), dir)?,
+        None => cache::plan_move_back(repo_type, repo_id.as_str())?,
+    };
+    print_move_preview(&plan, flags.keep_original);
+
+    if flags.dry_run {
+        println!("  Dry run: nothing was copied or changed.");
+        return Ok(());
+    }
+    if !flags.yes && !confirm_prompt("  Move? [y/N]") {
+        println!("  Aborted.");
+        return Ok(());
+    }
+
+    // The volume the bytes leave, measured where they are now.
+    let freed_volume = plan
+        .source
+        .parent()
+        // BORROW: explicit .clone() for owned PathBuf
+        .map_or_else(|| plan.source.clone(), Path::to_path_buf);
+    let free_before = volume_free(&freed_volume);
+
+    let bar = std::io::stderr().is_terminal().then(|| {
+        let bar = ProgressBar::new(0);
+        let style = ProgressStyle::with_template(
+            "  {bar:30} {bytes}/{total_bytes}  {bytes_per_sec}  {msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar());
+        bar.set_style(style);
+        bar
+    });
+    let started = Instant::now();
+    let on_event = |event: cache::MoveEvent<'_>| match event {
+        cache::MoveEvent::Started { files, bytes } => {
+            if let Some(bar) = &bar {
+                bar.set_length(bytes.saturating_mul(2));
+            } else {
+                println!(
+                    "  Copying {} in {} {} (each read back to verify)",
+                    format_size(bytes),
+                    files,
+                    pluralize(files, "file", "files")
+                );
+            }
+        }
+        cache::MoveEvent::File {
+            index,
+            total,
+            path,
+            len,
+        } => {
+            let line = format!(
+                "[{index}/{total}] {} ({})",
+                path.display(),
+                format_size(len)
+            );
+            match &bar {
+                Some(bar) => bar.set_message(line),
+                None => println!("  {line}"),
+            }
+        }
+        cache::MoveEvent::Progress { done, .. } => {
+            if let Some(bar) = &bar {
+                bar.set_position(done);
+            }
+        }
+        cache::MoveEvent::Swapping => {
+            if let Some(bar) = &bar {
+                bar.finish_and_clear();
+            }
+            println!("  Copied and verified; swapping the cache entry.");
+        }
+        cache::MoveEvent::Dropping { path } => {
+            println!("  Deleting the original at {} ...", path.display());
+        }
+        // EXPLICIT: future MoveEvent variants are not displayed
+        _ => {}
+    };
+    let result = cache::apply_move_with_progress(&plan, flags.keep_original, on_event);
+    if let Some(bar) = &bar {
+        bar.finish_and_clear();
+    }
+    let report = result?;
+
+    if let Some(recovered) = report.recovered {
+        let what = match recovered {
+            cache::MoveRecovery::RestoreAside => {
+                "put back the cache entry an interrupted move set aside"
+            }
+            cache::MoveRecovery::FinishDrop => "finished an interrupted move's last step",
+            // EXPLICIT: a future recovery is still reported, without detail
+            _ => "dealt with what an interrupted move left",
+        };
+        println!("  Recovered: {what}.");
+    }
+    if plan.kind != cache::MoveKind::Finish {
+        let resumed = if report.resumed_files > 0 {
+            format!(
+                "; {} {} ({}) already copied by an earlier run",
+                report.resumed_files,
+                pluralize(report.resumed_files, "file", "files"),
+                format_size(report.resumed_bytes)
+            )
+        } else {
+            String::new()
+        };
+        println!(
+            "  Copied {} {} ({}) in {}, each verified by SHA-256{resumed}.",
+            report.copied_files,
+            pluralize(report.copied_files, "file", "files"),
+            format_size(report.copied_bytes),
+            format_elapsed(started.elapsed())
+        );
+        if report.hard_links_copied > 0 {
+            println!(
+                "  Note: {} hard-linked {} became separate copies: the destination's volume cannot hard-link.",
+                report.hard_links_copied,
+                pluralize(report.hard_links_copied, "file", "files")
+            );
+        }
+        for path in &report.name_mismatches {
+            eprintln!(
+                "warning: {} does not hash to the SHA-256 it is named by; it was corrupt in the cache \
+                 and was moved as it is (`hf-fm cache verify` checks the repo)",
+                path.display()
+            );
+        }
+        if matches!(plan.kind, cache::MoveKind::Back { .. }) {
+            println!("  Back in the cache at {}.", plan.entry.display());
+        } else {
+            println!(
+                "  Moved: {} now links to {}.",
+                plan.entry.display(),
+                plan.destination.display()
+            );
+        }
+    }
+    print_move_original(report.original.as_ref());
+    if let (Some((label, before)), Some((_, after))) = (free_before, volume_free(&freed_volume)) {
+        // The change, since a rounded figure can hide it; other programs
+        // writing to the volume meanwhile change it too.
+        let change = match after.checked_sub(before) {
+            Some(gained) => format!("{} more", format_size(gained)),
+            None => format!("{} less", format_size(before - after)),
+        };
+        println!(
+            "  Free space on {label} {} -> {} ({change}).",
+            format_size(before),
+            format_size(after)
+        );
+    }
+    Ok(())
+}
+
+/// Prints `du`'s line for the bytes in the cache's `.hf-fm-move/` directory,
+/// when there are any: an original `cache move --keep-original` kept, or what
+/// an interrupted move left. No listing counts them.
+fn print_move_leftover(bytes: u64, cache_dir: &Path) {
+    if bytes == 0 {
+        return;
+    }
+    println!(
+        "  Not counted above: {} in {} (originals kept by `cache move --keep-original`, \
+         or left by an interrupted move); delete them when you no longer need them.",
+        format_size(bytes),
+        cache_dir.join(cache::MOVE_DIR_NAME).display()
+    );
+}
+
 /// Resolves the named ref (default: `main`) to a commit hash and constructs
 /// the snapshot path. Output is a bare path with no decoration, intended for
 /// shell substitution: `cd $(hf-fm cache path org/model)`.

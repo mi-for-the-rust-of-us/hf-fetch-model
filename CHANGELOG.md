@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`hf-fm cache move <REPO_ID|N> <DIR> [--dry-run] [--yes] [--keep-original]`
+  moves a cached repo to another disk and leaves a link to it in the cache**,
+  in one command instead of `robocopy`, `sha256` and `mklink /J` by hand (the
+  [junction addendum](docs/dogfooding-feedbacks/hf-fm-dogfooding-du-duplicates-cache-cleaning.md),
+  finding 5). The repo lands in `<DIR>/<folder>` (`D:\hf-cache\models--org--name`),
+  every file verified by SHA-256 on both sides. The cache entry becomes a
+  junction on Windows, which needs no administrator rights, or a symlink
+  elsewhere; `hf-hub`, `huggingface_hub` and every hf-fm command follow it.
+  The original is deleted once the link is checked, or kept under
+  `<cache>/.hf-fm-move/` with `--keep-original`.
+  - **`--back`** brings a moved repo back into the cache and replaces the link;
+    a repo already moved can move again to a new `<DIR>`, its old copy
+    deleted (or kept).
+  - The preview names the source and the destination, the bytes, the hard
+    links and symlinks kept as they are, what an interrupted run already
+    copied, the destination's free space, and what becomes of the original;
+    `--dry-run` stops there, and otherwise it prompts once unless `--yes`. A
+    numeric index prints the repo it resolved to, `--yes` or not; datasets and
+    Spaces are addressed as `datasets/org/name`.
+  - A byte progress bar on a terminal, a line per file otherwise. The result
+    states the source volume's free space before and after, and the change.
+  - Interrupted, it resumes when run again, copying only what is missing;
+    nothing in the cache changes until the copy is complete and verified.
+  - `du` and `du --tree` print a line for the bytes in `<cache>/.hf-fm-move/`
+    (a kept original, or what an interrupted move left), which no listing
+    counts, and their `--json` gains `move_leftover_bytes` (omitted when
+    there are none). A 159 GiB kept original must not be invisible.
 - **`cache::plan_move`, `cache::plan_move_back` and `cache::apply_move`
   (`apply_move_with_progress`): move a cached repo to another disk behind a
   link, and back.** The library half of `cache move`, asked for by the

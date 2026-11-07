@@ -6429,3 +6429,243 @@ fn du_and_gc_point_to_cache_dedupe_only_for_model_copies() {
         "and so does gc's preview, got:\n{stdout}"
     );
 }
+
+// -----------------------------------------------------------------------
+// cache move: relocate a repo to another disk behind a link (v0.13.0)
+// -----------------------------------------------------------------------
+
+/// Whether the cache entry `folder` of `hf_home` is a link (a symlink, or a
+/// Windows junction, which `std` reports as one).
+fn entry_is_link(hf_home: &std::path::Path, folder: &str) -> bool {
+    std::fs::symlink_metadata(hf_home.join("hub").join(folder))
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+#[test]
+fn cache_move_help_shows_flags() {
+    let (stdout, stderr, success) = run(hf_fm().args(["cache", "move", "--help"]));
+    assert!(success, "cache move --help failed: {stderr}");
+    for flag in ["--back", "--keep-original", "--yes", "--dry-run", "[DIR]"] {
+        assert!(stdout.contains(flag), "missing {flag} in:\n{stdout}");
+    }
+}
+
+#[test]
+fn cache_move_needs_a_dir_or_back_but_not_both() {
+    let (_dir, _stdout, stderr, success) =
+        run_isolated(hf_fm().args(["cache", "move", "test-org/a"]));
+    assert!(!success, "a move needs a destination");
+    assert!(
+        stderr.contains("<DIR>"),
+        "clap names the missing argument: {stderr}"
+    );
+
+    let (_dir, _stdout, stderr, success) =
+        run_isolated(hf_fm().args(["cache", "move", "test-org/a", "somewhere", "--back"]));
+    assert!(!success, "a destination and --back conflict");
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+}
+
+#[test]
+fn cache_move_dry_run_copies_and_changes_nothing() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--a", "e1", "model.bin", 4096);
+    let disk = dir.path().join("disk");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "move", "test-org/a"])
+        .arg(&disk)
+        .arg("--dry-run"));
+    assert!(success, "cache move --dry-run should succeed: {stderr}");
+    assert!(
+        stdout.contains("Move test-org/a  (8.0 KiB, 2 files)"),
+        "the preview names the repo and its footprint, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("does not exist yet and is created"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("the original is deleted"), "{stdout}");
+    assert!(
+        stdout.contains("Dry run: nothing was copied or changed."),
+        "{stdout}"
+    );
+    assert!(!disk.exists(), "the destination is not created");
+    assert!(!entry_is_link(dir.path(), "models--test-org--a"));
+}
+
+#[test]
+fn cache_move_prompt_declined_changes_nothing() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--a", "e1", "model.bin", 4096);
+    let disk = dir.path().join("disk");
+
+    let (stdout, stderr, success) = run_with_stdin(
+        hf_fm()
+            .env("HF_HOME", dir.path())
+            .args(["cache", "move", "test-org/a"])
+            .arg(&disk),
+        "n\n",
+    );
+    assert!(success, "a declined prompt is not an error: {stderr}");
+    assert!(stdout.contains("Aborted."), "{stdout}");
+    assert!(!disk.exists());
+    assert!(!entry_is_link(dir.path(), "models--test-org--a"));
+}
+
+#[test]
+fn cache_move_and_back_round_trip() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--a", "e1", "model.bin", 4096);
+    let disk = dir.path().join("disk");
+    let snapshot_file = dir
+        .path()
+        .join("hub")
+        .join("models--test-org--a")
+        .join("snapshots")
+        .join("fake0000000000000000000000000000000000000")
+        .join("model.bin");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "move", "test-org/a"])
+        .arg(&disk)
+        .arg("--yes"));
+    assert!(success, "cache move should succeed: {stderr}");
+    assert!(
+        stdout.contains("Copied 2 files (8.0 KiB)") && stdout.contains("each verified by SHA-256"),
+        "the result counts the files copied, got:\n{stdout}"
+    );
+    assert!(stdout.contains("Moved:"), "{stdout}");
+    assert!(stdout.contains("Original deleted"), "{stdout}");
+    assert!(
+        entry_is_link(dir.path(), "models--test-org--a"),
+        "the entry is a link"
+    );
+    assert!(
+        disk.join("models--test-org--a")
+            .join("blobs")
+            .join("e1")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read(&snapshot_file)
+            .expect("read through the link")
+            .len(),
+        4096
+    );
+
+    // `du` marks it relocated and still counts its bytes.
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--json"]));
+    assert!(success, "du --json should succeed: {stderr}");
+    let json = parse_json(&stdout);
+    let entry = json
+        .get("repos")
+        .and_then(|repos| repos.get(0))
+        .expect("one repo");
+    assert_eq!(
+        entry.get("size").and_then(Value::as_u64),
+        Some(8192),
+        "{json}"
+    );
+    assert!(
+        entry.get("relocated_to").is_some_and(Value::is_string),
+        "{json}"
+    );
+    assert!(
+        json.get("move_leftover_bytes").is_none(),
+        "nothing kept: {json}"
+    );
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "move",
+        "test-org/a",
+        "--back",
+        "--yes",
+    ]));
+    assert!(success, "cache move --back should succeed: {stderr}");
+    assert!(
+        stdout.contains("Move back into the cache test-org/a"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Back in the cache at"), "{stdout}");
+    assert!(
+        !entry_is_link(dir.path(), "models--test-org--a"),
+        "a directory again"
+    );
+    assert_eq!(std::fs::read(&snapshot_file).expect("read").len(), 4096);
+    assert!(
+        !disk.join("models--test-org--a").exists(),
+        "the moved copy is deleted"
+    );
+
+    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "move",
+        "test-org/a",
+        "--back",
+        "--yes",
+    ]));
+    assert!(!success, "a repo in the cache cannot move back");
+    assert!(stderr.contains("not behind a link"), "{stderr}");
+}
+
+#[test]
+fn cache_move_keep_original_is_reported_by_du() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--a", "e1", "model.bin", 4096);
+    let disk = dir.path().join("disk");
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "move", "test-org/a"])
+        .arg(&disk)
+        .args(["--yes", "--keep-original"]));
+    assert!(
+        success,
+        "cache move --keep-original should succeed: {stderr}"
+    );
+    assert!(stdout.contains("Original kept at"), "{stdout}");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stdout.contains("Not counted above: 8.0 KiB in") && stdout.contains(".hf-fm-move"),
+        "du states the kept original apart, got:\n{stdout}"
+    );
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--json"]));
+    assert!(success, "du --json should succeed: {stderr}");
+    let json = parse_json(&stdout);
+    assert_eq!(
+        json.get("move_leftover_bytes").and_then(Value::as_u64),
+        Some(8192),
+        "{json}"
+    );
+    assert_eq!(
+        json.get("total_bytes").and_then(Value::as_u64),
+        Some(8192),
+        "not in the total: {json}"
+    );
+}
+
+#[test]
+fn cache_move_by_index_prints_the_repo_and_refuses_a_destination_in_the_cache() {
+    let dir = temp_hf_home();
+    stage_three_repos(dir.path());
+
+    let (stdout, stderr, success) = run(hf_fm()
+        .env("HF_HOME", dir.path())
+        .args(["cache", "move", "1"])
+        .arg(dir.path().join("hub").join("inside"))
+        .arg("--yes"));
+    assert!(!success, "a destination inside the cache is refused");
+    assert!(
+        stdout.contains("index 1 is test-org/large"),
+        "the index's repo is printed first, got:\n{stdout}"
+    );
+    assert!(stderr.contains("inside the cache"), "{stderr}");
+    assert!(repo_exists(dir.path(), "models--test-org--large"));
+    assert!(!entry_is_link(dir.path(), "models--test-org--large"));
+}
