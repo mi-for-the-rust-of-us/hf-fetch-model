@@ -34,7 +34,8 @@ pub use dedupe::{
 pub(crate) use dedupe::{LinkOutcome, link_copy_to_blob};
 pub use relocate::{
     MOVE_DIR_NAME, MoveEvent, MoveKind, MoveOriginal, MovePlan, MoveRecovery, MoveReport,
-    apply_move, apply_move_with_progress, move_leftover_bytes, plan_move, plan_move_back,
+    StrandedMove, apply_move, apply_move_with_progress, move_leftover_bytes, plan_move,
+    plan_move_back, stranded_moves,
 };
 
 /// Filename of the per-repo `hf-fm` snapshot sidecar.

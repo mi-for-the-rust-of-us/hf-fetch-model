@@ -4109,16 +4109,16 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
             &cache_dir,
             verification,
             volumes,
-            cache::move_leftover_bytes()?,
+            &move_leftovers()?,
         );
     }
 
     println!("Cache: {}\n", cache_dir.display());
 
-    let move_leftover = cache::move_leftover_bytes()?;
+    let move_leftover = move_leftovers()?;
     if summaries.is_empty() {
         println!("No models found in local cache.");
-        print_move_leftover(move_leftover, &cache_dir);
+        print_move_leftover(&move_leftover, &cache_dir);
         return Ok(());
     }
 
@@ -4272,7 +4272,7 @@ fn run_du(age: bool, sort: DuSort, verify: bool, json: bool) -> Result<(), Fetch
     if let Some(note) = shared_store_note(store, &cache_dir) {
         println!("{note}");
     }
-    print_move_leftover(move_leftover, &cache_dir);
+    print_move_leftover(&move_leftover, &cache_dir);
     if let Some(v) = &verification {
         print_duplicate_verification(v);
     }
@@ -4624,6 +4624,23 @@ struct DuJson {
     /// Omitted when there are none.
     #[serde(skip_serializing_if = "Option::is_none")]
     move_leftover_bytes: Option<u64>,
+    /// Repos an interrupted move left out of the cache, set aside in
+    /// `.hf-fm-move/` and not put back: what each names may be the only copy
+    /// the cache has, and the next `cache move` of the repo restores it (new
+    /// in v0.13.0). Omitted when there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stranded_moves: Option<Vec<StrandedMoveJson>>,
+}
+
+/// One repo an interrupted move left out of the cache, in `du --json`.
+#[derive(serde::Serialize)]
+struct StrandedMoveJson {
+    /// Repository identifier.
+    repo_id: String,
+    /// `"model"`, `"dataset"` or `"space"`.
+    repo_type: &'static str,
+    /// What was set aside: `<cache>/.hf-fm-move/<folder>.swap`.
+    aside: String,
 }
 
 /// Top-level shape for `du <repo> --json` (per-file drill-down).
@@ -4699,7 +4716,7 @@ fn print_du_json(
     cache_dir: &std::path::Path,
     verification: Option<DuplicateVerification>,
     volumes: Option<Vec<(String, u64)>>,
-    move_leftover: u64,
+    move_leftover: &MoveLeftovers,
 ) -> Result<(), FetchError> {
     let mut total_files: usize = 0;
     let mut duplicated_bytes: u64 = 0;
@@ -4740,7 +4757,8 @@ fn print_du_json(
         shared_store_bytes: (store > 0).then_some(store),
         verification,
         volume_bytes: volumes.map(|v| v.into_iter().collect()),
-        move_leftover_bytes: (move_leftover > 0).then_some(move_leftover),
+        move_leftover_bytes: (move_leftover.bytes > 0).then_some(move_leftover.bytes),
+        stranded_moves: move_leftover.stranded_json(),
     };
     emit_json(&result)
 }
@@ -4751,6 +4769,7 @@ fn print_du_tree_json(
     store: u64,
     cache_dir: &std::path::Path,
 ) -> Result<(), FetchError> {
+    let move_leftover = move_leftovers()?;
     let mut total_files: usize = 0;
     let mut duplicated_bytes: u64 = 0;
     let mut out: Vec<DuRepoJson> = Vec::with_capacity(repos.len());
@@ -4806,7 +4825,8 @@ fn print_du_tree_json(
             cache_dir,
         )
         .map(|v| v.into_iter().collect()),
-        move_leftover_bytes: Some(cache::move_leftover_bytes()?).filter(|&b| b > 0),
+        move_leftover_bytes: (move_leftover.bytes > 0).then_some(move_leftover.bytes),
+        stranded_moves: move_leftover.stranded_json(),
     };
     emit_json(&result)
 }
@@ -5264,10 +5284,10 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
 
     println!("Cache: {}\n", cache_dir.display());
 
-    let move_leftover = cache::move_leftover_bytes()?;
+    let move_leftover = move_leftovers()?;
     if repos.is_empty() {
         println!("No models found in local cache.");
-        print_move_leftover(move_leftover, &cache_dir);
+        print_move_leftover(&move_leftover, &cache_dir);
         return Ok(());
     }
 
@@ -5332,7 +5352,7 @@ fn run_du_tree(age: bool, json: bool) -> Result<(), FetchError> {
     if let Some(note) = shared_store_note(store, &cache_dir) {
         println!("{note}");
     }
-    print_move_leftover(move_leftover, &cache_dir);
+    print_move_leftover(&move_leftover, &cache_dir);
 
     Ok(())
 }
@@ -6226,10 +6246,16 @@ fn volume_free(path: &Path) -> Option<(String, u64)> {
 fn print_move_preview(plan: &cache::MovePlan, keep_original: bool) {
     // BORROW: explicit .as_str() instead of Deref coercion
     let address = plan.repo_type.address(plan.repo_id.as_str());
+    let finish = plan.kind == cache::MoveKind::Finish;
     match plan.recovery {
         Some(cache::MoveRecovery::RestoreAside) => println!(
-            "  An interrupted move left {} set aside: it is put back first.",
-            plan.aside.display()
+            "  An interrupted move left {} set aside: it is put back{}.",
+            plan.aside.display(),
+            if finish {
+                ", which is the whole move"
+            } else {
+                " first"
+            }
         ),
         Some(cache::MoveRecovery::FinishDrop) => println!(
             "  An interrupted move left the original at {}: it is {} first.",
@@ -6239,11 +6265,21 @@ fn print_move_preview(plan: &cache::MovePlan, keep_original: bool) {
         // EXPLICIT: nothing left by an earlier run, nothing to say; future variants likewise
         _ => {}
     }
-    if plan.kind == cache::MoveKind::Finish {
+    if let Some(staging) = &plan.stale_staging {
         println!(
-            "  {address} is already at {}; nothing to copy.",
-            plan.destination.display()
+            "  The files it had copied stay at {}: a later move to that disk resumes from them;              delete them otherwise.",
+            staging.display()
         );
+    }
+    if finish {
+        if plan.recovery == Some(cache::MoveRecovery::RestoreAside) {
+            println!("  Nothing to copy.");
+        } else {
+            println!(
+                "  {address} is already at {}; nothing to copy.",
+                plan.destination.display()
+            );
+        }
         return;
     }
     let heading = if matches!(plan.kind, cache::MoveKind::Back { .. }) {
@@ -6328,7 +6364,7 @@ fn print_move_original(original: Option<&cache::MoveOriginal>) {
             println!("  Original kept at {}.", path.display());
         }
         Some(cache::MoveOriginal::Left { path, reason }) => eprintln!(
-            "warning: the original at {} could not be removed ({reason}); \
+            "warning: the original at {} is still there: {reason}; \
              the move stands, and the next `cache move` of this repo finishes it",
             path.display()
         ),
@@ -6453,6 +6489,18 @@ fn run_cache_move(repo_arg: &str, dir: Option<&Path>, flags: MoveFlags) -> Resul
         };
         println!("  Recovered: {what}.");
     }
+    if plan.kind == cache::MoveKind::Finish
+        && report.recovered == Some(cache::MoveRecovery::RestoreAside)
+    {
+        match cache::relocated_target(&plan.entry) {
+            Some(target) => println!(
+                "  {} links to {} again.",
+                plan.entry.display(),
+                target.display()
+            ),
+            None => println!("  Back in the cache at {}.", plan.entry.display()),
+        }
+    }
     if plan.kind != cache::MoveKind::Finish {
         let resumed = if report.resumed_files > 0 {
             format!(
@@ -6512,17 +6560,70 @@ fn run_cache_move(repo_arg: &str, dir: Option<&Path>, flags: MoveFlags) -> Resul
     Ok(())
 }
 
-/// Prints `du`'s line for the bytes in the cache's `.hf-fm-move/` directory,
-/// when there are any: an original `cache move --keep-original` kept, or what
-/// an interrupted move left. No listing counts them.
-fn print_move_leftover(bytes: u64, cache_dir: &Path) {
-    if bytes == 0 {
+/// What the cache's `.hf-fm-move/` directory holds, for `du`: its bytes, and
+/// the repos an interrupted move left set aside there.
+struct MoveLeftovers {
+    /// Bytes in the directory, which no listing counts.
+    bytes: u64,
+    /// Repos set aside and not put back.
+    stranded: Vec<cache::StrandedMove>,
+}
+
+impl MoveLeftovers {
+    /// The stranded repos for `du --json`, or `None` when there are none.
+    fn stranded_json(&self) -> Option<Vec<StrandedMoveJson>> {
+        (!self.stranded.is_empty()).then(|| {
+            self.stranded
+                .iter()
+                .map(|s| StrandedMoveJson {
+                    // BORROW: explicit .clone() for owned String field
+                    repo_id: s.repo_id.clone(),
+                    repo_type: s.repo_type.label(),
+                    // BORROW: explicit .to_string() for Path → String
+                    aside: s.aside.display().to_string(),
+                })
+                .collect()
+        })
+    }
+}
+
+/// Reads what the cache's `.hf-fm-move/` directory holds.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined or
+/// its `.hf-fm-move/` directory cannot be read.
+fn move_leftovers() -> Result<MoveLeftovers, FetchError> {
+    Ok(MoveLeftovers {
+        bytes: cache::move_leftover_bytes()?,
+        stranded: cache::stranded_moves()?,
+    })
+}
+
+/// Prints `du`'s lines for the cache's `.hf-fm-move/` directory, when it
+/// holds anything: a warning for each repo an interrupted move left out of
+/// the cache (never to be deleted), then the bytes there, which no listing
+/// counts.
+fn print_move_leftover(leftover: &MoveLeftovers, cache_dir: &Path) {
+    for s in &leftover.stranded {
+        // BORROW: explicit .as_str() instead of Deref coercion
+        let address = s.repo_type.address(s.repo_id.as_str());
+        eprintln!(
+            "warning: {address} is out of the cache: an interrupted move left it at {},              which may be its only copy; `hf-fm cache move {address} --back` puts it back              (or rerun the move to resume it)",
+            s.aside.display()
+        );
+    }
+    if leftover.bytes == 0 {
         return;
     }
+    let advice = if leftover.stranded.is_empty() {
+        "delete them when you no longer need them"
+    } else {
+        "put the repos named above back before deleting anything there"
+    };
     println!(
-        "  Not counted above: {} in {} (originals kept by `cache move --keep-original`, \
-         or left by an interrupted move); delete them when you no longer need them.",
-        format_size(bytes),
+        "  Not counted above: {} in {} (originals kept by `cache move --keep-original`,          or left by an interrupted move); {advice}.",
+        format_size(leftover.bytes),
         cache_dir.join(cache::MOVE_DIR_NAME).display()
     );
 }

@@ -19,9 +19,14 @@
 //!   digests agree, so a later run trusts a staged file whose length and
 //!   modification time equal the source's, and copies only the rest.
 //! - `<cache>/.hf-fm-move/<folder>.swap` is the cache entry set aside during
-//!   the swap. Found with the entry missing (or a link that does not
-//!   resolve), it is put back before anything else; found with the entry in
-//!   place, the drop of the original is finished.
+//!   the swap, always whole: a directory is renamed away from that name
+//!   before it is deleted. Found with the entry missing, or a link whose
+//!   destination is missing from a volume that is there, it is put back
+//!   before anything else; found with the entry reading as a repo again, the
+//!   drop of the original is finished. Until then it may be the only copy the
+//!   cache has, which [`stranded_moves`] reports.
+//! - `<cache>/.hf-fm-move/<folder>.drop` is an original being deleted, which
+//!   nothing needs any more.
 //! - `<cache>/.hf-fm-move/<folder>` is an original kept by `keep_original`.
 //!
 //! Hard links inside the repo are kept as hard links (so a repo reclaimed by
@@ -58,6 +63,10 @@ const STAGING_SUFFIX: &str = ".partial";
 /// [`MOVE_DIR_NAME`].
 const ASIDE_SUFFIX: &str = ".swap";
 
+/// Suffix an original directory is renamed to before it is deleted, inside
+/// [`MOVE_DIR_NAME`], so that an aside is never a half-deleted directory.
+const DROP_SUFFIX: &str = ".drop";
+
 /// Suffix of the link created and removed to check that the destination's
 /// volume can hold one, inside [`MOVE_DIR_NAME`].
 const PROBE_SUFFIX: &str = ".probe";
@@ -88,8 +97,11 @@ pub enum MoveKind {
         /// The directory the link points to now, where the bytes are.
         from: PathBuf,
     },
-    /// An earlier move to this destination was interrupted after its swap:
-    /// only its original is left to drop or keep, and nothing is copied.
+    /// An earlier move was interrupted, and finishing what it left is all
+    /// there is to do; nothing is copied. Either its swap was complete and
+    /// its original is left to drop or keep, or (for a move back, or a move to
+    /// where the set-aside link already points) putting the set-aside entry
+    /// back is the whole move.
     Finish,
 }
 
@@ -99,8 +111,9 @@ pub enum MoveKind {
 #[non_exhaustive]
 pub enum MoveRecovery {
     /// The cache entry was set aside and not replaced (the entry is missing,
-    /// or is a link that does not resolve): it is put back, and the move
-    /// starts again from the files already staged.
+    /// an empty directory a link was being made from, or a link whose
+    /// destination is missing from a volume that is there): it is put back,
+    /// and the move starts again from the files already staged.
     RestoreAside,
     /// The swap was complete and the original was being dropped: the drop
     /// (or the keep) is finished.
@@ -157,6 +170,10 @@ pub struct MovePlan {
     pub same_volume: bool,
     /// What an interrupted earlier move left, when it did.
     pub recovery: Option<MoveRecovery>,
+    /// Files an interrupted earlier move staged for another destination than
+    /// this plan's, which it does not use: left in place, for a later move to
+    /// that destination to resume from, or to delete.
+    pub stale_staging: Option<PathBuf>,
     // The cache root.
     cache_dir: PathBuf,
     // The repo's cache folder name (`models--org--model`).
@@ -229,7 +246,8 @@ pub struct MoveReport {
     pub name_mismatches: Vec<PathBuf>,
     /// What an interrupted earlier move left, and was dealt with.
     pub recovered: Option<MoveRecovery>,
-    /// What became of the original; `None` when nothing was moved.
+    /// What became of the original; `None` when nothing was moved, as when
+    /// putting back an entry an interrupted move set aside was the whole move.
     pub original: Option<MoveOriginal>,
 }
 
@@ -270,6 +288,25 @@ pub enum MoveEvent<'a> {
         /// The directory being deleted.
         path: &'a Path,
     },
+}
+
+/// A repo an interrupted move left out of the cache, from [`stranded_moves`]
+/// (new in v0.13.0).
+///
+/// Its cache entry was set aside in the cache's [`MOVE_DIR_NAME`] directory
+/// and not replaced, so no listing of the cache shows the repo, and what was
+/// set aside may be the only copy the cache has. The next `cache move` of the
+/// repo puts it back ([`MoveRecovery::RestoreAside`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StrandedMove {
+    /// The kind of repo.
+    pub repo_type: RepoType,
+    /// The repository identifier (e.g., `"org/model"`).
+    pub repo_id: String,
+    /// What was set aside: `<cache>/.hf-fm-move/<folder>.swap`, a directory,
+    /// or a link to where the repo's bytes are.
+    pub aside: PathBuf,
 }
 
 /// One entry of a repo's tree, relative to its directory.
@@ -328,6 +365,9 @@ enum EntryKind {
 /// Returns [`FetchError::InvalidArgument`] if `dir` is inside the cache or the
 /// repo, if `<dir>/<folder>` already exists, or if its volume lacks the free
 /// space the copy needs.
+/// Returns [`FetchError::InvalidArgument`] if an interrupted move left the
+/// repo's entry set aside and something else is in its place, or its link
+/// leads to a volume that is not there.
 /// Returns [`FetchError::Io`] if the cache directory cannot be determined or
 /// a directory cannot be read.
 pub fn plan_move(repo_type: RepoType, repo_id: &str, dir: &Path) -> Result<MovePlan, FetchError> {
@@ -338,12 +378,30 @@ pub fn plan_move(repo_type: RepoType, repo_id: &str, dir: &Path) -> Result<MoveP
 /// link, back into the cache (new in v0.13.0).
 ///
 /// Its bytes are copied from the directory the link points to into the
-/// cache, and replace the link.
+/// cache, and replace the link. When an interrupted move left the repo's
+/// entry set aside as a directory, putting it back is the whole move
+/// ([`MoveKind::Finish`]).
 ///
 /// # Errors
 ///
-/// Returns [`FetchError::InvalidArgument`] if the repo is not behind a link.
-/// Returns the other errors of [`plan_move`], for the cache's volume.
+/// Returns [`FetchError::InvalidArgument`] if `repo_id` could name a path
+/// outside the cache.
+/// Returns [`FetchError::InvalidArgument`] if the repo is not cached, or is
+/// not behind a link and no interrupted move left anything to finish.
+/// Returns [`FetchError::InvalidArgument`] if the repo's link points to a
+/// directory not named like its cache folder, or holding neither `blobs/` nor
+/// `snapshots/`.
+/// Returns [`FetchError::InvalidArgument`] if a download into the repo is in
+/// progress or was interrupted.
+/// Returns [`FetchError::InvalidArgument`] if a link inside the repo points
+/// outside it.
+/// Returns [`FetchError::InvalidArgument`] if the cache's volume lacks the
+/// free space the copy needs.
+/// Returns [`FetchError::InvalidArgument`] if an interrupted move left the
+/// repo's entry set aside and something else is in its place, or its link
+/// leads to a volume that is not there.
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined or
+/// a directory cannot be read.
 pub fn plan_move_back(repo_type: RepoType, repo_id: &str) -> Result<MovePlan, FetchError> {
     plan_in(&super::hf_cache_dir()?, repo_type, repo_id, None)
 }
@@ -356,7 +414,8 @@ pub fn plan_move_back(repo_type: RepoType, repo_id: &str) -> Result<MovePlan, Fe
 ///
 /// # Errors
 ///
-/// Returns the errors of [`apply_move_with_progress`].
+/// Returns [`FetchError::InvalidArgument`], [`FetchError::Checksum`] or
+/// [`FetchError::Io`] in the cases [`apply_move_with_progress`] lists.
 pub fn apply_move(plan: &MovePlan, keep_original: bool) -> Result<MoveReport, FetchError> {
     apply_move_with_progress(plan, keep_original, |_| {})
 }
@@ -364,8 +423,12 @@ pub fn apply_move(plan: &MovePlan, keep_original: bool) -> Result<MoveReport, Fe
 /// [`apply_move`], reporting each step through `on_event` (new in v0.13.0).
 ///
 /// What an interrupted earlier move left ([`MovePlan::recovery`]) is dealt
-/// with first; the move is then planned again, and must still be the move
-/// `plan` describes. Before any byte is copied, a link to the destination's
+/// with first: an entry set aside is put back, and an original whose drop was
+/// cut short is dropped (or kept), but only once the cache entry is seen to
+/// hold every file the original holds. An original that is still in the way
+/// stops the move there. For [`MoveKind::Finish`] that is all; otherwise the
+/// move is planned again, and must still be the move `plan` describes. Before
+/// any byte is copied, a link to the destination's
 /// parent is created and removed, so a volume that cannot hold one fails
 /// here; a volume that cannot hard-link gets separate copies instead. The
 /// source is walked again after the copy and must not have changed. Any
@@ -382,8 +445,9 @@ pub fn apply_move(plan: &MovePlan, keep_original: bool) -> Result<MoveReport, Fe
 ///
 /// Returns [`FetchError::InvalidArgument`] if the cache changed since the
 /// plan into a different move, if a kept original is in the way of
-/// `keep_original`, if the source changed during the copy, or if the copy did
-/// not read back as copied through the new link (the swap is then undone).
+/// `keep_original`, if an original an interrupted move left cannot be dropped
+/// or kept, if the source changed during the copy, or if the copy did not
+/// read back as copied through the new link (the swap is then undone).
 /// Returns [`FetchError::Checksum`] if a copy does not read back as the bytes
 /// copied.
 /// Returns [`FetchError::Io`] on a filesystem failure; a cache entry that
@@ -412,12 +476,38 @@ where
         )));
     }
 
+    // An original an interrupted drop was deleting: nothing needs it.
+    let _ = remove_any(&move_dir_child(&plan.cache_dir, &plan.folder, DROP_SUFFIX));
     match plan.recovery {
         Some(MoveRecovery::RestoreAside) => restore_aside(plan)?,
         Some(MoveRecovery::FinishDrop) => {
-            report.original = Some(settle_aside(plan, keep_original, &mut on_event));
+            report.original = Some(if entry_holds_aside(plan) {
+                settle_aside(plan, keep_original, &mut on_event)
+            } else {
+                MoveOriginal::Left {
+                    // BORROW: explicit .clone() for owned PathBuf
+                    path: plan.aside.clone(),
+                    // BORROW: explicit .to_owned() for &str → owned String
+                    reason: "the cache entry does not hold every file the original holds, so it was not deleted"
+                        .to_owned(),
+                }
+            });
         }
         None => {}
+    }
+    // A swap needs the aside's name free.
+    if plan.kind != MoveKind::Finish && std::fs::symlink_metadata(&plan.aside).is_ok() {
+        let reason = match &report.original {
+            // BORROW: explicit .as_str() instead of Deref coercion
+            Some(MoveOriginal::Left { reason, .. }) => reason.as_str(),
+            Some(MoveOriginal::Dropped { .. } | MoveOriginal::Kept { .. }) | None => {
+                "it is still there"
+            }
+        };
+        return Err(FetchError::InvalidArgument(format!(
+            "the original an interrupted move left at {} is in the way ({reason}; delete it and run again)",
+            plan.aside.display()
+        )));
     }
     if plan.kind == MoveKind::Finish {
         if let Some(move_dir) = plan.aside.parent() {
@@ -485,6 +575,146 @@ pub fn move_leftover_bytes() -> Result<u64, FetchError> {
     ))
 }
 
+/// Repos an interrupted move left out of the cache: set aside in the cache's
+/// [`MOVE_DIR_NAME`] directory and not put back (new in v0.13.0).
+///
+/// What a [`StrandedMove`] names must not be deleted with the rest of that
+/// directory; the next `cache move` of the repo, `--back` included, puts it
+/// back. Empty when there is none, which is the usual case.
+///
+/// # Errors
+///
+/// Returns [`FetchError::Io`] if the cache directory cannot be determined.
+/// Returns [`FetchError::Io`] if its move directory exists but cannot be read.
+pub fn stranded_moves() -> Result<Vec<StrandedMove>, FetchError> {
+    stranded_in(&super::hf_cache_dir()?)
+}
+
+/// [`stranded_moves`] for the cache at `cache_dir`.
+fn stranded_in(cache_dir: &Path) -> Result<Vec<StrandedMove>, FetchError> {
+    let move_dir = cache_dir.join(MOVE_DIR_NAME);
+    let read = match std::fs::read_dir(&move_dir) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(FetchError::Io {
+                path: move_dir,
+                source: e,
+            });
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|e| FetchError::Io {
+            // BORROW: explicit .clone() for owned PathBuf
+            path: move_dir.clone(),
+            source: e,
+        })?;
+        if let Some(name) = entry.file_name().to_str() {
+            // BORROW: explicit .to_owned() for &str → owned String
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    let stranded = names
+        .iter()
+        .filter_map(|name| {
+            let folder = name.strip_suffix(ASIDE_SUFFIX)?;
+            let (repo_type, repo_id) = crate::cache_layout::parse_repo_folder_name(folder)?;
+            let entry = cache_dir.join(folder);
+            let aside = move_dir.join(name);
+            // Only a finished swap makes the aside an original nothing needs.
+            let finished = matches!(
+                recovery_state(&entry, &aside, &repo_type.address(&repo_id)),
+                Ok(Some(MoveRecovery::FinishDrop))
+            );
+            (!finished).then_some(StrandedMove {
+                repo_type,
+                repo_id,
+                aside,
+            })
+        })
+        .collect();
+    Ok(stranded)
+}
+
+/// What an interrupted move left for the repo whose cache entry is `entry`
+/// and whose aside is `aside`: nothing (no aside), a finished swap (the entry
+/// reads as a repo again), or an entry to put back.
+///
+/// An entry that is a link whose destination is missing is put back only
+/// when the volume of that destination is there (its parent directory
+/// exists), which is the state a swap cut short leaves. A link to a drive
+/// that is not connected is refused instead: the repo may be whole there, and
+/// newer than what was set aside.
+///
+/// # Errors
+///
+/// Returns [`FetchError::InvalidArgument`] if the entry's link leads to a
+/// volume that is not there, or if something else is in the entry's place.
+fn recovery_state(
+    entry: &Path,
+    aside: &Path,
+    address: &str,
+) -> Result<Option<MoveRecovery>, FetchError> {
+    if std::fs::symlink_metadata(aside).is_err() {
+        return Ok(None);
+    }
+    if holds_repo(entry) {
+        return Ok(Some(MoveRecovery::FinishDrop));
+    }
+    let Ok(meta) = std::fs::symlink_metadata(entry) else {
+        // Set aside, and nothing put in its place.
+        return Ok(Some(MoveRecovery::RestoreAside));
+    };
+    if meta.file_type().is_symlink() {
+        let target = link_destination(entry);
+        if target
+            .as_deref()
+            .and_then(Path::parent)
+            .is_some_and(Path::is_dir)
+        {
+            return Ok(Some(MoveRecovery::RestoreAside));
+        }
+        return Err(FetchError::InvalidArgument(format!(
+            "{} links to {}, which cannot be reached, and an interrupted move of {address} left {} \
+             (connect the drive and run again; if it is gone for good, delete the link and rename {} to {})",
+            entry.display(),
+            target.as_deref().unwrap_or(entry).display(),
+            aside.display(),
+            aside.display(),
+            entry.display()
+        )));
+    }
+    // `junction::create` makes the directory, then turns it into a link.
+    if meta.is_dir() && std::fs::read_dir(entry).is_ok_and(|mut d| d.next().is_none()) {
+        return Ok(Some(MoveRecovery::RestoreAside));
+    }
+    Err(FetchError::InvalidArgument(format!(
+        "{} is in the way of restoring {} (move it away and run again)",
+        entry.display(),
+        aside.display()
+    )))
+}
+
+/// Where the link at `link` points, as written, read against the link's own
+/// directory when relative; `None` when it is not a link.
+fn link_destination(link: &Path) -> Option<PathBuf> {
+    let target = strip_verbatim_prefix(std::fs::read_link(link).ok()?);
+    Some(match link.parent() {
+        Some(parent) => parent.join(target),
+        None => target,
+    })
+}
+
+/// Whether `dir` reads as a cached repo: a directory (or a link to one)
+/// holding `blobs/` or `snapshots/`.
+fn holds_repo(dir: &Path) -> bool {
+    std::fs::metadata(dir).is_ok_and(|m| m.is_dir())
+        && (crate::cache_layout::blobs_dir(dir).is_dir()
+            || crate::cache_layout::snapshots_dir(dir).is_dir())
+}
+
 /// Where `keep_original` keeps an original that was a directory in the cache.
 fn kept_path(cache_dir: &Path, folder: &str) -> PathBuf {
     cache_dir.join(MOVE_DIR_NAME).join(folder)
@@ -515,23 +745,18 @@ fn plan_in(
 
     // What an interrupted move left: the entry set aside, and either not
     // replaced (put it back) or replaced (finish the drop).
-    let entry_usable = std::fs::metadata(&entry).is_ok_and(|m| m.is_dir());
-    let recovery = std::fs::symlink_metadata(&aside)
-        .is_ok()
-        .then_some(if entry_usable {
-            MoveRecovery::FinishDrop
-        } else {
-            MoveRecovery::RestoreAside
-        });
-    if recovery == Some(MoveRecovery::RestoreAside)
-        && std::fs::symlink_metadata(&entry).is_ok_and(|m| !m.file_type().is_symlink())
-    {
-        return Err(FetchError::InvalidArgument(format!(
-            "{address}: {} is in the way of restoring {} (move it away and run again)",
-            entry.display(),
-            aside.display()
-        )));
-    }
+    let recovery = recovery_state(&entry, &aside, &address)?;
+    // The files a swap cut short had staged, when its link names them.
+    let interrupted_staging = if recovery == Some(MoveRecovery::RestoreAside) {
+        link_destination(&entry)
+            .and_then(|d| {
+                d.parent()
+                    .map(|p| move_dir_child(p, &folder, STAGING_SUFFIX))
+            })
+            .filter(|staging| staging.is_dir())
+    } else {
+        None
+    };
     // The entry as it is, or as it is once the aside is put back.
     let current = if recovery == Some(MoveRecovery::RestoreAside) {
         &aside
@@ -560,7 +785,8 @@ fn plan_in(
         (Some(dir), Some(target)) => {
             let destination = resolve_dir(dir)?.join(&folder);
             if same_dir(&destination, target) {
-                if recovery != Some(MoveRecovery::FinishDrop) {
+                // Unless an interrupted move left something to finish here.
+                if recovery.is_none() {
                     return Err(FetchError::InvalidArgument(format!(
                         "{address} is already at {} (nothing to move)",
                         destination.display()
@@ -586,7 +812,9 @@ fn plan_in(
             entry.clone(),
         ),
         (None, None) => {
-            if recovery != Some(MoveRecovery::FinishDrop) {
+            // Putting back an entry set aside, or finishing a drop, is all
+            // a move back has left to do.
+            if recovery.is_none() {
                 return Err(FetchError::InvalidArgument(format!(
                     "{address} is not behind a link (nothing to move back)"
                 )));
@@ -629,12 +857,14 @@ fn plan_in(
         available_space: None,
         same_volume: false,
         recovery,
+        stale_staging: None,
         // BORROW: explicit .to_path_buf() for owned PathBuf
         cache_dir: cache_dir.to_path_buf(),
         folder,
         requested_dir: dir.map(Path::to_path_buf),
         entries: Vec::new(),
     };
+    plan.stale_staging = interrupted_staging.filter(|staging| !same_dir(staging, &plan.staging));
     if plan.kind == MoveKind::Finish {
         return Ok(plan);
     }
@@ -965,20 +1195,48 @@ fn staged_matches(staged: &Path, len: u64, modified: Option<SystemTime>) -> bool
     })
 }
 
-/// Puts back the cache entry an interrupted move set aside, removing the link
-/// that does not resolve in its place, if there is one.
+/// Puts back the cache entry an interrupted move set aside, removing what is
+/// in its place: a link that does not resolve, or an empty directory.
 fn restore_aside(plan: &MovePlan) -> Result<(), FetchError> {
-    if std::fs::symlink_metadata(&plan.entry).is_ok_and(|m| m.file_type().is_symlink()) {
-        remove_dir_link(&plan.entry).map_err(|e| FetchError::Io {
-            // BORROW: explicit .clone() for owned PathBuf
-            path: plan.entry.clone(),
-            source: e,
-        })?;
-    }
+    let removed = match std::fs::symlink_metadata(&plan.entry) {
+        Ok(meta) if meta.file_type().is_symlink() => remove_dir_link(&plan.entry),
+        // The empty directory a link was being made from; never a full one.
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir(&plan.entry),
+        Ok(_) | Err(_) => Ok(()),
+    };
+    removed.map_err(|e| FetchError::Io {
+        // BORROW: explicit .clone() for owned PathBuf
+        path: plan.entry.clone(),
+        source: e,
+    })?;
     std::fs::rename(&plan.aside, &plan.entry).map_err(|e| FetchError::Io {
         // BORROW: explicit .clone() for owned PathBuf
         path: plan.aside.clone(),
         source: rename_error(e),
+    })
+}
+
+/// Whether the cache entry holds every entry of the original set aside, the
+/// check before an interrupted move's drop is finished: each directory, each
+/// file with its length, and each link with its target. The entry may hold
+/// more (files downloaded into the moved repo since).
+fn entry_holds_aside(plan: &MovePlan) -> bool {
+    let (Ok(entry), Ok(aside)) = (walk(&plan.entry), walk(&plan.aside)) else {
+        return false;
+    };
+    let held: HashMap<&Path, &EntryKind> = entry
+        .iter()
+        // BORROW: explicit .as_path() for &PathBuf → &Path map key
+        .map(|e| (e.rel.as_path(), &e.kind))
+        .collect();
+    aside.iter().all(|e| {
+        // BORROW: explicit .as_path() for &PathBuf → &Path map key
+        match (held.get(e.rel.as_path()), &e.kind) {
+            (Some(EntryKind::Dir), EntryKind::Dir) => true,
+            (Some(EntryKind::File { len: held, .. }), EntryKind::File { len, .. }) => held == len,
+            (Some(EntryKind::Link { target: held }), EntryKind::Link { target }) => held == target,
+            _ => false,
+        }
     })
 }
 
@@ -1416,23 +1674,37 @@ where
             }
             return match std::fs::rename(&plan.aside, &kept) {
                 Ok(()) => MoveOriginal::Kept { path: kept },
-                Err(e) => left(&plan.aside, e.to_string()),
+                Err(e) => left(
+                    &plan.aside,
+                    format!("failed to rename it to {}: {e}", kept.display()),
+                ),
             };
         }
         on_event(MoveEvent::Dropping { path: &plan.aside });
-        return match std::fs::remove_dir_all(&plan.aside) {
+        // Renamed first, so an aside is never a half-deleted directory.
+        let dropping = move_dir_child(&plan.cache_dir, &plan.folder, DROP_SUFFIX);
+        if let Err(e) = remove_any(&dropping) {
+            return left(&dropping, format!("failed to delete it: {e}"));
+        }
+        if let Err(e) = std::fs::rename(&plan.aside, &dropping) {
+            return left(
+                &plan.aside,
+                format!("failed to rename it to {}: {e}", dropping.display()),
+            );
+        }
+        return match std::fs::remove_dir_all(&dropping) {
             Ok(()) => MoveOriginal::Dropped {
                 // BORROW: explicit .clone() for owned PathBuf
                 path: plan.aside.clone(),
             },
-            Err(e) => left(&plan.aside, e.to_string()),
+            Err(e) => left(&dropping, format!("failed to delete it: {e}")),
         };
     }
 
     // The original was the directory a link pointed to.
     let target = match guarded_target(&plan.aside, &plan.folder, &address) {
         Ok(target) => target,
-        Err(e) => return left(&plan.aside, e.to_string()),
+        Err(e) => return left(&plan.aside, format!("failed to check its target: {e}")),
     };
     // Never the directory the entry now resolves to.
     if std::fs::canonicalize(&plan.entry)
@@ -1445,16 +1717,16 @@ where
     if keep_original {
         return match remove_dir_link(&plan.aside) {
             Ok(()) => MoveOriginal::Kept { path: target },
-            Err(e) => left(&plan.aside, e.to_string()),
+            Err(e) => left(&plan.aside, format!("failed to remove the link: {e}")),
         };
     }
     on_event(MoveEvent::Dropping { path: &target });
     if let Err(e) = std::fs::remove_dir_all(&target) {
-        return left(&target, e.to_string());
+        return left(&target, format!("failed to delete it: {e}"));
     }
     match remove_dir_link(&plan.aside) {
         Ok(()) => MoveOriginal::Dropped { path: target },
-        Err(e) => left(&plan.aside, e.to_string()),
+        Err(e) => left(&plan.aside, format!("failed to remove the link: {e}")),
     }
 }
 
@@ -2097,24 +2369,153 @@ mod tests {
         assert!(elsewhere.join("blobs").is_dir(), "nothing was touched");
     }
 
+    /// The state a swap cut short between its link and its last rename
+    /// leaves: the entry set aside, a link to a destination that does not
+    /// exist yet, and the staged copy beside it. Returns the aside.
+    fn cut_short_swap(f: &Fixture, dest: &Path) -> PathBuf {
+        let staging = move_dir_child(dest, FOLDER, STAGING_SUFFIX);
+        std::fs::create_dir_all(&staging).unwrap();
+        let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
+        std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
+        std::fs::rename(&f.repo, &aside).unwrap();
+        create_dir_link(&dest.join(FOLDER), &f.repo).unwrap();
+        aside
+    }
+
     #[test]
     fn an_entry_set_aside_and_not_replaced_is_put_back_and_moved() {
         let f = fixture();
         let before = contents(&f.repo);
-        let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
-        std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
-        std::fs::rename(&f.repo, &aside).unwrap();
-        // The crash came after the link was made: it does not resolve yet.
-        create_dir_link(&f.dest.join(FOLDER), &f.repo).unwrap();
+        let aside = cut_short_swap(&f, &f.dest);
+        assert_eq!(
+            stranded_in(&f.cache).unwrap(),
+            vec![StrandedMove {
+                repo_type: RepoType::Model,
+                repo_id: "org/model".to_owned(),
+                aside: aside.clone(),
+            }],
+            "what `du` warns about"
+        );
 
         let p = plan(&f, &f.dest).unwrap();
         assert_eq!(p.recovery, Some(MoveRecovery::RestoreAside));
         assert_eq!(p.kind, MoveKind::Relocate);
+        assert_eq!(p.stale_staging, None, "the staging is this move's own");
         let report = apply_move(&p, false).unwrap();
         assert_eq!(report.recovered, Some(MoveRecovery::RestoreAside));
         assert!(super::super::relocated_target(&f.repo).is_some());
         assert_eq!(contents(&f.repo), before);
         assert!(!aside.exists());
+        assert!(
+            stranded_in(&f.cache).unwrap().is_empty(),
+            "nothing stranded once the move is done"
+        );
+    }
+
+    #[test]
+    fn back_after_a_cut_short_swap_only_puts_the_entry_back() {
+        let f = fixture();
+        let before = contents(&f.repo);
+        let aside = cut_short_swap(&f, &f.dest);
+        let staging = move_dir_child(&f.dest, FOLDER, STAGING_SUFFIX);
+
+        let p = plan_back(&f).unwrap();
+        assert_eq!(p.kind, MoveKind::Finish);
+        assert_eq!(p.recovery, Some(MoveRecovery::RestoreAside));
+        assert!(
+            p.stale_staging
+                .as_deref()
+                .is_some_and(|s| same_dir(s, &staging)),
+            "{:?}",
+            p.stale_staging
+        );
+        let report = apply_move(&p, false).unwrap();
+        assert_eq!(report.recovered, Some(MoveRecovery::RestoreAside));
+        assert!(
+            super::super::relocated_target(&f.repo).is_none(),
+            "a directory again"
+        );
+        assert_eq!(contents(&f.repo), before);
+        assert!(!aside.exists());
+        assert!(!f.cache.join(MOVE_DIR_NAME).exists());
+        assert!(staging.is_dir(), "the staged copy is left for the user");
+    }
+
+    #[test]
+    fn a_move_elsewhere_after_a_cut_short_swap_names_the_stale_staging() {
+        let f = fixture();
+        let before = contents(&f.repo);
+        let _ = cut_short_swap(&f, &f.dest);
+        let other = f.dest.parent().unwrap().join("dest2");
+        let p = plan(&f, &other).unwrap();
+        let staging = move_dir_child(&f.dest, FOLDER, STAGING_SUFFIX);
+        assert!(
+            p.stale_staging
+                .as_deref()
+                .is_some_and(|s| same_dir(s, &staging)),
+            "{:?}",
+            p.stale_staging
+        );
+        let _ = apply_move(&p, false).unwrap();
+        assert!(same_dir(
+            &super::super::relocated_target(&f.repo).unwrap(),
+            &other.join(FOLDER)
+        ));
+        assert_eq!(contents(&f.repo), before);
+    }
+
+    #[test]
+    fn a_link_to_a_volume_that_is_not_there_is_never_restored_over() {
+        let f = fixture();
+        let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
+        std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
+        std::fs::rename(&f.repo, &aside).unwrap();
+        // A drive unplugged: not even the destination's parent is there.
+        let unplugged = f.dest.join("unplugged").join(FOLDER);
+        create_dir_link(&unplugged, &f.repo).unwrap();
+
+        for result in [plan(&f, &f.dest), plan_back(&f)] {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("cannot be reached"), "{err}");
+        }
+        assert!(aside.is_dir(), "the aside is untouched");
+        assert!(
+            std::fs::symlink_metadata(&f.repo)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(stranded_in(&f.cache).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_directory_left_by_a_cut_short_link_is_replaced() {
+        let f = fixture();
+        let before = contents(&f.repo);
+        let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
+        std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
+        std::fs::rename(&f.repo, &aside).unwrap();
+        // `junction::create` made the directory and stopped there.
+        std::fs::create_dir(&f.repo).unwrap();
+
+        let p = plan(&f, &f.dest).unwrap();
+        assert_eq!(p.recovery, Some(MoveRecovery::RestoreAside));
+        let _ = apply_move(&p, false).unwrap();
+        assert!(super::super::relocated_target(&f.repo).is_some());
+        assert_eq!(contents(&f.repo), before);
+    }
+
+    #[test]
+    fn a_full_directory_in_the_entry_place_is_refused() {
+        let f = fixture();
+        let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
+        std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
+        std::fs::rename(&f.repo, &aside).unwrap();
+        std::fs::create_dir(&f.repo).unwrap();
+        std::fs::write(f.repo.join("note.txt"), b"mine").unwrap();
+        let err = plan(&f, &f.dest).unwrap_err();
+        assert!(err.to_string().contains("in the way"), "{err}");
+        assert!(aside.is_dir() && f.repo.join("note.txt").is_file());
     }
 
     #[test]
@@ -2126,6 +2527,10 @@ mod tests {
         let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
         std::fs::rename(kept_path(&f.cache, FOLDER), &aside).unwrap();
 
+        assert!(
+            stranded_in(&f.cache).unwrap().is_empty(),
+            "an original after a finished swap is not stranded"
+        );
         let again = plan(&f, &f.dest).unwrap();
         assert_eq!(again.recovery, Some(MoveRecovery::FinishDrop));
         assert_eq!(again.kind, MoveKind::Finish);
@@ -2140,6 +2545,65 @@ mod tests {
             super::super::relocated_target(&f.repo).is_some(),
             "the move stands"
         );
+    }
+
+    #[test]
+    fn an_interrupted_drop_is_not_finished_when_the_entry_lacks_a_file() {
+        let f = fixture();
+        let p = plan(&f, &f.dest).unwrap();
+        let _ = apply_move(&p, true).unwrap();
+        let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
+        std::fs::rename(kept_path(&f.cache, FOLDER), &aside).unwrap();
+        let config = rel(&["snapshots", "c0ffee", "config.json"]);
+        std::fs::remove_file(p.destination.join(&config)).unwrap();
+
+        let again = plan(&f, &f.dest).unwrap();
+        assert_eq!(again.recovery, Some(MoveRecovery::FinishDrop));
+        let report = apply_move(&again, false).unwrap();
+        let Some(MoveOriginal::Left { path, reason }) = report.original else {
+            panic!("{:?}", report.original);
+        };
+        assert_eq!(path, aside);
+        assert!(reason.contains("does not hold"), "{reason}");
+        assert!(aside.join(&config).is_file(), "the original is whole");
+    }
+
+    #[test]
+    fn an_original_left_in_the_way_stops_the_next_move_before_copying() {
+        let f = fixture();
+        let p = plan(&f, &f.dest).unwrap();
+        let _ = apply_move(&p, true).unwrap();
+        let aside = move_dir_child(&f.cache, FOLDER, ASIDE_SUFFIX);
+        std::fs::rename(kept_path(&f.cache, FOLDER), &aside).unwrap();
+        // A second kept original makes keeping this one impossible.
+        std::fs::create_dir_all(kept_path(&f.cache, FOLDER)).unwrap();
+
+        let other = f.dest.parent().unwrap().join("dest2");
+        let again = plan(&f, &other).unwrap();
+        assert!(matches!(again.kind, MoveKind::MoveAgain { .. }));
+        let err = apply_move(&again, true).unwrap_err();
+        assert!(err.to_string().contains("in the way"), "{err}");
+        assert!(aside.is_dir());
+        assert!(!again.staging.exists(), "nothing was copied");
+        assert!(same_dir(
+            &super::super::relocated_target(&f.repo).unwrap(),
+            &p.destination
+        ));
+    }
+
+    #[test]
+    fn an_original_being_deleted_is_cleared_by_the_next_move() {
+        let f = fixture();
+        let dropping = move_dir_child(&f.cache, FOLDER, DROP_SUFFIX);
+        std::fs::create_dir_all(dropping.join("blobs")).unwrap();
+        std::fs::write(dropping.join("blobs").join("half"), b"x").unwrap();
+        assert!(
+            stranded_in(&f.cache).unwrap().is_empty(),
+            "a `.drop` is never stranded"
+        );
+        let p = plan(&f, &f.dest).unwrap();
+        let _ = apply_move(&p, false).unwrap();
+        assert!(!f.cache.join(MOVE_DIR_NAME).exists());
     }
 
     #[test]

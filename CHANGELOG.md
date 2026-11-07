@@ -32,10 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     states the source volume's free space before and after, and the change.
   - Interrupted, it resumes when run again, copying only what is missing;
     nothing in the cache changes until the copy is complete and verified.
+    A move cut short during its swap is finished or undone by the next
+    `cache move` of the repo; when it left the entry set aside, `--back`
+    puts it back and does nothing more.
   - `du` and `du --tree` print a line for the bytes in `<cache>/.hf-fm-move/`
     (a kept original, or what an interrupted move left), which no listing
     counts, and their `--json` gains `move_leftover_bytes` (omitted when
-    there are none). A 159 GiB kept original must not be invisible.
+    there are none). A 159 GiB kept original must not be invisible. A repo
+    a move cut short left set aside there, which may be its only copy, gets
+    a warning naming the command that puts it back instead of the advice to
+    delete, and `--json` lists it under `stranded_moves`.
 - **`cache::plan_move`, `cache::plan_move_back` and `cache::apply_move`
   (`apply_move_with_progress`): move a cached repo to another disk behind a
   link, and back.** The library half of `cache move`, asked for by the
@@ -59,9 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Interruptible.** A staged file with the source's length and
     modification time is trusted, so a rerun copies only what is missing. The
     cache entry set aside during the swap (`<cache>/.hf-fm-move/<folder>.swap`)
-    is put back, or its drop finished, by the next move of the repo. Any
-    failure before the swap leaves the cache untouched, and a swap that fails
-    or does not read back is undone.
+    is always whole, since an original is renamed away from that name before
+    it is deleted. The next move of the repo puts it back, or finishes its
+    drop once the new entry holds every file it holds; a link to a drive that
+    is not connected is refused rather than restored over. Any failure before
+    the swap leaves the cache untouched, and a swap that fails or does not
+    read back is undone.
+  - `cache::stranded_moves` names each repo an interrupted move left set
+    aside and not put back (`StrandedMove`), which may be its only copy.
   - A blob whose content does not hash to the SHA-256 it is named by is moved
     as it is and reported (`MoveReport::name_mismatches`): the cache's copy
     was already corrupt.

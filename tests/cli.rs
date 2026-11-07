@@ -6669,3 +6669,61 @@ fn cache_move_by_index_prints_the_repo_and_refuses_a_destination_in_the_cache() 
     assert!(repo_exists(dir.path(), "models--test-org--large"));
     assert!(!entry_is_link(dir.path(), "models--test-org--large"));
 }
+
+#[test]
+fn cache_move_back_puts_back_an_entry_an_interrupted_move_set_aside() {
+    let dir = temp_hf_home();
+    stage_blob_and_copy(dir.path(), "models--test-org--a", "e1", "model.bin", 4096);
+    let hub = dir.path().join("hub");
+    let move_dir = hub.join(".hf-fm-move");
+    let aside = move_dir.join("models--test-org--a.swap");
+    std::fs::create_dir_all(&move_dir).expect("create move dir");
+    // A move cut short after it set the entry aside: the aside is the only copy.
+    std::fs::rename(hub.join("models--test-org--a"), &aside).expect("set aside");
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(
+        stderr.contains("warning: test-org/a is out of the cache")
+            && stderr.contains("cache move test-org/a --back"),
+        "du warns that the aside is the repo, got:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("put the repos named above back before deleting anything there")
+            && !stdout.contains("delete them when you no longer need them"),
+        "du never tells to delete a stranded repo, got:\n{stdout}"
+    );
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args(["du", "--json"]));
+    assert!(success, "du --json should succeed: {stderr}");
+    let json = parse_json(&stdout);
+    let stranded = json
+        .get("stranded_moves")
+        .and_then(|s| s.get(0))
+        .expect("one stranded repo");
+    assert_eq!(
+        stranded.get("repo_id").and_then(Value::as_str),
+        Some("test-org/a"),
+        "{json}"
+    );
+
+    let (stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).args([
+        "cache",
+        "move",
+        "test-org/a",
+        "--back",
+        "--yes",
+    ]));
+    assert!(success, "cache move --back should put it back: {stderr}");
+    assert!(
+        stdout.contains("which is the whole move") && stdout.contains("Nothing to copy."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Back in the cache at"), "{stdout}");
+    assert!(repo_exists(dir.path(), "models--test-org--a"));
+    assert!(!entry_is_link(dir.path(), "models--test-org--a"));
+    assert!(!move_dir.exists(), "nothing is left aside");
+
+    let (_stdout, stderr, success) = run(hf_fm().env("HF_HOME", dir.path()).arg("du"));
+    assert!(success, "du should succeed: {stderr}");
+    assert!(!stderr.contains("out of the cache"), "{stderr}");
+}
