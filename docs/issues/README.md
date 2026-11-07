@@ -7,7 +7,7 @@ This folder archives comments drafted or posted on upstream issues (primarily [h
 
 ## Thread status
 
-*Checked against GitHub on 2026-11-01.* One row per thread. Threads that are closed, or where nothing is left for us to do, are listed under **Done**; threads with an upstream issue or PR still open are under **Open**, with whatever would move them on. The per-file list is [below](#current-archive).
+*Checked against GitHub on 2026-11-07.* One row per thread. Threads that are closed, or where nothing is left for us to do, are listed under **Done**; threads with an upstream issue or PR still open are under **Open**, with whatever would move them on. The per-file list is [below](#current-archive).
 
 ### Open
 
@@ -20,6 +20,9 @@ This folder archives comments drafted or posted on upstream issues (primarily [h
 | [candle #3448](https://github.com/huggingface/candle/issues/3448): Gemma 4 load | AlpineVibrations | our comment ([p5](candle-3448-p5.md)), 2026-04-26 | [#3608](https://github.com/huggingface/candle/pull/3608) (eddyb): draft, idle since 2026-06-12 | None |
 | [candle #3401](https://github.com/huggingface/candle/issues/3401): LightOnOCR-2-1B | Abhinav5132 | our comment, 2026-04-16 | [#3772](https://github.com/huggingface/candle/pull/3772) (the reporter): open | None |
 | [candle #2875](https://github.com/huggingface/candle/issues/2875): F8_E4M3 quantize error | AlpineVibrations | our comment, 2026-08-24 | none | None |
+| [candle #4018](https://github.com/huggingface/candle/issues/4018): Apertus model support | saona-raimundo | our [p1](candle-4018-p1.md), 2026-11-07: checkpoint layout of four Apertus checkpoints, the raw xIELU `alpha_p` overflowing a naive `softplus` in the 8B models, the 1.5B's RoPE config unreadable by `llama.rs`'s types | none yet (the author offers to write it) | None: the author and the maintainers decide on scope |
+| [candle #4031](https://github.com/huggingface/candle/issues/4031): Whisper encoder, strided vs contiguous input | Trisert | our [p1](candle-4031-p1.md), 2026-11-07: no layout dependence on 0.11.1 with real weights and a real mel, stage by stage; a mis-laid-out fresh window gives a difference of the same order; asks the reporter for an equality check and build details | none | None: awaiting the reporter |
+| candle `__cpuid_count` E0133 (candle-core 0.11.1 fails on Rust 1.91-1.93, x86_64) | us (after [#4076](https://github.com/huggingface/candle/pull/4076), closed unmerged by its author 2026-11-06) | **our [#4097](https://github.com/huggingface/candle/pull/4097)**, opened 2026-11-06 | #4097: open, no review, both CI runs at `action_required` | None: awaiting workflow approval and a review. The PR's text and our 2026-10-31 comment on #4076 are not archived here |
 
 ### Done
 
@@ -103,6 +106,8 @@ When archiving, **flag anything that's not 100% faithful or not 100% correct**:
 | [candle-3530-p2.md](candle-3530-p2.md) | candle #3530 — best-guess repo identification + corrected on-disk math | Posted (2026-05-13) |
 | [candle-3628-p1.md](candle-3628-p1.md) | candle PR #3628 — status after 4½ months: re-verified on `main`, `repeat_n` fix, re-fuzzed, scope since June (#3688 closed; overlaps #3626 and #3961); reviewed with fresh eyes before posting | Posted (2026-11-01) |
 | [candle-3530-p3.md](candle-3530-p3.md) | candle #3530 — answering the maintainer: figures re-checked, the ~14 GiB is a remainder, the 18 GiB KV pool is the configured context (xinfer at `cf9b63b`) | Posted (2026-11-01) |
+| [candle-4018-p1.md](candle-4018-p1.md) | candle #4018 — Apertus: layout of four checkpoints via `hf-fm inspect`; raw xIELU `alpha_p` up to 174 overflow a naive `softplus` (measured in candle 0.11.0); the 1.5B's `rope_type: "default"` breaks `llama.rs`'s config types; reference table and collapsible data; reviewed with fresh eyes before posting | Posted (2026-11-07) |
+| [candle-4031-p1.md](candle-4031-p1.md) | candle #4031 — Whisper encoder strided vs contiguous: confirms zsewasdsdsd's no-repro on 0.11.1 with a real mel, stage by stage; a mis-laid-out fresh window reproduces the order of magnitude, from `conv1`; reviewed with fresh eyes before posting | Posted (2026-11-07) |
 | [candle-3617-p1.md](candle-3617-p1.md) | candle #3617 — `.pth` pickle-VM DoS (issue we opened) | Posted |
 | [candle-3617-p2.md](candle-3617-p2.md) | candle #3617 — PR #3628 announced | Posted |
 | [candle-3617-p3.md](candle-3617-p3.md) | candle #3617 — consolidating sibling reports #3619/#3620 | Posted |
