@@ -2,9 +2,9 @@
 
 *See what the HuggingFace cache holds, decide what to keep, and reclaim the rest — with a dry-run before anything is deleted.*
 
-*~2,830 words · about 11 min read*
+*~2,980 words · about 12 min read*
 
-<!-- Last updated: 2026-11-01, hf-fm v0.12.6 -->
+<!-- Last updated: 2026-11-07, hf-fm v0.13.0 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -45,6 +45,10 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    their pointer lines were updated to the text v0.12.6 prints for that same
    state (the footer note, the gc line, the du <repo> hint), since v0.12.5's
    pointed to issue #21, which this release resolves.
+
+   v0.13.0 (2026-11-07) adds the cache move preview, a --dry-run of the
+   cache's largest repo on the same machine (it reads only; the repo was not
+   moved), captured from a --release build of main.
 3. Safety: every destructive command appears with --dry-run, or with its
    confirmation prompt visible and answered `n`. Never paste an output
    that shows an actual deletion the reader did not see previewed first.
@@ -400,7 +404,24 @@ hf-fm cache delete julien-c/dummy-unknown EleutherAI/pythia-70m --dry-run
 
 Mind the indexes. They are the `#` of the last `du`, and they shift after each deletion, so a list of indexes read off one `du` and deleted one call at a time would remove the wrong repos from the second call on. In one call they are all resolved against the same listing, and each prints the repo it stands for, `--yes` or not (`index 3 is org/name`). A dataset or Space is deleted behind its prefix: `cache delete datasets/org/name`.
 
-**A repo moved to another disk.** To free `C:` without a second cache, a repo can be copied to another disk and a junction (or symlink) left at its old path; `du` follows it and marks the row `→ D:\hf-cache\models--gpt2`, and the footer says what each disk holds (`By volume: C: 762.71 GiB · D: 525.44 MiB`). Deleting such a repo removes the link and leaves the bytes, and says so:
+**A repo moved to another disk.** To free `C:` without a second cache, move a repo to another disk and leave a link at its old path. Since v0.13.0 `cache move` does the whole job. It copies the repo, hashing every file on both sides, and replaces its cache entry with a link: a junction on Windows, which needs no administrator rights, a symlink elsewhere. It checks the link, then deletes the original. Preview it first:
+
+```sh
+hf-fm cache move mntss/clt-gemma-2-2b-2.5M D:\hf-cache --dry-run
+```
+
+```
+  Move mntss/clt-gemma-2-2b-2.5M  (159.05 GiB, 54 files)
+    from  C:\Users\Eric JACOPIN\.cache\huggingface\hub\models--mntss--clt-gemma-2-2b-2.5M
+    to    D:\hf-cache\models--mntss--clt-gemma-2-2b-2.5M
+  Free space on D: 464.10 GiB.
+  Then C:\Users\Eric JACOPIN\.cache\huggingface\hub\models--mntss--clt-gemma-2-2b-2.5M is replaced by a link, and the original is deleted.
+  Dry run: nothing was copied or changed.
+```
+
+Without `--dry-run` it asks once, then copies with a progress bar and prints `C:`'s free space before and after. Nothing in the cache changes until the copy is complete and verified, so an interrupted move leaves the repo where it was, and running the command again copies only what is missing. `--keep-original` keeps the original under `<cache>/.hf-fm-move/` until you have checked the copy (`du` reports those bytes on a line of their own), and `cache move <repo> --back` brings a moved repo home.
+
+Every tool follows the link. `du` marks the row `→ D:\hf-cache\models--gpt2`, and the footer says what each disk holds (`By volume: C: 762.71 GiB · D: 525.44 MiB`). Deleting such a repo removes the link and leaves the bytes, and says so:
 
 ```sh
 hf-fm cache delete gpt2 --dry-run
@@ -512,6 +533,7 @@ cd (hf-fm cache path google/gemma-2-2b-it)         # PowerShell
 | What's inside repo #N? | `du <N>` |
 | Is this repo healthy? | `status <repo>`, `cache verify <repo\|N>` |
 | Remove repos | `cache delete <repo\|N>...` (`--dry-run`; a repo behind a link loses the link, `--with-target` the bytes) |
+| Move a repo to another disk, and back | `cache move <repo\|N> <DIR>` (`--dry-run` first; `--back`, `--keep-original`) |
 | Remove interrupted-download leftovers | `cache clean-partial` |
 | Reclaim space in bulk | `cache gc --older-than D` / `--max-size S` (+ `--except`, always `--dry-run` first) |
 | Hand the path to another tool | `cache path <repo>` |

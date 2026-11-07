@@ -67,6 +67,7 @@ Without `--force`, a stale local registry index can cause `cargo install` to exi
 | `hf-fm cache dedupe [REPO_ID\|N]...` | Reclaim the duplicated copies (Windows): replace each snapshot file that equals its blob with a hard link to it, keeping every model; `--dry-run` to preview |
 | `hf-fm cache delete <REPO_ID\|N>...` | Delete cached repos: several per call, `--dry-run` to preview; a repo moved to another disk behind a link loses the link only |
 | `hf-fm cache gc --older-than/--max-size` | Garbage-collect cached models by age and/or size budget |
+| `hf-fm cache move <REPO_ID\|N> <DIR>` | Move a cached repo to another disk and leave a link to it in the cache, every file verified by SHA-256; `--back` brings it back, `--dry-run` to preview |
 | `hf-fm cache path <REPO_ID\|N>` | Print snapshot directory path (for scripting) |
 | `hf-fm cache verify <REPO_ID\|N>` | Re-verify SHA256 digests of cached files against HF LFS metadata |
 | `hf-fm diff <REPO_A> <REPO_B>` | Compare tensor layouts between two models |
@@ -422,6 +423,18 @@ $ hf-fm cache delete gpt2 --dry-run
   gpt2  (525.44 MiB, 7 files)  → D:\hf-cache\models--gpt2
   Only the link is removed: its 525.44 MiB stay at D:\hf-cache\models--gpt2. `--with-target` deletes them too.
   Dry run: would delete 1 repo, freeing 0 B. Nothing was deleted.
+```
+
+Since 0.13.0 `cache move` makes such a repo in one command. It copies the repo to the other disk, hashing every file on both sides, and replaces its cache entry with a link: a junction on Windows, which needs no administrator rights, a symlink elsewhere. Then it deletes the original (`--keep-original` keeps it), and `--back` undoes the move. An interrupted move resumes where it stopped. On the same cache, for the largest repo:
+
+```
+$ hf-fm cache move mntss/clt-gemma-2-2b-2.5M D:\hf-cache --dry-run
+  Move mntss/clt-gemma-2-2b-2.5M  (159.05 GiB, 54 files)
+    from  C:\Users\Eric JACOPIN\.cache\huggingface\hub\models--mntss--clt-gemma-2-2b-2.5M
+    to    D:\hf-cache\models--mntss--clt-gemma-2-2b-2.5M
+  Free space on D: 464.10 GiB.
+  Then C:\Users\Eric JACOPIN\.cache\huggingface\hub\models--mntss--clt-gemma-2-2b-2.5M is replaced by a link, and the original is deleted.
+  Dry run: nothing was copied or changed.
 ```
 
 The [cache tutorial](docs/tutorials/clean-up-before-your-disk-fills.md) walks through all of it.

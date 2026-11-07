@@ -297,3 +297,23 @@ for skip in &report.skipped {
     println!("left alone {}: {}", skip.path.display(), skip.reason);
 }
 ```
+
+`cache::plan_move` and `cache::apply_move` (since v0.13.0) move a repo to another disk and leave a link to it in the cache, as `hf-fm cache move` does. The plan only reads, refuses what the move could not do safely, and counts what an interrupted earlier run already copied. The apply step copies and verifies every file, swaps the cache entry for a link, checks it, and drops the original (or keeps it, with `true`). `cache::plan_move_back` plans the way home, and `cache::apply_move_with_progress` reports each step to a callback:
+
+```rust
+use hf_fetch_model::cache;
+use std::path::Path;
+
+let plan = cache::plan_move(
+    cache::RepoType::Model,
+    "mntss/clt-gemma-2-2b-2.5M",
+    Path::new("D:/hf-cache"),
+)?;
+println!("{} bytes to copy into {}", plan.bytes_to_copy(), plan.destination.display());
+let report = cache::apply_move_with_progress(&plan, false, |event| {
+    if let cache::MoveEvent::Progress { done, total } = event {
+        eprint!("\r{done}/{total}");
+    }
+})?;
+println!("copied {} bytes, {} resumed", report.copied_bytes, report.resumed_bytes);
+```

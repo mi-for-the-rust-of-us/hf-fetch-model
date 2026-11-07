@@ -26,6 +26,7 @@ cargo install hf-fetch-model --features cli
 - [Cache dedupe flags](#cache-dedupe-flags)
 - [Cache delete flags](#cache-delete-flags)
 - [Cache gc flags](#cache-gc-flags)
+- [Cache move flags](#cache-move-flags)
 - [Cache verify flags](#cache-verify-flags)
 - [Diff flags](#diff-flags)
 - [Download flags](#download-flags)
@@ -52,6 +53,7 @@ cargo install hf-fetch-model --features cli
 | `cache clean-partial [REPO_ID\|N]` | Remove interrupted downloads' temp files (`.chunked.part`, and `hf-hub` / `huggingface_hub`'s `.incomplete`) |
 | `cache dedupe [REPO_ID\|N]...` | Reclaim the duplicated copies: replace each snapshot file that equals its blob with a hard link to it (every cached model when no repo is given), `--dry-run` to preview |
 | `cache delete <REPO_ID\|N>...` | Delete cached repos (each `models--org--name/` directory): several per call, `--dry-run` to preview, a repo moved behind a link loses the link only |
+| `cache move <REPO_ID\|N> <DIR>` | Move a cached repo to another disk and leave a link to it in the cache (copy, verify by SHA-256, link, delete or keep the original); `--back` brings it back, `--dry-run` to preview |
 | `cache path <REPO_ID\|N>` | Print the snapshot directory path for scripting |
 | `cache verify <REPO_ID\|N>` | Re-verify SHA256 digests of cached files against HuggingFace LFS metadata |
 | `inspect <REPO_ID> [FILENAME]` | Inspect `.safetensors` / `.npz` / `.gguf` / `.pth` headers (remote or cached) — tensor names, shapes, dtypes; auto-detects PEFT adapter config |
@@ -439,7 +441,7 @@ hf-fm du datasets/wikitext
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--age` | Show a last-modified age column (e.g., `2 days ago`, `3 months ago`) | off |
-| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,repo_type,size,shared_bytes?,duplicated_bytes,relocated_to?,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,duplicated_bytes,total_files,repo_count,shared_store_bytes?,volume_bytes?,verification?}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max`, with the same meaning as in `list-files --json`, are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down `{cache_dir,repo_id,repo_type,files[{filename,size}],total_bytes,listed_bytes,duplicated_bytes,orphan_blob_bytes,partial_bytes,bookkeeping_bytes,relocated_to?,shared_bytes?,file_count,has_partial,quant_alternatives,size_min,size_max,verification?}` with the same quant-range fields. A repo's `size` and `total_bytes`, and the flat view's top-level `total_bytes`, are **bytes on disk**: everything in the repo's directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars), each physical file counted once, plus the payloads the repo links to in `huggingface_hub`'s shared blob store (see below), so the flat view's `size` equals `du <REPO_ID> --json`'s `total_bytes` for the same repo. Per-file `size`, and so `size_min`/`size_max`, is each file's own size, and `listed_bytes` (since v0.12.2) is the sum of `files[].size`. It is smaller than `total_bytes` where snapshot entries are copies of their blobs, as files `hf-hub` writes on Windows were until v0.12.6 (and are until `cache dedupe`, for a cache filled before it), and larger where symlinked entries share one blob, as across several cached revisions. Before v0.12.2, `total_bytes` was that sum ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)). | off |
+| `--json` | Output disk usage as JSON. Flat: `{repos:[{repo_id,repo_type,size,shared_bytes?,duplicated_bytes,relocated_to?,file_count,has_partial,last_modified,quant_alternatives,size_min,size_max}],total_bytes,duplicated_bytes,total_files,repo_count,shared_store_bytes?,volume_bytes?,move_leftover_bytes?,verification?}` (`last_modified` is Unix epoch seconds, regardless of `--age`; `quant_alternatives`/`size_min`/`size_max`, with the same meaning as in `list-files --json`, are present per repo whether flat or `--tree`); `--tree` nests a `files` array per repo; `du <REPO_ID> --json` emits the per-file drill-down `{cache_dir,repo_id,repo_type,files[{filename,size}],total_bytes,listed_bytes,duplicated_bytes,orphan_blob_bytes,partial_bytes,bookkeeping_bytes,relocated_to?,shared_bytes?,file_count,has_partial,quant_alternatives,size_min,size_max,verification?}` with the same quant-range fields. A repo's `size` and `total_bytes`, and the flat view's top-level `total_bytes`, are **bytes on disk**: everything in the repo's directory (`blobs/`, `snapshots/`, `refs/`, hf-fm's sidecars), each physical file counted once, plus the payloads the repo links to in `huggingface_hub`'s shared blob store (see below), so the flat view's `size` equals `du <REPO_ID> --json`'s `total_bytes` for the same repo. Per-file `size`, and so `size_min`/`size_max`, is each file's own size, and `listed_bytes` (since v0.12.2) is the sum of `files[].size`. It is smaller than `total_bytes` where snapshot entries are copies of their blobs, as files `hf-hub` writes on Windows were until v0.12.6 (and are until `cache dedupe`, for a cache filled before it), and larger where symlinked entries share one blob, as across several cached revisions. Before v0.12.2, `total_bytes` was that sum ([#16](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/16)). | off |
 | `--sort KEY` | Order the summary (and `--json`'s `repos`) by `size` (the default) or `dup`, the bytes stored twice as duplicated copies. The `#` column stays each repo's rank by size, which is what `du <N>` takes. Conflicts with a repo argument and with `--tree`. | `size` |
 | `--verify-duplicates` | Hash every duplicated copy and compare it with its blob's name (the SHA-256 of an LFS file's content). Reads each copy once, so it takes minutes on tens of GiB, and reports each repo on stderr as it starts. Copies that differ are listed; git-stored files, whose blob is named by a git hash, are counted as unverifiable; copies that cannot be read (locked, permissions) are counted as unreadable and the rest are still checked. In `--json`, a `verification` object: `{identical,identical_bytes,unreadable,unreadable_bytes,differs,differs_bytes,unverifiable,unverifiable_bytes,differing[],unreadable_repos[]}`. The exit status stays 0; `unreadable` and `differs` are what a script checks. Conflicts with `--tree`. | off |
 | `--tree` | Hierarchical tree view: repos as branches, files as leaves, using box-drawing connectors. Composes with `--age` and `--json`; conflicts with the positional repo argument (the per-repo view is already covered by `du <REPO_ID>`). | off |
@@ -448,7 +450,9 @@ Since v0.12.5 `du` lists every repo the cache holds: models, datasets and Spaces
 
 **Duplicated copies.** Where a snapshot file is stored again beside its blob (what `hf-hub` leaves on Windows, which never tries a symlink), `du` adds a `DUP` column beside `SIZE` and a footer, `154.16 GiB of 763.22 GiB are duplicated copies (21 repos)`. The column appears only when some repo has copies, so a cache of symlinks prints as it always did. A blob counts when a snapshot file of the same length that is neither a link nor the blob itself exists in the same repo, each blob pairing with one file; a blob that a symlink or hard link points at does not. `du <REPO_ID>` ends with the gap in figures, `duplicated copies 7.12 GiB · orphan blobs 0 B · partial downloads 0 B · bookkeeping 140 B`, which with the listed bytes add up to `total on disk` (where the listing is the larger, as for symlinked entries sharing one blob across revisions, it keeps the note that names the possibilities). [`cache dedupe`](#cache-dedupe-flags) reclaims the copies; the footer, `du <REPO_ID>` and `cache gc --dry-run` point to it where a model repo holds some. Since v0.12.6 a hard-linked pointer is recognised on Windows too (by volume serial number and file index), so it is counted once and is not a duplicate.
 
-**Relocated repos.** A repo whose cache entry is a symlink or a Windows junction to a directory elsewhere (moved to another disk) is marked with `→` and its target, reported as `relocated_to` in `--json`, and named in `du <REPO_ID>`. Every figure still counts it; when the bytes sit on more than one volume the footer adds `By volume: C: 762.71 GiB · D: 525.44 MiB` (`volume_bytes` in `--json`).
+**Relocated repos.** A repo whose cache entry is a symlink or a Windows junction to a directory elsewhere (moved to another disk) is marked with `→` and its target, reported as `relocated_to` in `--json`, and named in `du <REPO_ID>`. Every figure still counts it; when the bytes sit on more than one volume the footer adds `By volume: C: 762.71 GiB · D: 525.44 MiB` (`volume_bytes` in `--json`). `cache move` makes such a repo.
+
+**Set aside by `cache move`.** Since v0.13.0, bytes in the cache's `.hf-fm-move/` directory (an original kept by `cache move --keep-original`, or what an interrupted move left) are counted by no listing, so `du` and `du --tree` add a line, `Not counted above: 159.05 GiB in <cache>/.hf-fm-move (...)`, and `--json` reports `move_leftover_bytes`, outside `total_bytes`. Both are absent when the directory is empty.
 
 A repo with an in-progress or interrupted download carries a `●` at the end of its row in the `du` listing, explained by a `● = partial downloads` line under the total. Its size includes the download's temp files: hf-fm's `.chunked.part` temp blobs at the full length they are preallocated to (on Windows that is what they occupy, while filesystems that keep the unwritten part sparse, such as ext4, allocate less until the download finishes), and the `.incomplete` files of `hf-hub` / `huggingface_hub` at what they hold so far (marked since v0.12.2). Run `hf-fm status <REPO_ID>` for the per-file progress.
 
@@ -600,6 +604,43 @@ hf-fm cache gc --older-than 30 --yes
 At least one of `--older-than` or `--max-size` is required. When both are set, age eviction runs first; if the cache is still over budget, oldest non-protected repos are evicted next, oldest first. A repo's age is the newest modification time among its snapshot files, or, for a repo with none (an interrupted first download, or only `inspect --cache-headers` entries), among its other files. Repos with active partial downloads (mtime within the last hour) are skipped to avoid racing with `hf-fm download`; run `cache clean-partial` first to clear stale partials.
 
 Decimal-prefixed size suffixes (`KB`, `MB`, `GB`, `TB`) are rejected — `hf-fm` reports sizes in binary units everywhere else and silent reinterpretation would mislead. Use `KiB`, `MiB`, `GiB`, `TiB`.
+
+```sh
+# Preview: where from and to, what is copied, the destination's free space
+hf-fm cache move mntss/clt-gemma-2-2b-2.5M D:\hf-cache --dry-run
+
+# Move it (prompts once), by name or du index
+hf-fm cache move mntss/clt-gemma-2-2b-2.5M D:\hf-cache
+hf-fm cache move 4 D:\hf-cache --yes
+
+# Keep the original under <cache>/.hf-fm-move/ until you have checked the copy
+hf-fm cache move mntss/clt-gemma-2-2b-2.5M D:\hf-cache --keep-original
+
+# Move a repo already moved to another disk, or bring it back into the cache
+hf-fm cache move mntss/clt-gemma-2-2b-2.5M E:\models
+hf-fm cache move mntss/clt-gemma-2-2b-2.5M --back
+```
+
+## Cache move flags
+
+Moves one cached repo to another disk and leaves a link to it in the cache (new in v0.13.0), which is how one cache can span several disks: `hf-hub`, `huggingface_hub` and every hf-fm command follow the link. The repo lands in `<DIR>/<folder>` (`D:\hf-cache\models--org--name`), and `<DIR>` is created if missing. Arguments resolve as `cache delete`'s do: a dataset or Space is `datasets/<org>/<name>`, and an index prints the repo it resolved to, `--yes` or not.
+
+The preview gives the source and the destination, the bytes and files, the hard links and symlinks kept as they are, what an interrupted run already copied, the destination's free space, and what becomes of the original. The copy is made in `<DIR>/.hf-fm-move/<folder>.partial`. Each file is hashed with SHA-256 as it is copied, flushed to disk, read back and hashed again, and gets its final name, modification time and permissions only when the two digests agree. Hard links inside the repo (what `cache dedupe` makes) stay hard links. When everything is copied, the source is checked again for changes, and the cache entry is swapped for a link: a junction on Windows, which needs no administrator rights or Developer Mode, a symlink elsewhere. The tree is read back through the link, and only then is the original deleted. The result states the source volume's free space before and after.
+
+What it refuses, before copying anything: a repo with a download in progress or interrupted (a partial download, or a download lock another process holds); a repo holding a link that points outside it, as `huggingface_hub`'s cache-wide blob store makes them, since such a link would dangle once the repo is elsewhere; a destination inside the cache or inside the repo; a `<DIR>/<folder>` that already exists, which is never merged into; a destination without the free space the copy needs; and a destination that cannot hold the link (a network share, FAT32), found by creating and removing a test link. A destination on the source's own volume is allowed, with a note that the move frees nothing there. On Windows, a repo with a file open inside it (a model a program has loaded) cannot be swapped; the error says so, and a rerun resumes.
+
+**Interrupted moves resume.** Nothing in the cache changes until the copy is complete and verified, so stopping a move (Ctrl+C, a crash, a full disk) leaves the repo where it was. A staged file with the source's length and modification time is trusted by the next run, which copies only the rest. The swap itself is two renames and a link; if it is cut short, the next `cache move` of the repo finds the entry it set aside (`<cache>/.hf-fm-move/<folder>.swap`) and puts it back, or finishes deleting the original.
+
+A blob whose content does not hash to the SHA-256 it is named by is moved as it is and reported on stderr: the cache's own copy was already corrupt, and `cache verify` checks the repo.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--back` | Bring a repo moved earlier back into the cache, replacing its link; takes no `<DIR>` | off |
+| `--keep-original` | Keep the original instead of deleting it. A repo moved out of the cache keeps it at `<cache>/.hf-fm-move/<folder>`, where `du` reports it apart; a repo moved again, or back, keeps the copy it moved from where it was | off |
+| `--yes` | Skip confirmation prompt | off |
+| `--dry-run` | Print what would be copied and changed, without copying, changing or prompting | off |
+
+A repo already behind a link moves again to a new `<DIR>`, and its old copy is deleted (or kept): before deleting it, `cache move` checks it as `cache delete --with-target` does, a directory named like the repo's cache folder holding `blobs/` or `snapshots/`. Moving a repo to the directory it is already in is refused as nothing to do.
 
 ```sh
 # Print snapshot path for shell substitution

@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-11-01, hf-fm v0.12.6 (reclaiming the duplicated copies with `cache dedupe`, in the cache section; before that, v0.12.5: duplicated copies and repos moved behind a link; before that, v0.12.3: growing read-ahead: GGUF costs, which models cannot be inspected remotely; reading tensor metadata from Rust; .pth on the range substrate; raising the range budgets) -->
+<!-- Last updated: 2026-11-07, hf-fm v0.13.0 (moving a repo to another disk with `cache move`, in the cache section; before that, v0.12.6: reclaiming the duplicated copies with `cache dedupe`; before that, v0.12.5: duplicated copies and repos moved behind a link; before that, v0.12.3: growing read-ahead: GGUF costs, which models cannot be inspected remotely; reading tensor metadata from Rust; .pth on the range substrate; raising the range budgets) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -420,11 +420,19 @@ The figure is found by length (a snapshot file the same length as a blob, in the
 
 Run `hf-fm cache dedupe` (since v0.12.6, [#21](https://github.com/mi-for-the-rust-of-us/hf-fetch-model/issues/21)), with `--dry-run` first to see what each model repo could reclaim. It compares every copy with its blob byte for byte and replaces each one that matches with a hard link to the blob, so the model keeps every file and the second copy's bytes are freed: 154.16 GiB of 763.22 GiB on the maintainer's cache, in 1 min 34 s. Since v0.12.6 hf-fm also links the copy `hf-hub` writes for a new download to its blob, so new LFS files are not stored twice. The [cache tutorial](tutorials/clean-up-before-your-disk-fills.md#reclaiming-the-copies-keeping-every-model-cache-dedupe) walks through a run, and the [CLI reference](cli-reference.md#cache-dedupe-flags) covers `--verify`, what is left alone and why, and what sharing bytes through a hard link means.
 
+### How do I move a model to another disk without starting a second cache?
+
+Run `hf-fm cache move <repo> <DIR>` (since v0.13.0), with `--dry-run` first. It copies the repo to `<DIR>/models--org--name`, hashing every file with SHA-256 as it is copied and again when read back. It then replaces the repo's cache entry with a link to the copy, checks the link, and deletes the original (`--keep-original` keeps it). The cache stays one cache: hf-fm, `hf-hub` and Python's `huggingface_hub` all follow the link, and `du` shows where the bytes are. `cache move <repo> --back` brings the repo home again, and a repo already moved can move on to a third disk.
+
+On Windows the link is a directory junction, which needs no administrator rights or Developer Mode (a symlink would); on Linux and macOS it is a symlink. A junction can only point to a local volume, so a network share is refused before anything is copied. A repo that Python keeps in its cache-wide shared blob store (`huggingface_hub` ≥ 1.32 with symlinks) is refused too, because its links would dangle once the repo is elsewhere.
+
+A move can be interrupted safely: nothing in the cache changes until the copy is complete and verified, and running the same command again copies only what is missing. While `<cache>/.hf-fm-move/` holds something (a kept original, or what an interrupted move left), `du` reports its bytes on a line of their own, and Python's `scan_cache_dir` lists that directory among its warnings as "not a valid HuggingFace cache directory"; it still reads every repo. Delete the kept original once you are satisfied, and the warning goes. The [CLI reference](cli-reference.md#cache-move-flags) has the details.
+
 ### I moved a repo to another disk behind a link — what do `du`, `cache delete` and `cache gc` do with it?
 
 `du` follows the link: the repo counts as cache usage wherever its bytes are, its row ends with `→ D:\hf-cache\models--gpt2`, and when the cache spans more than one volume the footer adds `By volume: C: 762.71 GiB · D: 525.44 MiB`, which answers the question the move was for (what the cache takes from `C:`). Python's `huggingface_hub` reads the link too. `cache delete` removes the link and leaves the bytes where they are, says so, and reports that it freed nothing here; `--with-target` deletes the bytes as well, only from a directory named like the repo's cache folder, and always asks, `--yes` or not. It is not atomic (it deletes the bytes, then the link, so a failure in between leaves the link pointing at a partly emptied directory; run it again, or remove the link without the flag and the leftovers by hand), and it follows a chain of links only to its end, removing just the outermost link, so point the link straight at the directory. `cache gc` skips relocated repos with a note, since evicting one frees nothing on the cache's own disk.
 
-To move a repo yourself: copy `models--org--name` to the other disk, check the copy, move the original out of the cache, and make a junction at the old path (`mklink /J` on Windows needs no administrator rights; `ln -s` elsewhere). Doing it in one command is planned (v0.13.0).
+`cache move` (above) makes such a repo in one command. To move one by hand instead: copy `models--org--name` to the other disk, check the copy, move the original out of the cache, and make a junction at the old path (`mklink /J` on Windows needs no administrator rights; `ln -s` elsewhere).
 
 ---
 
