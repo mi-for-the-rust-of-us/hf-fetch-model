@@ -899,7 +899,68 @@ Asked for by the [second addendum](../dogfooding-feedbacks/hf-fm-dogfooding-du-d
 - **It moves bytes, so it can lose them.** Copy, verify, swap and drop need a crash-safe order (the original kept until the link and the target both verify), a refusal when the repo is in use (`PartialFile::is_in_use`, as `dedupe`), and a plan that survives an interrupted 159 GiB copy.
 - **It composes with `cache dedupe`**, as the report says: copied naively, a hard-linked blob and its pointer become two files on the target. Preserving the link needs v0.12.6's identity and `link_over`, so it follows them.
 
-It builds on v0.12.5's relocated-repo detection (decision 7) and on `delete`'s `--with-target` guard (decision 8). Its own design section, with the maintainer's decisions on junction creation and on keeping the original, comes when it is scheduled.
+It builds on v0.12.5's relocated-repo detection (decision 7) and on `delete`'s `--with-target` guard (decision 8).
+
+**Command.**
+
+```
+hf-fm cache move <REPO_ID|N> <DIR> [--dry-run] [--yes] [--keep-original]
+hf-fm cache move <REPO_ID|N> --back [--dry-run] [--yes] [--keep-original]
+```
+
+`<DIR>` is the parent directory: the repo lands at `<DIR>/<folder>` (`D:\hf-cache\models--gpt2`, as the report did it), so the target keeps the folder name that `cache delete --with-target` checks. It is created if missing, and the preview says so. The argument resolves as `cache delete`'s do (`resolve_repo_arg`, `resolve_index`): an index prints the repo it resolved to, `--yes` or not, and a dataset is `datasets/org/name`. The preview gives the source and destination, the files and bytes to copy, the hard links kept, what an earlier interrupted run already copied, the destination's free space, and what happens to the original; it prompts `[y/N]` unless `--yes`, and `--dry-run` stops there. The result states the cache volume's free space before and after, which the [dedupe note](../dogfooding-feedbacks/hf-fm-dogfooding-dedupe-reclaimed-vs-volume.md) asks of every reclaim.
+
+**Compatibility.** A minor release for the reasons above; additive everywhere else. A new compiled dependency on Windows builds (`junction`, decision 1). `du`'s text and `--json` gain one line and one field (row 4); no existing key changes meaning. In the Rust API, new functions with `# Errors` sections and new types that are `#[must_use]` and `#[non_exhaustive]`.
+
+**Decisions** (confirmed by the maintainer on 2026-11-07).
+
+1. *Junction creation: the `junction` crate.* `junction` 2.1.0 (MIT, MSRV 1.85, published 2026-09-24) as a `[target.'cfg(windows)'.dependencies]` entry with `default-features = false`: its default feature, `unstable_admin`, asks for the backup and restore privileges when opening a directory is refused, which a non-administrator does not hold; without it, it asks for none beyond what creating a directory needs. Its `windows-sys` 0.61 is already in `Cargo.lock`, and it adds `scopeguard` alone. A `cmd /c mklink /J` subprocess was rejected (cmd.exe expands `%VAR%` even inside quotes, and its errors are localised text), and so was a symlink first with the junction as fallback (two layouts in the wild instead of one). Unix uses `std::os::unix::fs::symlink`. `junction::create` makes the directory before it sets the reparse point and leaves it empty when the second step fails, so the caller removes it.
+2. *The original is dropped once the link has been checked; `--keep-original` keeps it* at `<cache>/.hf-fm-move/<folder>`. Freeing the cache's disk is the point of the command, so the default frees it; the prompt names what goes, and `--dry-run` previews it. The dot prefix keeps every hf-fm listing from reading the directory as a repo.
+3. *Verification hashes both sides.* Each source file is hashed with SHA-256 while it is copied; the copy is flushed (`sync_all`), read back and hashed, and the two digests must agree. That is one read of each side, against three for a byte comparison after the copy (the `cache dedupe` precedent), which would read the source twice. A blob whose name is 64 hex digits is also checked against its name, for free; a mismatch means the cache's own copy is corrupt, is reported as such with a pointer to `cache verify`, and does not stop the move, since moving the bytes faithfully makes nothing worse. Reading the copy back right after writing it can be served by the operating system's cache, so this proves the copy path, not the medium, as the report's `sha256` by hand did.
+4. *Scope: any repo type, a repo already relocated, and the way back.* Datasets and Spaces move as models do, since the command acts on the directory alone (the report counted 34.5 GiB of datasets). A repo already behind a link moves again (`D:` to `E:`), and `--back` brings a relocated repo's bytes back into the cache and replaces the link with them, which is the undo the report's "keep or undo the move" asks for. Several repos per call stay out (the roadmap's title is single-repo, and `<DIR>` as the last of several positionals reads badly).
+
+**Design** (the author's, on the decisions above).
+
+*Three cases, one engine.* Let `C` be the repo's cache entry and `T` the directory a link resolves to.
+
+| Case | `C` before | Bytes copied from | After |
+|---|---|---|---|
+| Relocate | a directory | `C` | `C` is a link to `<DIR>/<folder>` |
+| Move again | a link to `T` | `T` | `C` is a link to `<DIR>/<folder>`; `T` dropped, or kept |
+| Back (`--back`) | a link to `T` | `T` | `C` is a directory in the cache; `T` dropped, or kept |
+
+`T` is deleted by the drop, so before the second and third cases it must pass the checks `cache delete --with-target` makes (`checked_link_target`): its final component is the repo's folder name, and it holds `blobs/` or `snapshots/`. A link pointed at anything else is refused, as in v0.12.5's decision 8.
+
+*A crash-safe order, recoverable from the filesystem alone.* No journal: every intermediate state has a name that a later run recognises. The staging directory is `<parent of the destination>/.hf-fm-move/<folder>.partial`, on the destination's volume, so its last step is a rename; the cache entry is set aside as `<cache>/.hf-fm-move/<folder>.swap`.
+
+1. *Preflight* (`plan_move`, which reads only). The repo is cached and no download is in progress (`download_in_progress` of v0.12.6: a partial download, or a download lock another process holds). No link inside the repo points outside it or by an absolute path: `huggingface_hub`'s cache-wide blob store (v0.12.2) links each blob to `../../blobs/…`, which would dangle once the repo is elsewhere, so such a repo is refused, with the links named. `<DIR>` is not inside the cache or the repo. `<DIR>/<folder>` does not exist already: it may be an unrelated or a stale copy, and is never merged into. With `--keep-original`, no kept original may be in the way. The destination's free space (`fs2::available_space`) covers the bytes still to copy. A destination on the source's own volume frees nothing there; it is warned about, not refused.
+2. *Probe*, before any byte moves. A link is created and removed at `<cache>/.hf-fm-move/<folder>.probe`, pointing at `<DIR>`, and, when the repo holds hard links, a hard link is tried in the staging directory. A volume that cannot hold the junction (a network share, FAT32) fails here rather than after 159 GiB; a volume without hard links is accepted, the linked names then being copied as separate files: the probe checks the free space again with their bytes added, and the result reports them.
+3. *Copy into staging*, in path order, so `blobs/` comes before `snapshots/`. A directory is created; a link inside the repo is recreated with the same relative target; a file whose `physical_id` was already copied becomes a hard link to that copy, so a deduplicated repo stays deduplicated (the composition the report asks for); any other file is streamed into `<name>.hf-fm-copy.tmp` with the hashing of decision 3, given the source's modification time (`File::set_times`, so `cache gc --older-than` judges a repo brought `--back` by its age, not by the move) and permissions, and renamed to its name.
+4. *Resume.* A staged file at its final name with the source's length and modification time is trusted, since it got that name only after its digests agreed (rsync's quick check: a `refs/main` that changed between two runs keeps its length of 40 and has a newer time, so it is copied again). A leftover `.tmp` is overwritten. Staged entries the source no longer holds are removed before the swap.
+5. *Re-check the source.* Its tree is walked again, metadata only, and compared with what was copied (path, kind, length, modification time), and `download_in_progress` is asked again. A change aborts the run with the staging kept, so the next run copies only the difference.
+6. *Swap.* `C` is renamed to the aside (the directory itself, or in the second and third cases the link itself, never what it points at). The link `C` is created, and the staging renamed to `<DIR>/<folder>`; for `--back`, the staging is renamed to `C` instead. A failure renames the aside back. On Windows, renaming a directory with a file open inside it is refused; the error says the repo is in use and that a rerun resumes the copy.
+7. *Check through the link.* `relocated_target(C)` is the destination, and a walk through `C` matches what was copied. A mismatch undoes the swap as in step 6.
+8. *Drop or keep.* The drop removes the aside: a directory, or for a link the guarded `T` and then the link. `--keep-original` renames a directory aside to `<cache>/.hf-fm-move/<folder>`, or, for a link, removes it and says where `T` stays.
+
+*Recovery.* The next `cache move` of the same repo finds what an interrupted one left. An aside with `C` missing, or with `C` a link that does not resolve, means the crash came before the swap was complete: the aside is put back, and the move starts again with the staged files counted as copied. An aside with `C` resolving to a complete destination means it came during the drop, which is finished. Either is reported.
+
+| Item | Scope | Origin |
+|---|---|---|
+| 1. Library | `cache::plan_move(repo_type, repo_id, dir)`, `cache::plan_move_back(repo_type, repo_id)`, `cache::apply_move(&plan, keep_original)` and `cache::apply_move_with_progress(…, on_event)` (the `verify_cache_with_progress` shape), in a private `cache/relocate.rs` re-exported as `dedupe` is. `MovePlan`, `MoveReport`, `MoveKind`, `MoveEvent`, all `#[non_exhaustive]`. One `create_dir_link` for both platforms; a volume identity (Unix `st_dev`, Windows the volume serial number through `winapi-util`) for the same-volume warning. | Report finding 5. |
+| 2. `cache move` | The command above, with a byte progress bar on a terminal and one line per file otherwise. | Report finding 5. |
+| 3. Tests | Temp caches, as the dedupe tests do. Relocate, keep, move again and back; a hard-linked pointer stays one file (runs for real here, as hard links need no privilege); symlinked pointers are recreated (`skipped` here, run on `windows-latest` and Linux); refusals (a shared-store link, an existing destination, a destination inside the cache, a partial download, a `T` not named like the folder); resume (a trusted file, a same-length stale one, an extra one, a leftover `.tmp`); a blob not matching its name moves and is reported; both recovery states; a swap that fails is undone. The CLI: `--dry-run` writes nothing, a move and its `--back` in a temp `HF_HOME`, the `<DIR>`/`--back` conflict, an index. | `CLAUDE.md`'s CI blind spots. |
+| 4. `du` sees what is set aside | `du`'s footer names the bytes in `<cache>/.hf-fm-move/` (a kept original, or what an interrupted move left), which no listing counts, and `du --json` gains `move_leftover_bytes`. A 159 GiB kept original must not be invisible. | The v0.12.2 lesson: totals disagree for a stated reason, never a silent one. |
+| 5. Docs | The cache tutorial gains the walkthrough (captured from the built binary on a throwaway repo), with `cli-reference.md`, the README's command table, an FAQ entry ("move a model to another disk": junction or symlink, what `huggingface_hub` sees, its `scan_cache_dir` warning about `.hf-fm-move/` while it exists) and `--help`. | Every figure and sentence the change touches. |
+
+**Implementation order.** The library and its tests first; the command and `du`'s line next; the docs follow the binary.
+
+**Acceptance.**
+- On a throwaway repo in a temp `HF_HOME` on `C:`, moved to `D:`: the cache entry is a junction (`dir /AL`), `du` marks it with its target and splits the volumes, `huggingface_hub`'s `scan_cache_dir` and `try_to_load_from_cache` read it through the junction, `cache verify` passes, and `C:`'s free space grows by the repo's bytes within cluster slack. `--back` restores a directory with the same files and modification times, and frees `D:`.
+- An interrupted copy (the process killed mid-file) resumes and copies only what was missing; a killed swap is recovered by the next run.
+- A deduplicated repo moves with its hard links (`du`'s `DUP` stays 0 and its total is unchanged).
+- The `cfg(unix)` arms run on the WSL2 mirror of `ci.yml`.
+
+**Out of scope:** several repos per call; repos linked into `huggingface_hub`'s cache-wide blob store (refused, not rewritten); moving the whole cache, which `HF_HOME` already does; a destination on a network share (refused by the probe); and anything in the [v0.14.0 multi-GPU plan](multi-gpu-roadmap.md).
 
 ---
 
