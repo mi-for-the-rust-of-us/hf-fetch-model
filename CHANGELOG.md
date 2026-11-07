@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`anamnesis` bumped `0.7.10` → `0.7.11`.** One pickup for hf-fm: a `GGUF`
+  holding an `F8_E4M3` tensor (`ggml_type` 43, which llama.cpp's converter
+  writes for a per-tensor-scaled `FP8` weight) used to be refused while
+  anamnesis read its tensor-info table, so `inspect` could not open the file
+  at all; it now lists it, with `F8_E4M3` as the dtype and one byte per
+  element. `GgufType` is `#[non_exhaustive]` and hf-fm only prints a dtype's
+  name, so no code changes here. anamnesis's other changes (dequantisation,
+  and folding the per-tensor scale into the weight on `remember` and
+  `convert`) are on paths hf-fm does not call. anamnesis 0.7.11 declares
+  Rust 1.88, below hf-fm's 1.91.
+
 ## [0.12.6] — `cache dedupe` reclaims the duplicated Windows copies
 
 ### Added

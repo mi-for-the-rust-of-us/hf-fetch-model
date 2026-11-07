@@ -25,9 +25,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "anamnesis"
-version = "0.7.10"
+version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9be5929c3dd97db2697f73c4c2d77970dd799936a87a454f3efe2aaac8d59818"
+checksum = "02c039cf2cf8c296b5ff561222dec8d603b85ffb176822966996a31256fa9d06"
 dependencies = [
  "flate2",
  "float8",
