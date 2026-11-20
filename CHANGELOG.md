@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`Cargo.toml` drops `homepage`**, which repeated `repository`; Rust 1.100's
+  cargo warns that `package.homepage is redundant with package.repository`.
+  crates.io still links the repository.
+
 ## [0.13.0] — `cache move` relocates a repo to another disk
 
 ### Added
