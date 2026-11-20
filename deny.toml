@@ -17,7 +17,16 @@ all-features = true
 # To accept one deliberately, add it to `ignore` with the reason, e.g.
 # `{ id = "RUSTSEC-0000-0000", reason = "..." }`.
 yanked = "deny"
-ignore = []
+ignore = [
+    # Both arrive only through hf-hub 1.0 -> hf-xet 1.6 -> xet-runtime/xet-data;
+    # hf-fm names neither. No patched version exists (both are informational
+    # "unmaintained"), and hf-xet 1.8.1 still depends on both. Upstream:
+    # huggingface/xet-core#1094, fix in review as #1096 (swaps both for jiff).
+    # Drop these entries once an hf-xet release without them is in Cargo.lock;
+    # note that hf-xet 1.8 also pulls sysinfo 0.39, which needs Rust 1.95.
+    { id = "RUSTSEC-2026-0542", reason = "humantime, transitive via hf-xet; upstream fix huggingface/xet-core#1096" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono, transitive via hf-xet; upstream fix huggingface/xet-core#1096" },
+]
 
 [licenses]
 # Permissive licences only, matching the crate's own MIT OR Apache-2.0.
